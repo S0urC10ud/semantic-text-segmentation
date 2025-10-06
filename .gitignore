@@ -1,0 +1,64 @@
+# ----------------------------------------
+# General Project Files
+# ----------------------------------------
+
+# Byte-compiled Python files
+__pycache__/
+*.pyc
+
+# Virtual environment directories
+# These are managed by tools like venv, uv, or conda and should not be committed.
+venv/
+.venv/
+env/
+.env/
+venv_py3/
+*.egg-info/
+.uv/
+src/.checkpoints/**
+# Environment variables file
+.env
+.env.local
+wandb/**
+src/wandb/**
+# IDE and Editor-specific files
+# These are local settings and should not be shared.
+.idea/             # JetBrains (PyCharm, IntelliJ)
+.vscode/           # VS Code
+*.sublime-project
+*.sublime-workspace
+.DS_Store          # macOS system files
+.history           # VS Code history
+
+# ----------------------------------------
+# Build Artifacts and Distribution
+# ----------------------------------------
+
+# Build directories and files
+dist/
+build/
+*.so
+*.egg
+*.whl
+sdist/
+
+src/checkpoints/**
+
+# Setuptools and poetry
+.tox/
+.coverage
+.cache/
+.pytest_cache/
+htmlcov/
+.nox/
+
+# ----------------------------------------
+# Specific to your project (ml_trainer)
+# ----------------------------------------
+
+# Your temporary output, models, or data files.
+# It's good practice to have a dedicated output directory for things
+# that don't belong in version control.
+data/
+models/
+output/

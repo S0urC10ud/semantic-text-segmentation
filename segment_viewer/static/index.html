@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Segmenter Viewer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span>Seg</span>Viewer</div>
+    <div class="topbar-actions">
+      <div id="device" class="device"></div>
+      <button id="runAll" class="btn primary small" title="Run segmentation on all examples">Segment All</button>
+    </div>
+  </header>
+
+  <!-- Global tooltip (shared by all examples) -->
+  <div id="tooltip" class="tooltip" role="tooltip" aria-hidden="true"></div>
+
+  <main class="container" id="examples">
+    <!-- Example cards are injected here by /static/app.js -->
+  </main>
+
+  <footer class="footer">
+    Multiple examples are editable independently. Hover characters in the outputs to see per-class probabilities.
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

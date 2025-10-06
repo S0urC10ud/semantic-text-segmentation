@@ -1,0 +1,613 @@
+import argparse
+import os
+import random
+import sys
+import time
+from typing import Dict, Tuple
+
+# Unbuffered/stdout-friendly logs
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+# Multiprocessing plays nicer with 'spawn' in JAX/CUDA contexts
+import multiprocessing as mp
+
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
+# Environment
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.7")  # Limit JAX memory usage
+
+import gc
+import jax
+import jax.numpy as jnp
+import numpy as np
+from flax.training import checkpoints
+from flax import serialization
+import wandb
+from wandb import Settings
+
+# Enable memory-efficient JAX flags
+jax.config.update("jax_disable_jit", False)
+jax.config.update("jax_enable_x64", False)
+
+from config import DataConfig, TrainConfig, NUM_CLASSES, ID2LANG, PAD_ID, PAD_BYTE_ID
+from data_utils import prepare_dsets_by_lang_with_splits
+from window_generator import (
+    PrefetchBatcher,
+    make_pure_window,
+    make_mixed_window,
+    make_line_injected_window,
+)
+from model import (
+    create_train_state,
+    train_step,
+    eval_step,
+    TrainState,
+    count_params,
+    train_step_no_jit,
+)
+from preview import build_preview_html
+
+from metrics_helper import (
+    evaluate_split_with_metrics,
+    compute_metrics_from_confusion,
+    print_metrics_table,
+    wandb_log_metrics,
+)
+
+import signal
+
+# global-ish flag that both the handler and loop can see
+_STOP = {"flag": False}
+
+
+def _signal_handler(sig, frame):
+    _STOP["flag"] = True
+    print(f"Signal {sig} received; stopping...", flush=True)
+
+
+# register early, before long inits
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+def _compute_running_stats(history, new_value, window=100):
+    history.append(float(new_value))
+    if len(history) > window:
+        history.pop(0)
+    import numpy as _np
+
+    return {
+        "mean": float(_np.mean(history)),
+        "std": float(_np.std(history)) if len(history) > 1 else 0.0,
+        "trend": (
+            float(history[-1] - history[0]) / len(history) if len(history) > 1 else 0.0
+        ),
+    }
+
+
+def _wandb_safe_log(data: dict, step: int, commit: bool = True):
+    try:
+        wandb.log(data, step=step, commit=commit)
+    except Exception as e:
+        print(f"Wandb logging failed: {e}", flush=True)
+
+
+def resolve_ckpt_paths(path: str):
+    blob_abs = os.path.abspath(path)
+    ckpt_dir_abs = os.path.dirname(blob_abs) or os.getcwd()
+    base = os.path.basename(blob_abs)
+    prefix = base + "-"
+    return ckpt_dir_abs, prefix, blob_abs
+
+
+def _make_eval_batch(
+    dsets_by_lang: Dict[int, dict],
+    L: int,
+    batch_size: int,
+    mix_prob: float,
+    min_seg: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    xb = np.full((batch_size, L), PAD_BYTE_ID, dtype=np.int32)
+    yb = np.full((batch_size, L), PAD_ID, dtype=np.uint8)
+    for i in range(batch_size):
+        if np.random.rand() < mix_prob:
+            x, y = make_mixed_window(dsets_by_lang, target_len=L, min_seg=min_seg)
+        else:
+            x, y = make_pure_window(dsets_by_lang, target_len=L)
+        xb[i] = x
+        yb[i] = y
+    return xb, yb
+
+
+def evaluate_split(
+    state: TrainState,
+    dsets_by_lang: Dict[int, dict],
+    L: int,
+    batch_size: int,
+    batches: int,
+    mix_prob: float,
+    min_seg: int,
+    rng,
+) -> Tuple[float, float]:
+    losses, accs = [], []
+    for i in range(batches):
+        data_rng, eval_rng = jax.random.split(jax.random.fold_in(rng, i))
+        seed_val = int(jax.random.randint(data_rng, (), 0, 2**31 - 1).item())
+        np.random.seed(seed_val)
+        xb, yb = _make_eval_batch(dsets_by_lang, L, batch_size, mix_prob, min_seg)
+        loss, acc = eval_step(
+            state,
+            jnp.array(xb, dtype=jnp.int32),
+            jnp.array(yb, dtype=jnp.uint8),
+            eval_rng,
+        )
+        losses.append(float(loss))
+        accs.append(float(acc))
+    import numpy as _np
+
+    return float(_np.mean(losses)), float(_np.mean(accs))
+
+
+def main():
+    # Force garbage collection at start
+    gc.collect()
+
+    parser = argparse.ArgumentParser()
+
+    # Data args
+    parser.add_argument(
+        "--data_root", type=str, default="../downloader/stack_web_sample"
+    )
+    parser.add_argument("--allow_hf_fallback", action="store_true", default=False)
+    parser.add_argument("--num_proc", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+    # 4KB fixed windows by default
+    parser.add_argument("--window_min_bytes", type=int, default=2048)
+    parser.add_argument("--window_max_bytes", type=int, default=2048)
+    parser.add_argument("--bucket_step", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--prefetch_batches", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--mix_prob", type=float, default=0.45)
+    parser.add_argument("--pure_prob", type=float, default=0.05)
+    parser.add_argument("--line_inject_prob", type=float, default=0.5)
+    parser.add_argument("--max_minutes", type=int, default=0)
+    parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
+
+    # Pruning
+    parser.add_argument("--prune_min_minutes", type=int, default=15)
+    parser.add_argument("--prune_patience_evals", type=int, default=9999999999)
+    parser.add_argument("--prune_delta", type=float, default=0.000001)
+
+    # Train args
+    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--lr", type=float, default=4e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--model_dim", type=int, default=256)
+    parser.add_argument("--channels", type=str, default="96,128,192,256")
+    parser.add_argument("--dropout_rate", type=float, default=0.15)
+    parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--eval_every", type=int, default=250)
+    parser.add_argument("--ckpt_path", type=str, default="auto")
+    parser.add_argument("--sweep_id", type=str, default="")
+    parser.add_argument("--no_jit", action="store_true")
+    parser.add_argument("--preview_only", action="store_true")
+    parser.add_argument("--preview_start", type=int, default=0)
+    parser.add_argument("--preview_count", type=int, default=10)
+
+    args = parser.parse_args()
+
+    # Build configs
+    d_cfg = DataConfig(
+        data_root=args.data_root,
+        allow_hf_fallback=args.allow_hf_fallback,
+        num_proc=args.num_proc,
+        seed=args.seed,
+        window_min_bytes=args.window_min_bytes,
+        window_max_bytes=args.window_max_bytes,
+        bucket_step=args.bucket_step,
+        batch_size=args.batch_size,
+        mix_prob=args.mix_prob,
+        pure_prob=args.pure_prob,
+        line_inject_prob=args.line_inject_prob,
+        prefetch_batches=args.prefetch_batches,
+        num_workers=args.num_workers,
+    )
+    t_cfg = TrainConfig(
+        steps=args.steps,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        warmup=args.warmup,
+        model_dim=args.model_dim,
+        channels=tuple(map(int, args.channels.split(","))),
+        dropout_rate=args.dropout_rate,
+        log_every=args.log_every,
+        eval_every=args.eval_every,
+        ckpt_path=args.ckpt_path,
+        sweep_id=args.sweep_id,
+        no_jit=args.no_jit,
+        preview_only=args.preview_only,
+        preview_start=args.preview_start,
+        preview_count=args.preview_count,
+    )
+
+    # Prepare datasets
+    print("Preparing datasets...", flush=True)
+    dsets = prepare_dsets_by_lang_with_splits(
+        d_cfg.num_proc, d_cfg.seed, d_cfg.data_root, d_cfg.allow_hf_fallback
+    )
+    train_dsets = dsets["train"]
+    val_dsets = dsets["val"]
+
+    # Preview mode (now mirrors PrefetchBatcher distribution, incl. 'both' overlays)
+    if t_cfg.preview_only:
+        print(
+            f"--- PREVIEW MODE: generating {t_cfg.preview_count} examples ---",
+            flush=True,
+        )
+        examples = []
+        both_prob = getattr(d_cfg, "both_prob", 0.2)
+        pad_tail_prob = getattr(d_cfg, "pad_tail_prob", 0.6)
+        pad_tail_max_frac = getattr(d_cfg, "pad_tail_max_frac", 0.9)
+
+        for i in range(t_cfg.preview_start, t_cfg.preview_start + t_cfg.preview_count):
+            np.random.seed(i)
+            random.seed(i)
+            L = random.choice(d_cfg.buckets())
+
+            r = random.random()
+            if r < d_cfg.pure_prob:
+                x, y = make_pure_window(train_dsets, L)
+            elif r < d_cfg.pure_prob + d_cfg.line_inject_prob:
+                x, y = make_line_injected_window(train_dsets, L, d_cfg)
+            else:
+                x, y = make_mixed_window(train_dsets, L, d_cfg.min_seg_len)
+
+            # Combine both modes sometimes (overlay mixed slices into base)
+            if random.random() < both_prob:
+                xm, ym = make_mixed_window(train_dsets, L, d_cfg.min_seg_len)
+                nslices = random.randint(1, 3)
+                for _ in range(nslices):
+                    max_len = max(d_cfg.min_seg_len, L // 4)
+                    seg_len = random.randint(d_cfg.min_seg_len, max_len)
+                    if seg_len >= L:
+                        seg_len = L - 1
+                    start = random.randint(0, L - seg_len)
+                    end = start + seg_len
+                    x[start:end] = xm[start:end]
+                    y[start:end] = ym[start:end]
+
+            # Varied tail padding to make “contained padding” obvious in preview too
+            if random.random() < pad_tail_prob:
+                max_pad = max(1, int(L * pad_tail_max_frac))
+                pad_len = random.randint(0, max_pad)
+                if pad_len > 0:
+                    content_end = max(1, L - pad_len)
+                    x[content_end:] = PAD_BYTE_ID
+                    y[content_end:] = PAD_ID
+
+            examples.append((x, y))
+
+        out_path = "preview.html"
+        build_preview_html(examples, out_path)
+        print(f"Preview HTML written to: {os.path.abspath(out_path)}")
+        return
+
+    # --- WandB: single init here (longer timeout) ---
+    wandb.init(
+        project=os.getenv("WANDB_PROJECT", "code-segmentation"),
+        settings=Settings(init_timeout=300),
+    )
+    wandb.config.update({**d_cfg.__dict__, **t_cfg.__dict__}, allow_val_change=True)
+
+    # Derive unique checkpoint path from run id if requested/placeholder-ish
+    if t_cfg.ckpt_path == "auto" or "${" in t_cfg.ckpt_path:
+        auto_ckpt = f"checkpoints/sweeps/{wandb.run.id}.msgpack"
+        os.makedirs(os.path.dirname(auto_ckpt), exist_ok=True)
+        t_cfg.ckpt_path = auto_ckpt
+        print(f"Using auto checkpoint path: {t_cfg.ckpt_path}", flush=True)
+
+    # Warm up device early so any XLA/CUDA issues show now
+    print("JAX devices:", jax.devices(), flush=True)
+    _ = jnp.ones((1,)).block_until_ready()
+
+    rng = jax.random.PRNGKey(t_cfg.rng_seed)
+    rng, init_rng = jax.random.split(rng)
+
+    print("Creating train state (may trigger JIT/compile)...", flush=True)
+    state = create_train_state(init_rng, t_cfg, NUM_CLASSES)
+    num_params = count_params(state.params)
+    print(f"Model created with {num_params/1e6:.2f}M parameters.", flush=True)
+
+    ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(t_cfg.ckpt_path)
+    if os.path.exists(ckpt_blob) or os.path.exists(
+        os.path.join(ckpt_dir, f"{ckpt_prefix}0")
+    ):
+        print("Restoring checkpoint...", flush=True)
+        state = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
+
+    data_fetcher = PrefetchBatcher(train_dsets, d_cfg)
+    train_step_fn = train_step_no_jit if t_cfg.no_jit else train_step
+
+    print("Starting training...", flush=True)
+    start_time = time.time()
+    last_log_time = time.time()
+    metrics_history = {"loss": [], "acc": [], "step_time": [], "grad_norm": []}
+
+    best_val = float("inf")
+    non_improve_evals = 0
+    pruned = False
+    stopped_reason = ""
+    error_reason = ""  # Track any unexpected error from the loop
+    last_heartbeat = time.time()
+
+    try:
+        try:
+            # +1 to make sure the final eval and checkpoint triggers
+            for step in range(state.step, t_cfg.steps + 1):
+                # Periodic garbage collection
+                if step % 100 == 0:
+                    gc.collect()  # Regular Python garbage collection
+
+                elapsed_min = (time.time() - start_time) / 60.0
+                if args.max_minutes > 0 and elapsed_min >= args.max_minutes:
+                    stopped_reason = f"time_cap_{args.max_minutes}min"
+                    print(
+                        f"Time cap reached ({args.max_minutes} min). Stopping gracefully.",
+                        flush=True,
+                    )
+                    break
+                if os.path.exists(args.stop_file):
+                    stopped_reason = "stop_file_detected"
+                    print(
+                        f"Stop file detected at '{args.stop_file}'. Stopping gracefully.",
+                        flush=True,
+                    )
+                    break
+
+                if _STOP["flag"]:
+                    stopped_reason = f"signal_{int(_STOP['flag'])}"
+                    print("Stop requested by signal. Exiting loop.", flush=True)
+                    break
+
+                step_start = time.time()
+
+                data_start = time.time()
+                batch_tokens, batch_labels = data_fetcher.get()
+                data_time = time.time() - data_start
+
+                rng, step_rng = jax.random.split(rng)
+                state, loss, acc = train_step_fn(
+                    state, batch_tokens, batch_labels, step_rng
+                )
+                # Explicitly delete batch data to free memory
+                del batch_tokens
+                del batch_labels
+                compute_time = time.time() - data_start - data_time
+
+                step_time = time.time() - step_start
+
+                # LR best-effort
+                try:
+                    if hasattr(state.opt_state[1], "hyperparams"):
+                        step_lr = float(state.opt_state[1].hyperparams["learning_rate"])
+                    elif len(state.opt_state) > 2 and hasattr(
+                        state.opt_state[2], "count"
+                    ):
+                        step_lr = float(
+                            t_cfg.lr * min(1.0, state.opt_state[2].count / t_cfg.warmup)
+                        )
+                    else:
+                        step_lr = t_cfg.lr
+                except Exception:
+                    step_lr = t_cfg.lr
+
+                metrics = {
+                    "train/loss": float(loss),
+                    "train/acc": float(acc),
+                    "train/learning_rate": step_lr,
+                    "perf/data_time": data_time,
+                    "perf/compute_time": compute_time,
+                    "perf/total_step_time": step_time,
+                }
+
+                rs = _compute_running_stats(metrics_history["loss"], float(loss))
+                metrics.update(
+                    {
+                        "train/loss_mean": rs["mean"],
+                        "train/loss_std": rs["std"],
+                        "train/loss_trend": rs["trend"],
+                    }
+                )
+                rs = _compute_running_stats(metrics_history["acc"], float(acc))
+                metrics.update(
+                    {
+                        "train/acc_mean": rs["mean"],
+                        "train/acc_std": rs["std"],
+                        "train/acc_trend": rs["trend"],
+                    }
+                )
+                rs = _compute_running_stats(metrics_history["step_time"], step_time)
+                metrics.update(
+                    {"perf/step_time_mean": rs["mean"], "perf/step_time_std": rs["std"]}
+                )
+
+                # Determine if we should commit the logs now or wait
+                should_commit = (
+                    step % t_cfg.log_every == 0 and step % t_cfg.eval_every != 0
+                )
+
+                _wandb_safe_log(metrics, step=step, commit=should_commit)
+                last_heartbeat = time.time()
+
+                if step % t_cfg.log_every == 0:
+                    elapsed = time.time() - last_log_time
+                    sps = t_cfg.log_every / elapsed if elapsed > 0 else 0
+                    print(
+                        f"Step {step}/{t_cfg.steps} | Loss: {loss:.4f} (±{metrics['train/loss_std']:.4f}), "
+                        f"Acc: {acc:.4f} (±{metrics['train/acc_std']:.4f}), SPS: {sps:.2f}",
+                        flush=True,
+                    )
+                    last_log_time = time.time()
+
+                # Watchdog
+                if time.time() - last_heartbeat > 600:
+                    stopped_reason = "watchdog_no_progress_10min"
+                    print(
+                        "Watchdog: no progress for 10 minutes. Stopping.",
+                        flush=True,
+                    )
+                    break
+
+                if step > 0 and step % t_cfg.eval_every == 0:
+                    print("Evaluating...", flush=True)
+                    rng, eval_rng = jax.random.split(rng)
+
+                    # >>> NEW: eval with confusion matrix + metrics <<<
+                    val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
+                        state=state,
+                        dsets_by_lang=dsets["val"],
+                        L=d_cfg.window_max_bytes,
+                        batch_size=d_cfg.batch_size,
+                        batches=t_cfg.eval_batches,
+                        mix_prob=d_cfg.mix_prob,
+                        min_seg=d_cfg.min_seg_len,
+                        rng=eval_rng,
+                        eval_step_fn=eval_step,
+                    )
+
+                    # Compute per-class and aggregates
+                    per_class, aggregates = compute_metrics_from_confusion(
+                        conf_mat, NUM_CLASSES, PAD_ID
+                    )
+
+                    print(
+                        f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}",
+                        flush=True,
+                    )
+                    # Existing scalar gap logs
+                    val_metrics = {
+                        "val/loss": val_loss,
+                        "val/acc": val_acc,
+                        "val/train_gap": float(loss) - val_loss,
+                        "val/acc_gap": float(acc) - val_acc,
+                    }
+                    _wandb_safe_log(val_metrics, step=step, commit=False)
+
+                    # Print table and log to W&B
+                    print_metrics_table(
+                        per_class, aggregates, ID2LANG, NUM_CLASSES, PAD_ID
+                    )
+                    wandb_log_metrics(
+                        step,
+                        per_class,
+                        aggregates,
+                        ID2LANG,
+                        NUM_CLASSES,
+                        PAD_ID,
+                        conf_mat,
+                    )
+
+                    # Save checkpoints (unchanged)
+                    ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(
+                        t_cfg.ckpt_path
+                    )
+                    checkpoints.save_checkpoint(
+                        ckpt_dir,
+                        state,
+                        step=step,
+                        prefix=ckpt_prefix,
+                        keep=2,
+                        overwrite=True,
+                    )
+
+                    try:
+                        os.makedirs(ckpt_dir, exist_ok=True)
+                        with open(ckpt_blob, "wb") as f:
+                            f.write(serialization.to_bytes(state.params))
+                        base = os.path.basename(ckpt_blob)
+                        stem, ext = os.path.splitext(base)
+                        hist_path = os.path.join(ckpt_dir, f"{stem}-{step}{ext}")
+                        with open(hist_path, "wb") as f:
+                            f.write(serialization.to_bytes(state.params))
+                    except Exception as e:
+                        print(
+                            f"WARNING: writing raw params msgpack failed: {e}",
+                            flush=True,
+                        )
+
+                    # Simple pruning (unchanged)
+                    elapsed_min = (time.time() - start_time) / 60.0
+                    if elapsed_min >= args.prune_min_minutes:
+                        if (
+                            val_loss
+                            + args.prune_delta
+                            * (best_val if best_val < float("inf") else val_loss)
+                            < best_val
+                        ):
+                            best_val = val_loss
+                            non_improve_evals = 0
+                        else:
+                            non_improve_evals += 1
+                            if non_improve_evals >= args.prune_patience_evals:
+                                pruned = True
+                                stopped_reason = (
+                                    f"pruned_no_improve_{args.prune_patience_evals}"
+                                    f"evals_delta{args.prune_delta}"
+                                )
+                                print(
+                                    f"[PRUNE] {stopped_reason}. Stopping run.",
+                                    flush=True,
+                                )
+                                break
+
+        except KeyboardInterrupt:
+            stopped_reason = "keyboard_interrupt"
+            print("Interrupted. Saving checkpoint and finishing.", flush=True)
+        except Exception as e:
+            # Catch any other exception (like CUDA OOM)
+            error_reason = str(e)
+            print(
+                f"\nFATAL ERROR in training loop: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            # This error will be logged in the finally block
+    finally:
+        try:
+            data_fetcher.close()
+        except Exception:
+            pass
+
+        final_reason = "completed"
+        if error_reason:
+            final_reason = f"error_{error_reason.__class__.__name__}"
+            _wandb_safe_log(
+                {"meta/error_message": error_reason},
+                step=int(getattr(state, "step", 0)),
+                commit=False,
+            )
+        elif stopped_reason:
+            final_reason = stopped_reason
+
+        _wandb_safe_log(
+            {
+                "meta/stopped_reason": final_reason,
+                "meta/pruned": int(pruned),
+                "meta/runtime_minutes": (time.time() - start_time) / 60.0,
+            },
+            step=int(getattr(state, "step", 0)),
+        )
+        wandb.finish()
+        print("Training finished.", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,43 @@
+[project]
+name = "text-segmenter"
+version = "0.1.0"
+description = "Byte-wise HTML/CSS/JS segmentation with JAX/Flax"
+readme = "README.md"
+requires-python = "~=3.11.0"
+dependencies = [
+    "datasets>=2.18.0",      # uses map/filter/shuffle with num_proc
+    "flax>=0.11.2",
+    "optax>=0.2.5",
+    "numpy>=1.26",           # JAX works well with >=1.26; NumPy 2.x also fine on recent JAX
+    "pyarrow>=12",           # datasets backend
+    "msgpack>=1.0.5",
+    "jax==0.7.2.dev20250913",
+    "jaxlib==0.7.2.dev20250913",
+    "jax-cuda13-pjrt==0.7.2.dev20250913",
+    "jax-cuda13-plugin==0.7.2.dev20250913",
+    "orbax-checkpoint>=0.6.0",
+    "tensorstore>=0.1.67",
+    "wandb==0.21.4",
+    "fastapi==0.116.2",
+    "uvicorn==0.35.0"
+]
+
+[project.optional-dependencies]
+# If you want GPU wheels via pip (requires CUDA 12 runtime/driver installed):
+gpu = [
+    "jax[cuda12]>=0.4.30",
+]
+
+[project.scripts]
+# (optional) if you want a CLI entrypoint; otherwise just run python u_net.py
+seg-train = "u_net:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["activate", "segment_viewer"]
+
+[[tool.uv.index]]
+url = "https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/"
