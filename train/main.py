@@ -187,7 +187,7 @@ def main():
     parser.add_argument("--prune_delta", type=float, default=0.000001)
 
     # Train args
-    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--steps", type=int, default=20000)
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup", type=int, default=100)
@@ -242,10 +242,9 @@ def main():
     # Prepare datasets
     print("Preparing datasets...", flush=True)
     dsets = prepare_dsets_by_lang_with_splits(
-        d_cfg.num_proc, d_cfg.seed, d_cfg.data_root, d_cfg.allow_hf_fallback
+        d_cfg.data_root
     )
     train_dsets = dsets["train"]
-    val_dsets = dsets["val"]
 
     # Preview mode (now mirrors PrefetchBatcher distribution, incl. 'both' overlays)
     if t_cfg.preview_only:

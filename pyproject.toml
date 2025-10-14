@@ -19,7 +19,8 @@ dependencies = [
     "tensorstore>=0.1.67",
     "wandb==0.21.4",
     "fastapi==0.116.2",
-    "uvicorn==0.35.0"
+    "uvicorn==0.35.0",
+    "matplotlib==3.10.6"
 ]
 
 [project.optional-dependencies]

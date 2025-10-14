@@ -72,7 +72,7 @@ class TrainConfig:
     rng_seed: int = 123
     log_every: int = 50
     eval_every: int = 250
-    eval_batches: int = 20
+    eval_batches: int = 250
     ckpt_path: str = "checkpoints/seg-unet1d.msgpack"
     sweep_id: str = ""
     no_jit: bool = False

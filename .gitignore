@@ -5,7 +5,10 @@
 # Byte-compiled Python files
 __pycache__/
 *.pyc
-
+downloader/stack_web_sample/**
+train/wandb/**
+train/checkpoints/**
+train/sankey_images/**
 # Virtual environment directories
 # These are managed by tools like venv, uv, or conda and should not be committed.
 venv/

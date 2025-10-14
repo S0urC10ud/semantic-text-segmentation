@@ -1,8 +1,10 @@
 """
 Metrics helpers for per-class and aggregated accuracy / precision / recall / F1,
-plus nice console tables and Weights & Biases logging.
+plus nice console tables, a high-res Sankey diagram,
+and Weights & Biases logging.
 """
 from typing import Dict, Tuple
+import os
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -10,6 +12,20 @@ import wandb
 
 from config import NUM_CLASSES, PAD_ID, PAD_BYTE_ID
 from window_generator import make_pure_window, make_mixed_window
+
+# Ensure any later matplotlib usage in this process prefers a headless backend.
+# (This is belt-and-suspenders; we don't import pyplot anywhere below.)
+os.environ.setdefault("MPLBACKEND", "Agg")
+
+# --- Matplotlib compatibility shim -------------------------------------------
+# Some downstream libs (or environments) may access `matplotlib.pyplot`
+# attribute directly. Ensure it's importable and set to a headless backend.
+try:
+    import matplotlib as _matplotlib
+    _matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as _plt  # noqa: F401
+except Exception as _e:
+    print(f"Matplotlib setup warning (safe to ignore if you don't need plots): {_e}", flush=True)
 
 
 # ----------------------------- batch building ---------------------------------
@@ -176,13 +192,220 @@ def print_metrics_table(
     print("", flush=True)
 
 
-# ----------------------------- W&B logging ------------------------------------
+# ----------------------------- W&B logging + Sankey ---------------------------
 
 def _wandb_safe_log(data: dict, step: int, commit: bool = True):
     try:
         wandb.log(data, step=step, commit=commit)
     except Exception as e:
         print(f"Wandb logging failed: {e}", flush=True)
+
+
+def _save_sankey_from_confusion(
+    conf_mat: np.ndarray,
+    id2label: Dict[int, str],
+    num_classes: int,
+    ignore_class: int,
+    step: int,
+) -> str:
+    """
+    Create a high-res horizontal Sankey (true → predicted) as a PNG and return its path.
+    - Always overwrites the same file for the current run: sankey_{wandb.run.id}.png
+    - Ignores PAD / 'ignore_class'.
+    - Shows all flows; very tiny flows are pruned for readability.
+    """
+    # Headless, explicit Agg rendering (no pyplot, no GUI backend)
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+    from matplotlib.patches import Rectangle
+    from matplotlib.cm import get_cmap
+
+    cm = conf_mat.copy()
+    if ignore_class is not None and 0 <= ignore_class < num_classes:
+        cm[ignore_class, :] = 0
+        cm[:, ignore_class] = 0
+
+    # If nothing to show, bail
+    total = float(cm.sum())
+    if total <= 0:
+        return ""
+
+    # Normalize to fractions for geometry, but keep counts for labels.
+    C = num_classes
+    support_true = cm.sum(axis=1).astype(float)
+    support_pred = cm.sum(axis=0).astype(float)
+
+    # Build class indices to display (skip zero-support classes)
+    idx_true = [i for i in range(C) if i != ignore_class and support_true[i] > 0]
+    idx_pred = [j for j in range(C) if j != ignore_class and support_pred[j] > 0]
+
+    # Edge list (i -> j) with values
+    flows = []
+    for i in idx_true:
+        for j in idx_pred:
+            v = float(cm[i, j])
+            if v > 0:
+                flows.append((i, j, v))
+
+    # Prune minuscule flows for visual clarity (keep at least top-K per true class)
+    min_frac = 0.002  # 0.2% of all tokens
+    keep = []
+    by_src = {}
+    for i, j, v in flows:
+        by_src.setdefault(i, []).append((i, j, v))
+    for i, lst in by_src.items():
+        lst_sorted = sorted(lst, key=lambda x: x[2], reverse=True)
+        for k, (ii, jj, vv) in enumerate(lst_sorted):
+            if vv / total >= min_frac or k < 3:
+                keep.append((ii, jj, vv))
+    flows = keep
+
+    # Layout parameters
+    left_x = 0.05
+    right_x = 0.95
+    mid_x0 = 0.42
+    mid_x1 = 0.58
+    node_width = 0.02
+
+    # Vertical stacking for left (true) and right (pred)
+    y_gap = 0.008
+    y_margin = 0.02  # use symmetric top/bottom margins
+
+    # Heights (fractions). We'll scale them to fit inside [y_margin, 1 - y_margin].
+    left_heights_raw = [support_true[i] / total for i in idx_true]
+    right_heights_raw = [support_pred[j] / total for j in idx_pred]
+
+    def stack_positions(heights, n_nodes):
+        # scale to available vertical space taking gaps into account
+        available = 1.0 - 2.0 * y_margin - y_gap * max(n_nodes - 1, 0)
+        total_h = sum(heights) if len(heights) > 0 else 1.0
+        scale = available / total_h if total_h > 0 else 0.0
+        y = y_margin
+        pos = []
+        for h in heights:
+            hh = h * scale
+            pos.append((y, y + hh))
+            y = y + hh + y_gap
+        return pos, scale
+
+    left_pos, left_scale = stack_positions(left_heights_raw, len(idx_true))
+    right_pos, right_scale = stack_positions(right_heights_raw, len(idx_pred))
+
+    # Running offsets inside each node for ribbons (scaled to side)
+    left_offsets = {i: 0.0 for i in idx_true}
+    right_offsets = {j: 0.0 for j in idx_pred}
+
+    # Map class -> color (consistent, bright)
+    tab = get_cmap("tab20")
+    def class_color(k):
+        return tab((hash(k) % 20) / 20.0)
+
+    # Build index maps for quick lookups
+    idx_true_to_order = {i: n for n, i in enumerate(idx_true)}
+    idx_pred_to_order = {j: n for n, j in enumerate(idx_pred)}
+
+    # Prepare figure (explicit Agg canvas, no pyplot)
+    fig = Figure(figsize=(18, 10), dpi=220)
+    _ = FigureCanvas(fig)  # attaches an Agg canvas to the figure
+    ax = fig.add_axes([0.02, 0.02, 0.96, 0.96])
+    ax.axis("off")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    # Draw nodes (left true, right pred)
+    for i, (y0, y1) in zip(idx_true, left_pos):
+        h = y1 - y0
+        rect = Rectangle((left_x - node_width/2, y0), node_width, h,
+                         facecolor=(0, 0, 0, 0.05), edgecolor=(0, 0, 0, 0.25), linewidth=1.0)
+        ax.add_patch(rect)
+        label = id2label.get(i, str(i))
+        ax.text(left_x - node_width/2 - 0.01, (y0 + y1)/2, f"{label}\n{int(support_true[i])}",
+                va="center", ha="right", fontsize=8.5, fontweight="600")
+
+    for j, (y0, y1) in zip(idx_pred, right_pos):
+        h = y1 - y0
+        rect = Rectangle((right_x - node_width/2, y0), node_width, h,
+                         facecolor=(0, 0, 0, 0.05), edgecolor=(0, 0, 0, 0.25), linewidth=1.0)
+        ax.add_patch(rect)
+        label = id2label.get(j, str(j))
+        ax.text(right_x + node_width/2 + 0.01, (y0 + y1)/2, f"{label}\n{int(support_pred[j])}",
+                va="center", ha="left", fontsize=8.5, fontweight="600")
+
+    # Helper: build a ribbon as a closed Path between (left segment) and (right segment)
+    def add_ribbon(x0, ya0, yb0, x1, ya1, yb1, color, alpha):
+        # Sample top and bottom curves with a smooth cubic Bezier
+        def bezier(t, p0, p1, p2, p3):
+            return ((1 - t) ** 3) * p0 + 3 * ((1 - t) ** 2) * t * p1 + 3 * (1 - t) * (t ** 2) * p2 + (t ** 3) * p3
+
+        T = 20  # smoothness
+        ts = np.linspace(0, 1, T)
+        # Top curve
+        top_x = bezier(ts, x0, mid_x0, mid_x1, x1)
+        top_y = bezier(ts, ya0, ya0, ya1, ya1)
+        # Bottom curve
+        bot_x = bezier(ts, x1, mid_x1, mid_x0, x0)
+        bot_y = bezier(ts, yb1, yb1, yb0, yb0)
+
+        xs = np.concatenate([top_x, bot_x])
+        ys = np.concatenate([top_y, bot_y])
+
+        from matplotlib.path import Path  # local import remains
+        codes = [Path.MOVETO] + [Path.CURVE4] * (T - 1) + [Path.CURVE4] * T + [Path.CLOSEPOLY]
+        verts = np.column_stack([np.append(xs, xs[0]), np.append(ys, ys[0])])
+
+        path = Path(verts, codes)
+        from matplotlib.patches import PathPatch  # local import remains
+        patch = PathPatch(path, facecolor=color, edgecolor=(0, 0, 0, 0.12), linewidth=0.4, alpha=alpha, antialiased=True)
+        ax.add_patch(patch)
+
+    # Draw ribbons (source color, thicker for mispred)
+    for i, j, v in flows:
+        li = idx_true_to_order[i]
+        rj = idx_pred_to_order[j]
+        y0a, y0b = left_pos[li]
+        y1a, y1b = right_pos[rj]
+
+        # Determine segment within each node (scaled separately per side)
+        src_h = (v / total) * left_scale
+        dst_h = (v / total) * right_scale
+
+        ya0 = y0a + left_offsets[i]
+        yb0 = ya0 + src_h
+        left_offsets[i] += src_h
+
+        ya1 = y1a + right_offsets[j]
+        yb1 = ya1 + dst_h
+        right_offsets[j] += dst_h
+
+        col = class_color(i)
+        is_correct = (i == j)
+        alpha = 0.35 if is_correct else 0.85
+
+        add_ribbon(left_x + node_width/2, ya0, yb0, right_x - node_width/2, ya1, yb1, col, alpha)
+
+    # Title / subtitle
+    run_id = getattr(wandb.run, "id", "run")
+    acc_line = ""
+    acc_val = None
+    if getattr(wandb, "run", None) is not None and wandb.run is not None:
+        try:
+            acc_val = wandb.run.summary.get("val/agg/micro/accuracy", None)
+        except Exception:
+            acc_val = None
+    if isinstance(acc_val, (int, float)):
+        acc_line = f" • Acc {acc_val:.3f}"
+
+    ax.text(0.5, 1.06, f"Flow: True → Predicted  (Run {run_id}{acc_line})",
+            ha="center", va="bottom", fontsize=12.5, fontweight="700", transform=ax.transAxes)
+    ax.text(0.5, 1.03, f"Step {step} • Width ∝ byte/token count • Node labels show byte counts",
+            ha="center", va="top", fontsize=9.0, color=(0, 0, 0, 0.65), transform=ax.transAxes)
+
+    # Save — overwrite per run id
+    out_path = f"sankey_images/sankey_{run_id}_{step}.png"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
+    fig.clear()
+    return out_path
 
 
 def wandb_log_metrics(
@@ -194,7 +417,7 @@ def wandb_log_metrics(
     ignore_class: int,
     conf_mat: np.ndarray,
 ):
-    """Log a wandb.Table, aggregated scalars, per-class scalars, and a confusion-matrix image."""
+    """Log a wandb.Table, aggregated scalars, per-class scalars, a confusion-matrix image, and a Sankey diagram."""
     # 1) Table — ensure consistent numeric types across ALL rows.
     columns = ["label", "support", "acc", "precision", "recall", "f1"]
     rows = []
@@ -246,23 +469,31 @@ def wandb_log_metrics(
         per_class_logs[f"{base}/recall"]    = float(rec[cid])
         per_class_logs[f"{base}/f1"]        = float(f1[cid])
 
-    # 4) Confusion matrix image
-    try:
-        import matplotlib.pyplot as plt
-        fig = plt.figure(figsize=(6, 5))
-        cm_disp = conf_mat.copy()
-        if ignore_class is not None and 0 <= ignore_class < num_classes:
-            cm_disp[ignore_class, :] = 0
-            cm_disp[:, ignore_class] = 0
-        plt.imshow(cm_disp, interpolation='nearest', aspect='auto')
-        plt.title("Validation Confusion Matrix")
-        plt.xlabel("Predicted"); plt.ylabel("True")
-        plt.tight_layout()
-        _wandb_safe_log({"val/confusion_matrix": wandb.Image(fig)}, step=step, commit=False)
-        plt.close(fig)
-    except Exception:
-        pass
+    # 4) Confusion matrix image (Agg, no pyplot, fail hard on errors)
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
+    fig = Figure(figsize=(6, 5))
+    _ = FigureCanvas(fig)  # attach Agg canvas
+    ax = fig.add_subplot(111)
+    cm_disp = conf_mat.copy()
+    if ignore_class is not None and 0 <= ignore_class < num_classes:
+        cm_disp[ignore_class, :] = 0
+        cm_disp[:, ignore_class] = 0
+    im = ax.imshow(cm_disp, interpolation='nearest', aspect='auto')
+    ax.set_title("Validation Confusion Matrix")
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    fig.tight_layout()
+    
+    #_wandb_safe_log({"val/confusion_matrix": wandb.Image(fig)}, step=step, commit=False)
+    fig.clear()
+
+    # 5) Sankey diagram (single file per run, overwritten) — fail on errors if any
+    sankey_path = _save_sankey_from_confusion(conf_mat, id2label, num_classes, ignore_class, step)
+    #if sankey_path:
+        #wandb.log({"val/sankey_diagram": wandb.Image(sankey_path)}, step=step, commit=False)
+
+    
     _wandb_safe_log({"val/metrics_table": metrics_table, **scalar_logs, **per_class_logs}, step=step, commit=True)
 
 
