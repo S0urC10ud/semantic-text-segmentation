@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 End-to-end The Stack → filtered windows → Arrow datasets (single script)
 
@@ -684,7 +682,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--out-root", type=Path, default=Path("arrow_windows"),
                     help="Output directory for Arrow datasets (one subdir per label)")
     ap.add_argument("--langs", type=str,
-                    default="php,csharp,typescript,go,sql,rust,yaml,ruby",
+                    default="json,html,javascript,css,csv,text,java,c,c++,python,typescript,php,csharp,go,sql,rust,yaml,ruby",
                     help="Comma-separated labels to process (logical names).")
     ap.add_argument("--rebuild", action="store_true",
                     help="Delete existing output directories for selected labels before writing")
