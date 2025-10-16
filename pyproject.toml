@@ -20,7 +20,8 @@ dependencies = [
     "wandb==0.21.4",
     "fastapi==0.116.2",
     "uvicorn==0.35.0",
-    "matplotlib==3.10.6"
+    "matplotlib==3.10.6",
+    "magika==0.6.2"
 ]
 
 [project.optional-dependencies]

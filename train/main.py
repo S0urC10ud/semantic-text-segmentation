@@ -169,8 +169,8 @@ def main():
     parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     # 4KB fixed windows by default
-    parser.add_argument("--window_min_bytes", type=int, default=2048)
-    parser.add_argument("--window_max_bytes", type=int, default=2048)
+    parser.add_argument("--window_min_bytes", type=int, default=1536)
+    parser.add_argument("--window_max_bytes", type=int, default=1536)
     parser.add_argument("--bucket_step", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--prefetch_batches", type=int, default=8)
@@ -180,6 +180,8 @@ def main():
     parser.add_argument("--line_inject_prob", type=float, default=0.5)
     parser.add_argument("--max_minutes", type=int, default=0)
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
+    parser.add_argument("--dont_use_train_windows", action="store_true", default=False,
+                      help="Use train directory instead of train_windows for training data")
 
     # Pruning
     parser.add_argument("--prune_min_minutes", type=int, default=15)
@@ -242,7 +244,8 @@ def main():
     # Prepare datasets
     print("Preparing datasets...", flush=True)
     dsets = prepare_dsets_by_lang_with_splits(
-        d_cfg.data_root
+        d_cfg.data_root,
+        use_train_windows=not args.dont_use_train_windows
     )
     train_dsets = dsets["train"]
 
@@ -333,7 +336,9 @@ def main():
         print("Restoring checkpoint...", flush=True)
         state = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
 
-    data_fetcher = PrefetchBatcher(train_dsets, d_cfg)
+    # Switch to epoch-based batching
+    from epoch_batcher import EpochPrefetchBatcher
+    data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
     train_step_fn = train_step_no_jit if t_cfg.no_jit else train_step
 
     print("Starting training...", flush=True)
@@ -347,6 +352,10 @@ def main():
     stopped_reason = ""
     error_reason = ""  # Track any unexpected error from the loop
     last_heartbeat = time.time()
+
+    # Track min/max epochs across languages
+    min_epochs = 0
+    max_epochs = 0
 
     try:
         try:
@@ -409,10 +418,17 @@ def main():
                 except Exception:
                     step_lr = t_cfg.lr
 
+                # Get current epochs from the batcher
+                epochs_by_lang = data_fetcher.get_epochs()
+                min_epochs = min(epochs_by_lang.values())
+                max_epochs = max(epochs_by_lang.values())
+
                 metrics = {
                     "train/loss": float(loss),
                     "train/acc": float(acc),
                     "train/learning_rate": step_lr,
+                    "train/min_epochs": min_epochs,
+                    "train/max_epochs": max_epochs,
                     "perf/data_time": data_time,
                     "perf/compute_time": compute_time,
                     "perf/total_step_time": step_time,
@@ -451,7 +467,8 @@ def main():
                     elapsed = time.time() - last_log_time
                     sps = t_cfg.log_every / elapsed if elapsed > 0 else 0
                     print(
-                        f"Step {step}/{t_cfg.steps} | Loss: {loss:.4f} (±{metrics['train/loss_std']:.4f}), "
+                        f"Step {step}/{t_cfg.steps} [Epochs {min_epochs}-{max_epochs}] | "
+                        f"Loss: {loss:.4f} (±{metrics['train/loss_std']:.4f}), "
                         f"Acc: {acc:.4f} (±{metrics['train/acc_std']:.4f}), SPS: {sps:.2f}",
                         flush=True,
                     )

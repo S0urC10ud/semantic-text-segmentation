@@ -36,8 +36,11 @@ def _collect_files(root: str, exts: Tuple[str, ...]) -> List[str]:
                 out.append(os.path.join(dirpath, fn))
     return out
 
-def _build_local_dataset_for_lang(lang: str, data_root: str, split: str):
+def _build_local_dataset_for_lang(lang: str, data_root: str, split: str, use_train_windows = True):
     # 1) Prefer prebuilt Arrow cache: <data_root>/arrow_cache/<split>/<lang>
+    if use_train_windows:
+        if split == "train":
+            split = "train_windows"
     arrow_dir = os.path.join(data_root, "arrow_cache", split, lang)
     info_fp = os.path.join(arrow_dir, "dataset_info.json")
     if os.path.exists(info_fp):
@@ -45,7 +48,7 @@ def _build_local_dataset_for_lang(lang: str, data_root: str, split: str):
         return load_from_disk(arrow_dir)  # -> indexable HF Dataset
 
 
-def prepare_dsets_by_lang_with_splits(data_root: str) -> Dict[str, Dict[int, hfds.Dataset]]:
+def prepare_dsets_by_lang_with_splits(data_root: str, use_train_windows: bool = True) -> Dict[str, Dict[int, hfds.Dataset]]:
     """
     Returns a nested dict: splits['train'|'val'|'test'][lang_id] -> dataset
     Prefers local folders under data_root; if missing and allow_hf_fallback==True, uses HF dataset.
@@ -54,7 +57,7 @@ def prepare_dsets_by_lang_with_splits(data_root: str) -> Dict[str, Dict[int, hfd
     for split in ("train", "val", "test"):
         for lang in LANG2ID.keys():
             lang_id = LANG2ID[lang]
-            ds = _build_local_dataset_for_lang(lang, data_root, split)
+            ds = _build_local_dataset_for_lang(lang, data_root, split, use_train_windows=use_train_windows)
             print(f"Loaded local '{lang}' {split} samples (streaming)...")
             splits[split][lang_id] = ds
 
