@@ -12,6 +12,13 @@ What this does (single pass per language, no temp files):
   • Robust streaming controls: shard/offset/skip to jump ahead in huge sorted datasets.
   • Detailed progress bars & summaries (tqdm) and periodic logging.
 
+Resume & dedupe:
+  • Each window gets a stable content hash field `uid`.
+  • If an output dataset already exists, we (a) recover from any prior partial write,
+    (b) collect existing `uid`s (cheap), and (c) skip duplicates on the fly.
+  • We write new data to a temporary directory, then atomically swap it in.
+  • Aborting mid-save never corrupts the prior dataset; reruns are safe and cheap.
+
 Notes:
   - No stage-wise “write many raw files” — only Arrow datasets are written.
   - Magika is invoked in batches inside the same process (stable, fast enough, avoids fork issues).
@@ -27,23 +34,25 @@ Example:
       --window-bytes 1536 --magika-batch 1024 --threshold 0.82 \
       --shard-count 64 --shard-index 17 \
       --skip-per-lang php=500000,csharp=200000 --use-auth-token
-
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set
 
 # Keep native threadpools from over-subscribing
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -52,7 +61,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # 3rd-party deps expected:
 #   datasets>=2.14, magika==0.6.*, numpy, tqdm
-from datasets import Dataset, Features, Value, load_dataset
+from datasets import Dataset, Features, Value, load_dataset, load_from_disk, concatenate_datasets
 from tqdm import tqdm
 import numpy as np
 
@@ -65,7 +74,7 @@ def safe_filename(name: str) -> str:
     s = (name or "")
     if s.lower() == "c++":
         return "cpp"
-    if s.lower() in ("c#", "c-sharp", "csharp"):
+    if s.lower() in ("c#", "c-sharp", "csharp", "cs"):  # accept cs
         return "csharp"
     if s.lower() in ("yml",):
         return "yaml"
@@ -76,11 +85,12 @@ def canonical_label(name: str) -> str:
     s = (name or "").strip().lower()
     if s in {"c++", "cpp"}:
         return "cpp"
-    if s in {"c#", "c-sharp", "csharp"}:
+    # include "cs" so Magika extension-based labels map to csharp
+    if s in {"c#", "c-sharp", "csharp", "cs"}:
         return "csharp"
     if s in {"js", "javascript"}:
         return "javascript"
-    if s in {"ts", "typescript", "tsx"}:
+    if s in {"ts", "typescript"}:
         return "typescript"
     if s in {"yml", "yaml"}:
         return "yaml"
@@ -91,11 +101,11 @@ def canonical_label(name: str) -> str:
 LABEL_ACCEPTS: Dict[str, set] = {
     "text": {"txt", "text"},
     "cpp": {"cpp", "c++"},
-    "csharp": {"c#", "csharp"},
+    # add both "c-sharp" and "cs" explicitly
+    "csharp": {"c#", "csharp", "c-sharp", "cs"},
     "javascript": {"javascript", "js"},
     "typescript": {"typescript", "ts"},
     "yaml": {"yaml", "yml"},
-    # Common exact matches (kept for completeness)
     "php": {"php"},
     "go": {"go"},
     "sql": {"sql"},
@@ -106,7 +116,7 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "c": {"c"},
     "json": {"json"},
     "css": {"css"},
-    "html": {"html", "xhtml", "xml", "svg"},
+    "html": {"html", "xhtml"},
 }
 
 def label_matches_target(target: str, magika_label: Optional[str], mime: Optional[str]) -> bool:
@@ -212,9 +222,8 @@ def extract_php_code_only(text: str) -> str:
             if inner is not None:
                 parts.append(inner)
     # If still nothing and the file looks like a pure PHP file without tags (rare), keep as-is
-    # (heuristic: plenty of '$' and 'function' / 'class' / '->' / '::')
+    sample = text[:4096].lower()
     if not parts:
-        sample = text[:4096].lower()
         if ("$" in sample and ("function" in sample or "class" in sample or "->" in sample or "::" in sample)):
             return text
         return ""
@@ -228,7 +237,8 @@ def extract_php_code_only(text: str) -> str:
 # Candidate dataset folder names per logical label
 LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     "php": ["php"],
-    "csharp": ["c#", "csharp", "c-sharp"],
+    # prefer "c-sharp" first to avoid warnings; fallbacks kept
+    "csharp": ["c-sharp", "c#", "csharp"],
     "typescript": ["typescript"],
     "go": ["go"],
     "sql": ["sql"],
@@ -341,6 +351,13 @@ def byte_windows(b: bytes, window_bytes: int) -> Iterator[Tuple[int, bytes]]:
         yield idx, b[off: off + step]
         idx += 1
 
+def stable_uid_for_window(raw: bytes) -> str:
+    """
+    Stable, compact hash for a window's raw bytes. Language-agnostic; duplicates (even
+    from different sources) collapse, which is desirable for dedupe-on-resume.
+    """
+    return hashlib.blake2s(raw, digest_size=16).hexdigest()
+
 @dataclass
 class MagikaResult:
     ok: bool
@@ -397,9 +414,11 @@ def gen_windows_for_label(
     skip_first_n: int,
     progress_mode: str,
     demo: bool,
+    seen_uids: Optional[Set[str]] = None,
 ) -> Iterator[dict]:
     """
-    Stream The Stack for a given language (logical_label), window it, Magika-filter, and yield dicts.
+    Stream The Stack for a given language (logical_label), window it, Magika-filter,
+    de-duplicate against seen_uids, and yield dicts. max_windows limits *kept* count.
     """
     # UI setup
     is_tty = sys.stderr.isatty()
@@ -424,8 +443,7 @@ def gen_windows_for_label(
     batcher = MagikaBatcher()
 
     kept = 0
-    seen_windows = 0
-    rejected = 0
+    rejected = 0  # includes non-matching, low score, or duplicates
 
     # Precompute lang_id mapping here (consistent enumeration below)
     lang_id = LANG2ID.get(canonical_label(logical_label), -1)
@@ -433,19 +451,22 @@ def gen_windows_for_label(
     # Rolling buffers for batched Magika calls
     buf_bytes: List[bytes] = []
     buf_meta: List[Tuple[int, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]] = []
+    buf_uids: List[str] = []
     # meta per window: (window_idx, ext, hexsha, repo_name, repo_path, license_str)
 
     def _flush_batch():
-        nonlocal kept, rejected, seen_windows
+        nonlocal kept, rejected
         if not buf_bytes:
             return
         results = batcher.identify_many(buf_bytes)
-        for (res, meta, raw) in zip(results, buf_meta, buf_bytes):
-            seen_windows += 1
+        for (res, meta, raw, uid) in zip(results, buf_meta, buf_bytes, buf_uids):
+            if kept >= max_windows:
+                break
             if res.ok and res.score >= threshold and label_matches_target(logical_label, res.label, res.mime):
                 payload = {
                     "content": raw.decode("utf-8", errors="ignore"),
                     "lang_id": np.int16(lang_id).item(),  # int16 to be safe for many classes
+                    "uid": uid,
                 }
                 if add_meta:
                     win_idx, ext, hexsha, repo_name, repo_path, license_str = meta
@@ -457,24 +478,25 @@ def gen_windows_for_label(
                         "source_repo_path": str(repo_path or ""),
                         "license": str(license_str or ""),
                     })
+                # update seen set as we keep
+                if seen_uids is not None:
+                    seen_uids.add(uid)
                 yield payload
                 kept += 1
                 pbar.update(1)
-                if kept >= max_windows:
-                    # Clear buffers so the caller won't re-flush
-                    buf_bytes.clear()
-                    buf_meta.clear()
-                    return
             else:
                 rejected += 1
         buf_bytes.clear()
         buf_meta.clear()
+        buf_uids.clear()
 
-    # Iterate streaming examples
     last_postfix = time.time()
     for ex in ds:
+        if kept >= max_windows:
+            break
+
         # License gate
-        ok_lic, why = license_is_allowed(ex)
+        ok_lic, _ = license_is_allowed(ex)
         if not ok_lic:
             continue
 
@@ -506,11 +528,16 @@ def gen_windows_for_label(
         license_str = ex.get("max_stars_repo_license") or ex.get("license")
 
         for widx, wbytes in byte_windows(b, window_bytes):
+            # pre-dedupe via uid before Magika (saves compute)
+            uid = stable_uid_for_window(wbytes)
+            if seen_uids is not None and uid in seen_uids:
+                rejected += 1
+                continue
             buf_bytes.append(wbytes)
             buf_meta.append((widx, ext, hexsha, repo_name, repo_path, license_str))
+            buf_uids.append(uid)
             # Flush when batch is full
             if len(buf_bytes) >= magika_batch:
-                # Yield from the local generator
                 for out in _flush_batch():
                     yield out
                 if kept >= max_windows:
@@ -521,9 +548,6 @@ def gen_windows_for_label(
         if (now - last_postfix) >= 0.3:
             pbar.set_postfix(kept=kept, rej=rejected)
             last_postfix = now
-
-        if kept >= max_windows:
-            break
 
         # Aggressive early GC to keep RAM stable during huge streams
         content = ""
@@ -564,6 +588,86 @@ LANG2ID: Dict[str, int] = {
     "text": 16,
 }
 
+def ensure_recovery_dirs(out_dir: Path) -> None:
+    """
+    Make resume operations safe:
+      - If a previous swap left a .bak, restore or remove appropriately.
+      - If a previous tmp exists, remove it.
+    """
+    backup_dir = out_dir.with_name(out_dir.name + ".bak")
+    tmp_dir = out_dir.with_name(out_dir.name + ".tmp_write")
+    # If backup exists but out_dir missing, restore
+    if backup_dir.exists() and not out_dir.exists():
+        os.replace(backup_dir, out_dir)
+    # If both exist, discard stale backup
+    if backup_dir.exists() and out_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    # Remove any stale tmp from interrupted save
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+def collect_existing_uids(out_dir: Path) -> Tuple[Optional[Dataset], Set[str], bool]:
+    """
+    Load any existing dataset and return (dataset, set_of_uids, has_uid_column).
+    If uid column is missing, compute it on the fly to dedupe; we may add it later.
+    """
+    seen: Set[str] = set()
+    if not out_dir.exists():
+        return None, seen, False
+    ds = load_from_disk(str(out_dir))
+    has_uid = "uid" in ds.column_names
+    if has_uid:
+        # Build set cheaply
+        for uid in ds["uid"]:
+            seen.add(uid)
+    else:
+        # Compute on the fly from content; cheap for tens/hundreds of thousands
+        for chunk in ds.iter(10000):
+            for s in chunk["content"]:
+                uid = stable_uid_for_window(s.encode("utf-8", errors="ignore"))
+                seen.add(uid)
+    return ds, seen, has_uid
+
+def maybe_add_uid_and_resave(ds: Dataset, out_dir: Path) -> Dataset:
+    """
+    If the existing dataset lacks 'uid', add it (via content hash) and write
+    back atomically. This accelerates future resumptions.
+    """
+    if "uid" in ds.column_names:
+        return ds
+    def _mk_uid(batch):
+        return {"uid": [stable_uid_for_window(x.encode("utf-8", errors="ignore")) for x in batch["content"]]}
+    ds2 = ds.map(_mk_uid, batched=True, batch_size=8192)
+    # Save atomically
+    tmp_dir = out_dir.with_name(out_dir.name + ".tmp_uid")
+    backup_dir = out_dir.with_name(out_dir.name + ".bak_uid")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    ds2.save_to_disk(str(tmp_dir))
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    if out_dir.exists():
+        os.replace(str(out_dir), str(backup_dir))
+    os.replace(str(tmp_dir), str(out_dir))
+    shutil.rmtree(str(backup_dir), ignore_errors=True)
+    return load_from_disk(str(out_dir))
+
+def atomic_replace_dir(src_tmp: Path, dst: Path) -> None:
+    """
+    Swap in src_tmp to dst atomically (best-effort):
+      - Move dst -> dst.bak
+      - Move src_tmp -> dst
+      - Remove dst.bak
+    On crash between steps, ensure_recovery_dirs(...) at next start fixes things.
+    """
+    backup_dir = dst.with_name(dst.name + ".bak")
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    if dst.exists():
+        os.replace(str(dst), str(backup_dir))
+    os.replace(str(src_tmp), str(dst))
+    shutil.rmtree(str(backup_dir), ignore_errors=True)
+
 def build_arrow_for_label(
     *,
     label: str,
@@ -584,22 +688,39 @@ def build_arrow_for_label(
     rebuild: bool,
 ) -> Tuple[int, Path]:
     """
-    Create a Hugging Face Dataset directly from a generator for one label and save to disk.
-    Returns (#kept, output_dir)
+    Create/extend a Hugging Face Dataset directly from a generator for one label and save to disk.
+    Resume-safe and duplicate-proof via 'uid'.
+    Returns (total_kept_after_run, output_dir)
     """
     label_c = canonical_label(label)
     if label_c not in LANG2ID:
         raise ValueError(f"Unknown/unsupported label '{label}'")
 
     out_dir = out_root / label_c
+
+    # Recover from any prior interrupted writes
+    ensure_recovery_dirs(out_dir)
+
+    # Optional full rebuild
     if rebuild and out_dir.exists():
-        import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
 
-    # Features schema
+    # Load existing (if any) and collect uids
+    existing_ds, seen_uids, has_uid = collect_existing_uids(out_dir)
+    kept_before = len(seen_uids)
+
+    # If existing dataset lacks uid, add it for faster future resumes
+    if existing_ds is not None and not has_uid:
+        existing_ds = maybe_add_uid_and_resave(existing_ds, out_dir)
+        # Recollect (now cheap)
+        existing_ds, seen_uids, _ = collect_existing_uids(out_dir)
+        kept_before = len(seen_uids)
+
+    # Features schema (always include 'uid' for resume/dedupe)
     features = {
         "content": Value("string"),
         "lang_id": Value("int16"),
+        "uid": Value("string"),
     }
     if add_meta:
         features.update({
@@ -612,12 +733,19 @@ def build_arrow_for_label(
         })
     feats = Features(features)
 
+    # Compute remaining budget
+    remaining = max(0, (max_windows if max_windows > 0 else max_windows) - kept_before)
+    if remaining == 0 and max_windows > 0:
+        # Nothing to do; already at/above cap
+        return kept_before, out_dir
+
+    # Build new (non-duplicate) windows
     gen_kwargs = dict(
         logical_label=label_c,
         window_bytes=window_bytes,
         magika_batch=magika_batch,
         threshold=threshold,
-        max_windows=max_windows,
+        max_windows=remaining if max_windows > 0 else 0,  # 0 = unlimited; but we keep budgeted
         add_meta=add_meta,
         shuffle_buffer=shuffle_buffer,
         use_auth_token=use_auth_token,
@@ -626,20 +754,37 @@ def build_arrow_for_label(
         skip_first_n=skip_first_n,
         progress_mode=progress_mode,
         demo=demo,
+        seen_uids=seen_uids,  # live dedupe
     )
 
-    # Let HF stream from the generator directly to Arrow (no huge RAM spikes)
-    ds = Dataset.from_generator(
+    ds_new = Dataset.from_generator(
         gen_windows_for_label,
         gen_kwargs=gen_kwargs,
         features=feats,
         keep_in_memory=False,
         writer_batch_size=writer_batch_size,
     )
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
-    ds.save_to_disk(str(out_dir))
-    kept = len(ds)
-    return kept, out_dir
+
+    # If nothing new, we're done
+    if len(ds_new) == 0:
+        return kept_before, out_dir
+
+    # Merge with existing (if any) and save atomically
+    if existing_ds is not None:
+        # Ensure both have the same columns ordering
+        full = concatenate_datasets([existing_ds, ds_new])
+    else:
+        full = ds_new
+
+    tmp_dir = out_dir.with_name(out_dir.name + ".tmp_write")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.parent.mkdir(parents=True, exist_ok=True)
+    full.save_to_disk(str(tmp_dir))
+    atomic_replace_dir(tmp_dir, out_dir)
+
+    kept_after = kept_before + len(ds_new)
+    return kept_after, out_dir
 
 
 # ============================================================
@@ -675,7 +820,8 @@ def parse_args() -> argparse.Namespace:
             "• Filters licenses (permissive only)\n"
             "• PHP: strips foreign (HTML/etc.) content via regex\n"
             "• Magika prefilter in-process batches (no temp files)\n"
-            "• Writes ONLY Arrow datasets at the end"
+            "• Writes ONLY Arrow datasets at the end\n"
+            "• Resume-safe, duplicate-proof with per-window uid"
         )
     )
     # Core IO
@@ -696,8 +842,8 @@ def parse_args() -> argparse.Namespace:
                     help="Magika confidence threshold (keep if score >= threshold)")
     ap.add_argument("--magika-batch", type=int, default=1024,
                     help="How many windows to run through Magika per batch")
-    ap.add_argument("--max-windows-per-label", type=int, default=1_000_000,
-                    help="Cap of kept windows per label (post-filter). Default: 1,000,000")
+    ap.add_argument("--max-windows-per-label", type=int, default=40_000,
+                    help="Cap of kept windows per label (post-filter). Default: 40_000")
     ap.add_argument("--writer-batch-size", type=int, default=8192,
                     help="HF writer batch size to Arrow (bigger = fewer flushes)")
 
@@ -741,7 +887,7 @@ def main() -> None:
     max_per_label = 100 if args.demo else args.max_windows_per_label
     skip_map = parse_skip_map(args.skip_per_lang)
 
-    print("⚙️  The Stack → Arrow (windowed, Magika-filtered)")
+    print("⚙️  The Stack → Arrow (windowed, Magika-filtered, resume-safe)")
     print(f"   Out root:        {out_root}")
     print(f"   Labels:          {', '.join(labels)}")
     print(f"   Window bytes:    {args.window_bytes}")
@@ -775,14 +921,14 @@ def main() -> None:
                 use_auth_token=args.use_auth_token,
                 shard_count=args.shard_count,
                 shard_index=args.shard_index,
-                skip_first_n=int(skip_map.get(lbl, 0)),
+                skip_first_n=int(skip_map.get(canonical_label(lbl), 0)),
                 progress_mode=args.progress,
                 demo=args.demo,
                 writer_batch_size=args.writer_batch_size,
                 rebuild=args.rebuild,
             )
             grand_kept += kept
-            print(f"  ✓ Kept {kept:,} windows  →  {out_dir}\n")
+            print(f"  ✓ Total kept now: {kept:,} windows  →  {out_dir}\n")
         except KeyboardInterrupt:
             print("\n[!] Interrupted by user.", file=sys.stderr)
             raise
@@ -797,7 +943,7 @@ def main() -> None:
     rate = grand_kept / elapsed if elapsed > 0 else 0.0
     print("🎯 Summary")
     print(f"  Labels processed: {len(labels)}")
-    print(f"  Total kept:       {grand_kept:,} windows")
+    print(f"  Total kept (sum of totals per label): {grand_kept:,} windows")
     print(f"  Elapsed:          {elapsed/60.0:.1f} min  ({rate:.1f} win/s)")
     if failures:
         print("  Failures:")
