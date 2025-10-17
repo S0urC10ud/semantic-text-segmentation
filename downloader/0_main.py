@@ -101,6 +101,7 @@ def canonical_label(name: str) -> str:
 LABEL_ACCEPTS: Dict[str, set] = {
     "text": {"txt", "text"},
     "cpp": {"cpp", "c++"},
+    "csv": {"csv"},
     # add both "c-sharp" and "cs" explicitly
     "csharp": {"c#", "csharp", "c-sharp", "cs"},
     "javascript": {"javascript", "js"},
@@ -240,6 +241,7 @@ LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     # prefer "c-sharp" first to avoid warnings; fallbacks kept
     "csharp": ["c-sharp", "c#", "csharp"],
     "typescript": ["typescript"],
+    "csv": ["csv"],
     "go": ["go"],
     "sql": ["sql"],
     "rust": ["rust"],
@@ -586,6 +588,7 @@ LANG2ID: Dict[str, int] = {
     "css": 14,
     "html": 15,
     "text": 16,
+    "csv": 17,
 }
 
 def ensure_recovery_dirs(out_dir: Path) -> None:
