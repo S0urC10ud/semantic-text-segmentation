@@ -8,7 +8,7 @@ This version ALWAYS writes three disjoint datasets per content type (label) to:
             arrow_out/test/php/dataset
 
 What this does (single pass per label, no temp raw files):
-  • Streams from BigCode "bigcode/the-stack" per language folder (no full download).
+  • Streams from BigCode "bigcode/the-stack" per language folder (no full download) — for real languages.
   • Strict license filter: keeps permissive families only (MIT/Apache/BSD/Unlicense).
   • Windows content to fixed-size byte chunks (default: 1536 bytes).
   • Magika pre-filtering in batches (in-process; no multiprocessing issues).
@@ -24,14 +24,24 @@ Resume, dedupe & splits:
   • Resume loads existing train/val/test datasets, unions their UIDs, and skips dups on the fly.
   • New data are written to a temporary directory, then atomically swapped in per split.
 
+Also supported (synthetic):
+  • Labels starting with `encoding_` or `encryption_`:
+      encodings:  hex, base64, base32, base58, base85
+      encryptions: aes, des, blowfish, rc4, chacha20
+    - Names: encoding_<method> / encryption_<method> (e.g., encoding_base64, encryption_aes)
+    - Synthetic windows are generated deterministically per split using Python and
+      random-looking keys/nonces derived from the base seed and the split.
+    - **No leakage across splits**: the base plaintext pool is disjoint per split,
+      shared across all synthetic subsets for that split only.
+
 Example:
   python build_stack_windows_arrow_splits.py \
       --out-root arrow_out \
-      --langs php,csharp,typescript,go,sql,rust,yaml,ruby \
+      --langs html,css,javascript,c,cpp,csv,java,json,python,text,shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,encryption_aes,encryption_des,encryption_blowfish,encryption_rc4,encryption_chacha20 \
       --max-windows-per-label 200000 \
       --window-bytes 1536 --magika-batch 1024 --threshold 0.82 \
       --shard-count 64 --shard-index 17 \
-      --skip-per-lang php=500000,csharp=200000 --use-auth-token
+      --skip-per-lang php=500000,css=200000 --use-auth-token
 """
 
 from __future__ import annotations
@@ -56,6 +66,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # 3rd-party deps expected:
 #   datasets>=2.14, magika==0.6.*, numpy, tqdm
+#   For synthetic encryption labels: pycryptodome (Crypto)
 from datasets import Dataset, Features, Value, load_dataset, load_from_disk, concatenate_datasets
 from tqdm import tqdm
 import numpy as np
@@ -73,11 +84,12 @@ def safe_filename(name: str) -> str:
         return "csharp"
     if s.lower() in ("yml",):
         return "yaml"
+    s = s.replace(" ", "_")
     return re.sub(r"[^a-zA-Z0-9._-]", "_", s)
 
 
 def canonical_label(name: str) -> str:
-    s = (name or "").strip().lower()
+    s = (name or "").strip().lower().replace(" ", "_")
     if s in {"c++", "cpp"}:
         return "cpp"
     if s in {"c#", "c-sharp", "csharp", "cs"}:
@@ -88,6 +100,14 @@ def canonical_label(name: str) -> str:
         return "typescript"
     if s in {"yml", "yaml"}:
         return "yaml"
+    if s in {"vb", "visual-basic", "visualbasic", "vbnet", "vb.net"}:
+        return "visual_basic"
+    if s in {"ps", "ps1", "powershell"}:
+        return "powershell"
+    if s in {"batch", "bat", "cmd", "batchfile"}:
+        return "batchfile"
+    if s in {"docker", "dockerfile"}:
+        return "dockerfile"
     return s
 
 
@@ -111,6 +131,12 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "json": {"json"},
     "css": {"css"},
     "html": {"html", "xhtml"},
+    "shell": {"shell", "bash", "sh", "zsh"},
+    "powershell": {"powershell", "ps1"},
+    "batchfile": {"batchfile", "bat", "cmd"},
+    "visual_basic": {"visual_basic", "visual-basic", "vb", "vba", "vb.net", "visualbasic"},
+    "dockerfile": {"dockerfile", "docker"},
+    # synthetic labels are handled separately (no Magika check)
 }
 
 def label_matches_target(target: str, magika_label: Optional[str], mime: Optional[str]) -> bool:
@@ -240,6 +266,13 @@ LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     "css": ["css"],
     "html": ["html", "xhtml", "xml", "svg"],
     "text": ["text"],
+    # new language buckets requested
+    "shell": ["shell", "bash", "sh", "zsh", "fish"],
+    "powershell": ["powershell", "ps1"],
+    "batchfile": ["batchfile", "batch", "bat", "cmd"],
+    "visual_basic": ["visual-basic", "visualbasic", "vb", "vb.net", "vba"],
+    "dockerfile": ["dockerfile", "docker"],
+    # synthetic enc/enc are generated locally and do not map to The Stack
 }
 
 def try_load_streaming_dir(lang_dir: str, *, shuffle_buffer: int, token: Optional[bool]) -> Optional[Any]:
@@ -372,6 +405,213 @@ class MagikaBatcher:
 
 
 # ============================================================
+#                 Synthetic data (encodings/encryptions)
+# ============================================================
+
+SYN_ENCODING_METHODS = {"hex", "base64", "base32", "base58", "base85"}
+SYN_ENCRYPTION_METHODS = {"aes", "des", "blowfish", "rc4", "chacha20"}
+
+def is_synthetic_label(lbl: str) -> bool:
+    c = canonical_label(lbl)
+    if c.startswith("encoding_"):
+        return c.split("encoding_", 1)[1] in SYN_ENCODING_METHODS
+    if c.startswith("encryption_"):
+        return c.split("encryption_", 1)[1] in SYN_ENCRYPTION_METHODS
+    return False
+
+# Deterministic pseudo-random bytes (PRF) based on base_seed, split, method tag, and index.
+def _prf_bytes(base_seed: int, split: str, tag: str, idx: int, n: int) -> bytes:
+    out = bytearray()
+    ctr = 0
+    # domain-separated personalization ensures no collisions across tags/methods/splits
+    while len(out) < n:
+        h = hashlib.blake2b(
+            f"{base_seed}|{split}|{tag}|{idx}|{ctr}".encode("utf-8"),
+            digest_size=32,
+        ).digest()
+        out.extend(h)
+        ctr += 1
+    return bytes(out[:n])
+
+# Base plaintext generator per split (shared across all synthetic labels for that split).
+def synthetic_plaintext(base_seed: int, split: str, idx: int, nbytes: int) -> bytes:
+    return _prf_bytes(base_seed, split, "plaintext", idx, nbytes)
+
+# Base58 (Bitcoin alphabet) encoder (no checksum)
+_B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58encode(b: bytes) -> str:
+    # Convert big-endian bytes to integer
+    n = int.from_bytes(b, "big")
+    if n == 0:
+        # preserve leading zeros faithfully
+        zeros = len(b) - len(b.lstrip(b"\0"))
+        return ("1" * zeros) or "1"
+    chars = []
+    while n > 0:
+        n, rem = divmod(n, 58)
+        chars.append(chr(_B58_ALPHABET[rem]))
+    chars.reverse()
+    # Handle leading zeros: each 0x00 → leading '1'
+    pad = 0
+    for byte in b:
+        if byte == 0:
+            pad += 1
+        else:
+            break
+    return ("1" * pad) + "".join(chars)
+
+def encode_bytes(method: str, raw: bytes) -> str:
+    m = method.lower()
+    if m == "hex":
+        return raw.hex()
+    import base64
+    if m == "base64":
+        return base64.b64encode(raw).decode("ascii")
+    if m == "base32":
+        return base64.b32encode(raw).decode("ascii")
+    if m == "base85":
+        return base64.a85encode(raw).decode("ascii")
+    if m == "base58":
+        return b58encode(raw)
+    raise ValueError(f"Unknown encoding method: {method}")
+
+def encrypt_bytes(method: str, base_seed: int, split: str, idx: int, raw: bytes) -> bytes:
+    m = method.lower()
+    # keys/nonces derived deterministically from (seed, split, method, idx)
+    if m == "aes":
+        key = _prf_bytes(base_seed, split, "aes_key", idx, 32)   # AES-256
+        nonce = _prf_bytes(base_seed, split, "aes_nonce", idx, 16)
+        try:
+            from Crypto.Cipher import AES
+        except Exception as e:
+            raise RuntimeError("PyCryptodome is required for AES encryption") from e
+        cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
+        ct, tag = cipher.encrypt_and_digest(raw)
+        return nonce + tag + ct  # include nonce+tag for completeness
+    elif m == "des":
+        key = bytearray(_prf_bytes(base_seed, split, "des_key", idx, 8))
+        # Ensure DES key has odd parity (PyCryptodome adjusts if needed)
+        try:
+            from Crypto.Cipher import DES
+        except Exception as e:
+            raise RuntimeError("PyCryptodome is required for DES encryption") from e
+        iv = _prf_bytes(base_seed, split, "des_iv", idx, 8)
+        cipher = DES.new(bytes(key), DES.MODE_CFB, iv=iv, segment_size=64)
+        return iv + cipher.encrypt(raw)
+    elif m == "blowfish":
+        try:
+            from Crypto.Cipher import Blowfish
+        except Exception as e:
+            raise RuntimeError("PyCryptodome is required for Blowfish encryption") from e
+        key = _prf_bytes(base_seed, split, "bf_key", idx, 32)
+        iv = _prf_bytes(base_seed, split, "bf_iv", idx, 8)
+        cipher = Blowfish.new(key, Blowfish.MODE_CFB, iv=iv, segment_size=64)
+        return iv + cipher.encrypt(raw)
+    elif m == "rc4":
+        try:
+            from Crypto.Cipher import ARC4
+        except Exception as e:
+            raise RuntimeError("PyCryptodome is required for RC4 encryption") from e
+        key = _prf_bytes(base_seed, split, "rc4_key", idx, 32)
+        cipher = ARC4.new(key, drop=3072)  # drop initial keystream for safety
+        return cipher.encrypt(raw)
+    elif m == "chacha20":
+        try:
+            from Crypto.Cipher import ChaCha20
+        except Exception as e:
+            raise RuntimeError("PyCryptodome is required for ChaCha20 encryption") from e
+        key = _prf_bytes(base_seed, split, "chacha_key", idx, 32)
+        nonce = _prf_bytes(base_seed, split, "chacha_nonce", idx, 8)  # PyCryptodome uses 8-byte nonce
+        cipher = ChaCha20.new(key=key, nonce=nonce)
+        return nonce + cipher.encrypt(raw)
+    else:
+        raise ValueError(f"Unknown encryption method: {method}")
+
+def gen_synthetic_for_label(
+    *,
+    label_c: str,
+    window_bytes: int,
+    add_meta: bool,
+    progress_mode: str,
+    demo: bool,
+    seen_uids: Optional[Set[str]],
+    budget_per_split: Dict[str, int],
+    base_seed: int,
+) -> Iterator[dict]:
+    is_tty = sys.stderr.isatty()
+    show_progress = ((progress_mode == "always") or (progress_mode == "auto" and is_tty))
+    total_budget = sum(max(0, b) for b in budget_per_split.values())
+    pbar = tqdm(total=total_budget if total_budget > 0 else None,
+                unit="win",
+                desc=f"{label_c} (synthetic)",
+                disable=not show_progress)
+
+    # Determine method & family
+    if label_c.startswith("encoding_"):
+        family = "encoding"
+        method = label_c.split("encoding_", 1)[1]
+    else:
+        family = "encryption"
+        method = label_c.split("encryption_", 1)[1]
+
+    kept_total = 0
+    kept_per_split = {"train": 0, "val": 0, "test": 0}
+    lang_id = LANG2ID.get(label_c, -1)
+
+    # Deterministic per-split plaintext pools (shared across all synthetic labels via base_seed+split)
+    # We iterate idx=0.. and consume as many as needed per split, guaranteeing no cross-split reuse.
+    for split in SPLITS:
+        need = budget_per_split.get(split, 0)
+        if need <= 0:
+            continue
+        idx = 0
+        while need > 0:
+            pt = synthetic_plaintext(base_seed, split, idx, window_bytes)
+            idx += 1
+            try:
+                if family == "encoding":
+                    content_str = encode_bytes(method, pt)
+                else:
+                    ct = encrypt_bytes(method, base_seed, split, idx - 1, pt)
+                    # Store ciphertext as hex for portability/readability
+                    content_str = ct.hex()
+            except Exception as e:
+                # If crypto backend unavailable, surface the error clearly.
+                raise
+
+            uid = stable_uid_for_window(content_str.encode("utf-8", errors="ignore"))
+            if seen_uids is not None and uid in seen_uids:
+                continue  # avoid duplicates within label
+            ex = {
+                "content": content_str,
+                "lang_id": np.int16(lang_id).item(),
+                "uid": uid,
+            }
+            if add_meta:
+                ex.update({
+                    "win_idx": np.int64(0).item(),
+                    "source_ext": f"{family}:{method}",
+                    "source_hexsha": "",
+                    "source_repo": "synthetic",
+                    "source_repo_path": f"{family}/{method}",
+                    "license": "synthetic",
+                })
+            ex["split"] = split
+            if seen_uids is not None:
+                seen_uids.add(uid)
+            need -= 1
+            kept_total += 1
+            kept_per_split[split] += 1
+            pbar.update(1)
+            yield ex
+
+    pbar.set_postfix(k_train=kept_per_split["train"],
+                     k_val=kept_per_split["val"],
+                     k_test=kept_per_split["test"])
+    pbar.close()
+
+
+# ============================================================
 #                 Generator: one pass per label
 # ============================================================
 
@@ -391,7 +631,25 @@ def gen_windows_for_label(
     demo: bool,
     seen_uids: Optional[Set[str]] = None,
     budget_per_split: Dict[str, int],
+    base_seed: int,
 ) -> Iterator[dict]:
+    label_c = canonical_label(logical_label)
+
+    # Synthetic families: generate locally with no Magika or The Stack streaming
+    if is_synthetic_label(label_c):
+        yield from gen_synthetic_for_label(
+            label_c=label_c,
+            window_bytes=window_bytes,
+            add_meta=add_meta,
+            progress_mode=progress_mode,
+            demo=demo,
+            seen_uids=seen_uids,
+            budget_per_split=budget_per_split,
+            base_seed=base_seed,
+        )
+        return
+
+    # Real languages: stream from The Stack and filter via Magika
     is_tty = sys.stderr.isatty()
     show_progress = ((progress_mode == "always") or (progress_mode == "auto" and is_tty))
     total_budget = sum(max(0, b) for b in budget_per_split.values())
@@ -546,6 +804,7 @@ def gen_windows_for_label(
 # ============================================================
 
 LANG2ID: Dict[str, int] = {
+    # real languages
     "php": 0,
     "csharp": 1,
     "typescript": 2,
@@ -564,6 +823,23 @@ LANG2ID: Dict[str, int] = {
     "html": 15,
     "text": 16,
     "csv": 17,
+    "shell": 18,
+    "powershell": 19,
+    "batchfile": 20,
+    "visual_basic": 21,
+    "dockerfile": 22,
+    # synthetic encodings
+    "encoding_hex": 100,
+    "encoding_base64": 101,
+    "encoding_base32": 102,
+    "encoding_base58": 103,
+    "encoding_base85": 104,
+    # synthetic encryptions
+    "encryption_aes": 120,
+    "encryption_des": 121,
+    "encryption_blowfish": 122,
+    "encryption_rc4": 123,
+    "encryption_chacha20": 124,
 }
 
 SPLITS = ("train", "val", "test")
@@ -683,6 +959,7 @@ def build_arrow_for_label_with_splits(
     demo: bool,
     writer_batch_size: int,
     rebuild: bool,
+    base_seed: int,
 ) -> Tuple[Dict[str, int], Dict[str, Path]]:
     label_c = canonical_label(label)
     if label_c not in LANG2ID:
@@ -746,6 +1023,7 @@ def build_arrow_for_label_with_splits(
         demo=demo,
         seen_uids=seen_uids,
         budget_per_split=per_split_budget,
+        base_seed=base_seed,
     )
 
     ds_new_total = Dataset.from_generator(
@@ -826,14 +1104,21 @@ def parse_args() -> argparse.Namespace:
             "• Filters licenses (permissive only)\n"
             "• PHP: strips foreign (HTML/etc.) content via regex\n"
             "• In-process Magika prefilter (no temp files)\n"
-            "• Resume-safe, duplicate-proof with per-window uid and deterministic splits (70/20/10)"
+            "• Resume-safe, duplicate-proof with per-window uid and deterministic splits (70/20/10)\n"
+            "• Synthetic families: encoding_* and encryption_* generated per split with no leakage"
         )
     )
     # Core IO
     ap.add_argument("--out-root", type=Path, default=Path("arrow_out"),
                     help="Output root for Arrow datasets (<out-root>/<split>/<label>/dataset)")
+    # NEW default labels per request
     ap.add_argument("--langs", type=str,
-                    default="json,html,javascript,css,csv,text,java,c,c++,python,typescript,php,csharp,go,sql,rust,yaml,ruby",
+                    default=(
+                        "html,css,javascript,c,cpp,csv,java,json,python,text,"
+                        "shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,"
+                        "encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,"
+                        "encryption_aes,encryption_des,encryption_blowfish,encryption_rc4,encryption_chacha20"
+                    ),
                     help="Comma-separated labels to process (logical names).")
     ap.add_argument("--rebuild", action="store_true",
                     help="Delete existing output directories for selected labels (per split) BEFORE writing")
@@ -862,12 +1147,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--shard-index", type=int, default=0,
                     help="Which shard index to read (0..shard-count-1)")
     ap.add_argument("--skip-per-lang", type=str, default=None,
-                    help='Optional extra skip per label, e.g. "php=500000,csharp=200000"')
+                    help='Optional extra skip per label, e.g. "php=500000,css=200000"')
 
     # UX
     ap.add_argument("--progress", choices=["auto", "always", "never"], default="auto",
                     help="Show live progress bars (default: auto)")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed (also used for synthetic generation)")
     ap.add_argument("--demo", action="store_true",
                     help="Demo mode: keep at most 100 windows per label TOTAL (overrides --max-windows-per-label)")
     return ap.parse_args()
@@ -889,7 +1174,10 @@ def main() -> None:
     out_root: Path = args.out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
+    max_per_label_total = 100 if args.demo else args.max_windows_per_label  # keep name consistent
+    # fix potential split line artifacts
     max_per_label_total = 100 if args.demo else args.max_windows_per_label
+
     skip_map = parse_skip_map(args.skip_per_lang)
 
     print("⚙️  The Stack → Arrow (windowed, Magika-filtered, resume-safe) with 70/20/10 splits")
@@ -931,6 +1219,7 @@ def main() -> None:
                 demo=args.demo,
                 writer_batch_size=args.writer_batch_size,
                 rebuild=args.rebuild,
+                base_seed=args.seed,
             )
             grand_kept_per_split["train"] += kept_map.get("train", 0)
             grand_kept_per_split["val"] += kept_map.get("val", 0)
