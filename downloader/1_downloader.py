@@ -18,6 +18,8 @@ def safe_filename(name: str) -> str:
     # special-case languages we want pretty folder names for
     if s.lower() == "c++":
         return "cpp"
+    if s.lower() in ("c#", "c-sharp"):
+        return "csharp"
     return re.sub(r"[^a-zA-Z0-9._-]", "_", s)
 
 def to_lower_dir(p: Path) -> Path:
@@ -26,7 +28,7 @@ def to_lower_dir(p: Path) -> Path:
 def canonical_lang_key(name: str) -> str:
     """
     Canonicalize language names for counters/output-dir purposes.
-    Use The Stack's folder names (e.g., 'c++', 'javascript').
+    Use The Stack's folder names (e.g., 'c++', 'javascript', 'c-sharp').
     """
     s = (name or "").strip().lower()
     if s in ("cpp",):
@@ -35,6 +37,8 @@ def canonical_lang_key(name: str) -> str:
         return "javascript"
     if s in ("ts", "tsx", "typescript"):
         return "typescript"
+    if s in ("csharp", "c-sharp", "cs", "c#"):
+        return "c-sharp"
     return s
 
 def normalize_lang_dir(name: str) -> str:
@@ -237,8 +241,8 @@ def main():
     ap.add_argument(
         "--langs",
         type=str,
-        default="json,html,javascript,css,csv,text,java,c,c++,python,typescript",
-        help="Comma-separated language dirs in The Stack.",
+        default="json,html,javascript,css,csv,text,java,c,c++,python,typescript,php,csharp,go,sql,rust,yaml,ruby",
+        help="Comma-separated language dirs in The Stack (e.g., 'c++', 'c-sharp').",
     )
     ap.add_argument("--shuffle-buffer", type=int, default=0, help="Streaming shuffle buffer size (0 = no shuffle).")
     ap.add_argument("--gzip", action="store_true", help="Gzip-compress saved files.")
@@ -246,8 +250,7 @@ def main():
     ap.add_argument(
         "--ext-filter",
         type=str,
-        # widened defaults help C/C++/TS coverage a lot
-        default="json,html,htm,css,js,ts,csv,txt,java,c,cc,cpp,cxx,py",
+        default="json,html,htm,css,js,ts,csv,txt,java,c,cc,cpp,cxx,py,php,cs,go,sql,rs,rb,yaml,yml", # purpusefully exclude tsx
         help="Allowed extensions (lowercase, no dots, comma-separated).",
     )
     ap.add_argument("--per-lang-cap", type=int, default=100_000, help="Optional per-language cap.")

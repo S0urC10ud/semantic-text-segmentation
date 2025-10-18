@@ -163,7 +163,7 @@ def main():
 
     # Data args
     parser.add_argument(
-        "--data_root", type=str, default="../downloader/stack_web_sample"
+        "--data_root", type=str, default="../downloader/arrow_out"
     )
     parser.add_argument("--allow_hf_fallback", action="store_true", default=False)
     parser.add_argument("--num_proc", type=int, default=4)

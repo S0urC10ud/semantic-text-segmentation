@@ -3,10 +3,40 @@ Utilities for generating an HTML preview of augmented data samples.
 """
 import os
 import json
-from typing import List, Tuple
+import colorsys
+from typing import List, Tuple, Dict
 import numpy as np
 
-from config import ID2LANG, PAD_ID
+import config
+
+def generate_color(index, total):
+    """Generate a distinct color from HSL color space"""
+    import colorsys
+    hue = index / total
+    saturation = 0.7
+    lightness = 0.5
+    rgb = colorsys.hls_to_rgb(hue, lightness, saturation)
+    return '#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255))
+
+# Generate CSS for all language classes
+def generate_lang_css():
+    num_classes = len(config.ID2LANG)
+    css_rules = []
+    for lang_id, lang_name in config.ID2LANG.items():
+        color = generate_color(lang_id, num_classes)
+        # Legend style (solid color)
+        css_rules.append(f".{lang_name} {{ background:{color}; }}")
+        # Token style (transparent background)
+        css_rules.append(f".tok.{lang_name} {{ background:rgba({int(int(color[1:3], 16))}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.15); }}")
+    return "\n  ".join(css_rules)
+
+def generate_legend_spans():
+    """Generate legend spans for all languages"""
+    spans = []
+    for lang_id, lang_name in sorted(config.ID2LANG.items()):
+        spans.append(f'<span class="{lang_name}">{lang_name.upper()}</span>')
+    spans.append('<span class="pad">PAD</span>')
+    return "\n    ".join(spans)
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -17,17 +47,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; margin: 24px; }
   .toolbar { display:flex; gap:12px; align-items:center; margin-bottom:12px; }
   button { padding:6px 10px; }
-  .legend span { display:inline-block; padding:2px 8px; border-radius:4px; margin-right:8px; color:#fff; }
-  .html { background:#1f77b4; }
-  .css { background:#2ca02c; }
-  .javascript { background:#d62728; }
-  .pad { background:#999; color:#000; }
+  .example-legend { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .chip { display:inline-block; padding:2px 8px; border-radius:4px; margin-right:0; color:#fff; font-size:12px; }
   .muted { color:#666; font-size:0.9em; }
   .example { display:none; white-space:pre-wrap; word-break:break-word; border:1px solid #eee; padding:12px; border-radius:8px; background:#fafafa; }
   .example.active { display:block; }
-  .tok.html { background:rgba(31,119,180,.15); }
-  .tok.css { background:rgba(44,160,44,.15); }
-  .tok.javascript { background:rgba(214,39,40,.15); }
+  .tok { transition: all 0.15s ease; }
+  .tok:hover { filter: brightness(0.9); }
   .tok.pad { background:rgba(153,153,153,.20); color:#555; }
   .stats { margin-bottom:8px; }
   .code { font-size: 12.5px; line-height: 1.35; }
@@ -38,12 +64,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <button id="prevBtn">← Prev</button>
   <button id="nextBtn">Next →</button>
   <div id="counter"></div>
-  <div class="legend">
-    <span class="html">HTML</span>
-    <span class="css">CSS</span>
-    <span class="javascript">JavaScript</span>
-    <span class="pad">PAD</span>
-  </div>
 </div>
 <div id="examples"></div>
 <script>
@@ -87,13 +107,55 @@ def _escape_html(s: str) -> str:
               .replace('"',"&quot;").replace("'", "&#39;"))
 
 def _labels_to_name(lid: int) -> str:
-    return ID2LANG.get(int(lid), "pad") if lid != PAD_ID else "pad"
+    mapping = config.ID2LANG
+    pad_id = config.PAD_ID
+    lid_int = int(lid)
+    return mapping.get(lid_int, "pad") if lid_int != pad_id else "pad"
+
+def generate_example_colors(labels_u8: np.ndarray) -> dict:
+    """Generate colors for unique labels in this example."""
+    pad_id = config.PAD_ID
+    unique_labels = sorted(int(x) for x in np.unique(labels_u8) if x != pad_id)
+    
+    # Create a mapping of actual label indices to dense indices (0, 1, 2, ...)
+    # This ensures colors are consistently spaced regardless of which IDs are present
+    dense_indices = {label: idx for idx, label in enumerate(unique_labels)}
+    total_labels = len(unique_labels)
+    
+    colors = {}
+    for label in unique_labels:
+        # Use the dense index for color generation to ensure even spacing
+        hue = dense_indices[label] / max(1, total_labels)
+        # Tweak saturation and lightness for better visibility
+        saturation = 0.65
+        lightness = 0.6
+        rgb = colorsys.hls_to_rgb(hue, lightness, saturation)
+        colors[label] = '#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255))
+    return colors
 
 def _render_example_html(tokens_i32: np.ndarray, labels_u8: np.ndarray) -> str:
     """Render a single example (window) into an HTML snippet with spans colored by label."""
     L = int(tokens_i32.shape[0])
-    valid = np.where(labels_u8 != PAD_ID)[0]
+    pad_id = config.PAD_ID
+    valid = np.where(labels_u8 != pad_id)[0]
     last_valid = int(valid[-1]) + 1 if valid.size else 0
+
+    # Generate colors for this specific example
+    colors = generate_example_colors(labels_u8)
+    
+    # Create legend for this example - sort by language name for consistent ordering
+    legend_parts = []
+    sorted_labels = sorted(colors.items(), key=lambda x: _labels_to_name(x[0]))
+    for label_id, color in sorted_labels:
+        lang_name = _labels_to_name(label_id)
+        legend_parts.append(
+            f'<span class="chip" style="background: {color};" title="ID: {label_id}">'
+            f'{_escape_html(lang_name.upper())}</span>'
+        )
+    if legend_parts:
+        legend_html = '<div class="example-legend">' + "".join(legend_parts) + '</div>'
+    else:
+        legend_html = ''
 
     html_parts: List[str] = []
     if last_valid > 0:
@@ -102,6 +164,7 @@ def _render_example_html(tokens_i32: np.ndarray, labels_u8: np.ndarray) -> str:
     else:
         dist = "empty"
     html_parts.append(f'<div class="stats muted">valid_len={last_valid}, class_dist=[{_escape_html(dist)}]</div>')
+    html_parts.append(legend_html)
 
     i = 0
     while i < L:
@@ -115,8 +178,16 @@ def _render_example_html(tokens_i32: np.ndarray, labels_u8: np.ndarray) -> str:
         valid_bytes = chunk_tokens[chunk_tokens < 256].astype(np.uint8).tobytes()
         text = valid_bytes.decode('utf-8', 'replace')
 
-        class_name = _labels_to_name(label_id)
-        html_parts.append(f'<span class="tok {class_name}">{_escape_html(text)}</span>')
+        if label_id == pad_id:
+            html_parts.append(f'<span class="tok pad" title="PAD">{_escape_html(text)}</span>')
+        else:
+            color = colors[int(label_id)]
+            lang_name = _labels_to_name(label_id)
+            html_parts.append(
+                f'<span class="tok" style="background:rgba({int(int(color[1:3], 16))}, '
+                f'{int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.15);" '
+                f'title="{_escape_html(lang_name.upper())}">{_escape_html(text)}</span>'
+            )
         i = j
         
     return "".join(html_parts)

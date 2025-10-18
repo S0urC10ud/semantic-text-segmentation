@@ -3,9 +3,39 @@ from typing import Tuple, List
 import jax.numpy as jnp
 
 # Language and class mapping
-LANG2ID = {"html": 0, "css": 1, "javascript": 2, "c":3, "cpp": 4, "csv":5, "java":6, "json":7, "python":8, "text":9}
-ID2LANG = {v: k for k, v in LANG2ID.items()}
-NUM_CLASSES = 10
+LANG2ID = {
+    "html": 0, 
+    "css": 1, 
+    "javascript": 2, 
+    "c": 3,
+    "cpp": 4, 
+    "csharp": 5,
+    "csv": 6,
+    "go": 7,
+    "java": 8,
+    "json": 9,
+    "php": 10,
+    "python": 11,
+    "ruby": 12,
+    "rust": 13,
+    "sql": 14,
+    "text": 15,
+    "typescript": 16,
+    "yaml": 17
+}
+
+# These will be updated dynamically based on available data
+ID2LANG = {}
+NUM_CLASSES = 0
+
+def update_lang_mappings():
+    """Update ID2LANG and NUM_CLASSES based on current LANG2ID state"""
+    global ID2LANG, NUM_CLASSES
+    ID2LANG = {v: k for k, v in LANG2ID.items()}
+    NUM_CLASSES = len(LANG2ID)
+
+# Initialize mappings
+update_lang_mappings()
 
 # Special IDs for padding in labels and inputs
 PAD_ID = NUM_CLASSES  # Label PAD is 3 (masked out of loss/metrics)

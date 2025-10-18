@@ -1132,8 +1132,8 @@ def parse_args() -> argparse.Namespace:
                     help="Magika confidence threshold (keep if score >= threshold)")
     ap.add_argument("--magika-batch", type=int, default=1024,
                     help="How many windows to run through Magika per batch")
-    ap.add_argument("--max-windows-per-label", type=int, default=40_000,
-                    help="TOTAL cap of kept windows per label (post-filter) across splits. Default: 40,000")
+    ap.add_argument("--max-windows-per-label", type=int, default=100_000,
+                    help="TOTAL cap of kept windows per label (post-filter) across splits. Default: 100,000")
     ap.add_argument("--writer-batch-size", type=int, default=8192,
                     help="HF writer batch size to Arrow (bigger = fewer flushes)")
 

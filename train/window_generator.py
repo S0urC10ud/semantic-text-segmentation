@@ -33,6 +33,54 @@ def _random_example(ds) -> Optional[dict]:
     if n is not None and n > 0:
         idx = random.randrange(0, n)
         return ds[idx]
+
+
+def _sample_mixed_segment_count(max_segments: int = 6, stop_prob: float = 0.6) -> int:
+    """Geometric-like sampler favouring fewer segments when mixing windows."""
+    count = 1
+    while count < max_segments and random.random() > stop_prob:
+        count += 1
+    return count
+
+
+def _choose_segment_slice(
+    byte_content: np.ndarray,
+    seg_len: int,
+    min_letters: int = 4,
+    guard_len: int = 64,
+    max_attempts: int = 6,
+) -> np.ndarray:
+    """
+    Pick a slice of ``byte_content`` up to ``seg_len`` bytes. For shorter slices we
+    bias toward samples that contain at least ``min_letters`` ASCII alphabetic chars.
+    """
+    total = int(len(byte_content))
+    if seg_len <= 0 or total == 0:
+        return np.empty((0,), dtype=np.uint8)
+
+    seg_len = min(seg_len, total)
+    if seg_len > guard_len:
+        if total == seg_len:
+            return byte_content[:seg_len]
+        start = random.randint(0, total - seg_len)
+        return byte_content[start:start + seg_len]
+
+    best_slice = byte_content[:seg_len]
+    best_letters = -1
+    for _ in range(max_attempts):
+        if total == seg_len:
+            start = 0
+        else:
+            start = random.randint(0, total - seg_len)
+        segment = byte_content[start:start + seg_len]
+        text = segment.tobytes().decode("utf-8", "ignore")
+        letters = sum(("a" <= c <= "z") or ("A" <= c <= "Z") for c in text)
+        if letters >= min_letters:
+            return segment
+        if letters > best_letters:
+            best_slice = segment
+            best_letters = letters
+    return best_slice
 # ---------------------------
 # Window builders (supports partial fill + masking)
 # ---------------------------
@@ -77,7 +125,7 @@ def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
     if not lids:
         return x_buf, y_buf
 
-    nsegs = random.randint(1, 6)
+    nsegs = _sample_mixed_segment_count()
     left, pos = target_len, 0
     for i in range(nsegs):
         seg_len = random.randint(min_seg, left) if left > min_seg else left
@@ -97,13 +145,10 @@ def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
             continue
 
         b = bytes_from_text(ex["content"])
-        if len(b) > seg_len:
-            start = random.randint(0, len(b) - seg_len)
-            b = b[start:start + seg_len]
-
-        L = min(seg_len, len(b))
+        segment = _choose_segment_slice(b, seg_len)
+        L = min(seg_len, len(segment))
         if L > 0:
-            x_buf[pos:pos + L] = b[:L].astype(np.int32)
+            x_buf[pos:pos + L] = segment[:L].astype(np.int32)
             y_buf[pos:pos + L] = lid
 
         pos += seg_len

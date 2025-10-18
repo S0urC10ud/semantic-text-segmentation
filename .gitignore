@@ -5,7 +5,8 @@
 # Byte-compiled Python files
 __pycache__/
 *.pyc
-downloader/stack_web_sample/**
+downloader/stack*/**
+downloader/arrow*/**
 train/wandb/**
 train/checkpoints/**
 train/sankey_images/**
