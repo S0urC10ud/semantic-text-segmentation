@@ -24,15 +24,14 @@ Resume, dedupe & splits:
   • Resume loads existing train/val/test datasets, unions their UIDs, and skips dups on the fly.
   • New data are written to a temporary directory, then atomically swapped in per split.
 
-Also supported (synthetic):
+Also supported (derived transforms):
   • Labels starting with `encoding_` or `encryption_`:
       encodings:  hex, base64, base32, base58, base85
       encryptions: aes, des, blowfish, rc4, chacha20
     - Names: encoding_<method> / encryption_<method> (e.g., encoding_base64, encryption_aes)
-    - Synthetic windows are generated deterministically per split using Python and
-      random-looking keys/nonces derived from the base seed and the split.
-    - **No leakage across splits**: the base plaintext pool is disjoint per split,
-      shared across all synthetic subsets for that split only.
+    - Each window reuses plaintext from existing non-derived labels in the SAME split,
+      then applies the requested transform deterministically (encode/encrypt).
+    - Deterministic selection per split → no cross-split leakage and stable resumes.
 
 Example:
   python build_stack_windows_arrow_splits.py \
@@ -49,6 +48,7 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
+import math
 import os
 import random
 import re
@@ -58,6 +58,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set
+from bisect import bisect_left
 
 # Keep native threadpools from over-subscribing
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -66,7 +67,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # 3rd-party deps expected:
 #   datasets>=2.14, magika==0.6.*, numpy, tqdm
-#   For synthetic encryption labels: pycryptodome (Crypto)
+#   For encryption transforms: pycryptodome (Crypto)
 from datasets import Dataset, Features, Value, load_dataset, load_from_disk, concatenate_datasets
 from datasets.exceptions import DatasetGenerationError
 from tqdm import tqdm
@@ -137,7 +138,7 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "batchfile": {"batchfile", "bat", "cmd"},
     "visual_basic": {"visual_basic", "visual-basic", "vb", "vba", "vb.net", "visualbasic"},
     "dockerfile": {"dockerfile", "docker"},
-    # synthetic labels are handled separately (no Magika check)
+    # derived labels are handled separately (no Magika check)
 }
 
 def label_matches_target(target: str, magika_label: Optional[str], mime: Optional[str]) -> bool:
@@ -286,7 +287,7 @@ LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     "batchfile": ["batchfile", "batch", "bat", "cmd"],
     "visual_basic": ["visual-basic", "visualbasic", "vb", "vb.net", "vba"],
     "dockerfile": ["dockerfile", "docker"],
-    # synthetic enc/enc are generated locally and do not map to The Stack
+    # derived enc/enc are generated locally and do not map to The Stack
 }
 
 def try_load_streaming_dir(lang_dir: str, *, shuffle_buffer: int, token: Optional[bool]) -> Optional[Any]:
@@ -419,18 +420,18 @@ class MagikaBatcher:
 
 
 # ============================================================
-#                 Synthetic data (encodings/encryptions)
+#               Derived data (encodings/encryptions)
 # ============================================================
 
-SYN_ENCODING_METHODS = {"hex", "base64", "base32", "base58", "base85"}
-SYN_ENCRYPTION_METHODS = {"aes", "des", "blowfish", "rc4", "chacha20"}
+ENCODING_METHODS = {"hex", "base64", "base32", "base58", "base85"}
+ENCRYPTION_METHODS = {"aes", "des", "blowfish", "rc4", "chacha20"}
 
-def is_synthetic_label(lbl: str) -> bool:
+def is_derived_label(lbl: str) -> bool:
     c = canonical_label(lbl)
     if c.startswith("encoding_"):
-        return c.split("encoding_", 1)[1] in SYN_ENCODING_METHODS
+        return c.split("encoding_", 1)[1] in ENCODING_METHODS
     if c.startswith("encryption_"):
-        return c.split("encryption_", 1)[1] in SYN_ENCRYPTION_METHODS
+        return c.split("encryption_", 1)[1] in ENCRYPTION_METHODS
     return False
 
 # Deterministic pseudo-random bytes (PRF) based on base_seed, split, method tag, and index.
@@ -447,9 +448,93 @@ def _prf_bytes(base_seed: int, split: str, tag: str, idx: int, n: int) -> bytes:
         ctr += 1
     return bytes(out[:n])
 
-# Base plaintext generator per split (shared across all synthetic labels for that split).
-def synthetic_plaintext(base_seed: int, split: str, idx: int, nbytes: int) -> bytes:
-    return _prf_bytes(base_seed, split, "plaintext", idx, nbytes)
+def _prf_int(base_seed: int, split: str, tag: str, idx: int, modulo: int) -> int:
+    if modulo <= 0:
+        raise ValueError("Modulo must be positive")
+    raw = _prf_bytes(base_seed, split, tag, idx, 8)
+    return int.from_bytes(raw, "big") % modulo
+
+@dataclass
+class PlaintextPool:
+    split: str
+    datasets: List[Dataset]
+    labels: List[str]
+    cumulative_counts: List[int]
+
+    @property
+    def total(self) -> int:
+        return self.cumulative_counts[-1] if self.cumulative_counts else 0
+
+    def locate(self, global_index: int) -> Tuple[int, int]:
+        if not (0 <= global_index < self.total):
+            raise IndexError(f"Plaintext index {global_index} out of range for split '{self.split}' (total={self.total})")
+        pos = bisect_left(self.cumulative_counts, global_index + 1)
+        prev_total = self.cumulative_counts[pos - 1] if pos > 0 else 0
+        return pos, global_index - prev_total
+
+def build_plaintext_pool(out_root: Path, split: str, exclude_label: str) -> PlaintextPool:
+    datasets: List[Dataset] = []
+    labels: List[str] = []
+    cumulative: List[int] = []
+    total = 0
+    split_root = out_root / split
+    if not split_root.exists():
+        return PlaintextPool(split, datasets, labels, cumulative)
+    for child in sorted(split_root.iterdir()):
+        if not child.is_dir():
+            continue
+        lbl = canonical_label(child.name)
+        if lbl == exclude_label:
+            continue
+        if lbl.startswith("encryption_") or lbl.startswith("encoding_"):
+            continue
+        ds_dir = child / "dataset"
+        if not ds_dir.exists():
+            continue
+        try:
+            ds = load_from_disk(str(ds_dir))
+        except Exception:
+            continue
+        length = len(ds)
+        if length == 0:
+            continue
+        datasets.append(ds)
+        labels.append(lbl)
+        total += length
+        cumulative.append(total)
+    return PlaintextPool(split, datasets, labels, cumulative)
+
+class PlaintextSampler:
+    __slots__ = ("total", "mode", "start", "step", "base_seed", "split", "method", "_tag")
+
+    def __init__(self, *, total: int, need: int, base_seed: int, split: str, method: str) -> None:
+        if total <= 0:
+            raise ValueError("Plaintext pool is empty")
+        self.total = total
+        self.base_seed = base_seed
+        self.split = split
+        self.method = method
+        self._tag = f"encrypt_src::{method}"
+        if total > 1 and total >= need:
+            start = _prf_int(base_seed, split, f"{method}_start", 0, total)
+            step = _prf_int(base_seed, split, f"{method}_step", 0, total)
+            step = step or 1
+            while math.gcd(step, total) != 1:
+                step = (step + 1) % total
+                if step == 0:
+                    step = 1
+            self.mode = "cycle"
+            self.start = start
+            self.step = step
+        else:
+            self.mode = "prf"
+            self.start = 0
+            self.step = 0
+
+    def index_for(self, position: int) -> int:
+        if self.mode == "cycle":
+            return (self.start + self.step * position) % self.total
+        return _prf_int(self.base_seed, self.split, self._tag, position, self.total)
 
 # Base58 (Bitcoin alphabet) encoder (no checksum)
 _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -494,14 +579,13 @@ def encrypt_bytes(method: str, base_seed: int, split: str, idx: int, raw: bytes)
     # keys/nonces derived deterministically from (seed, split, method, idx)
     if m == "aes":
         key = _prf_bytes(base_seed, split, "aes_key", idx, 32)   # AES-256
-        nonce = _prf_bytes(base_seed, split, "aes_nonce", idx, 16)
+        iv = _prf_bytes(base_seed, split, "aes_iv", idx, 16)
         try:
             from Crypto.Cipher import AES
         except Exception as e:
             raise RuntimeError("PyCryptodome is required for AES encryption") from e
-        cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
-        ct, tag = cipher.encrypt_and_digest(raw)
-        return nonce + tag + ct  # include nonce+tag for completeness
+        cipher = AES.new(key, AES.MODE_CFB, iv=iv, segment_size=128)
+        return iv + cipher.encrypt(raw)
     elif m == "des":
         key = bytearray(_prf_bytes(base_seed, split, "des_key", idx, 8))
         # Ensure DES key has odd parity (PyCryptodome adjusts if needed)
@@ -541,7 +625,7 @@ def encrypt_bytes(method: str, base_seed: int, split: str, idx: int, raw: bytes)
     else:
         raise ValueError(f"Unknown encryption method: {method}")
 
-def gen_synthetic_for_label(
+def gen_transformed_for_label(
     *,
     label_c: str,
     window_bytes: int,
@@ -551,16 +635,18 @@ def gen_synthetic_for_label(
     seen_uids: Optional[Set[str]],
     budget_per_split: Dict[str, int],
     base_seed: int,
+    out_root: Path,
 ) -> Iterator[dict]:
     is_tty = sys.stderr.isatty()
     show_progress = ((progress_mode == "always") or (progress_mode == "auto" and is_tty))
     total_budget = sum(max(0, b) for b in budget_per_split.values())
+    progress_desc = f"{label_c} (derived)"
+
     pbar = tqdm(total=total_budget if total_budget > 0 else None,
                 unit="win",
-                desc=f"{label_c} (synthetic)",
+                desc=progress_desc,
                 disable=not show_progress)
 
-    # Determine method & family
     if label_c.startswith("encoding_"):
         family = "encoding"
         method = label_c.split("encoding_", 1)[1]
@@ -571,53 +657,104 @@ def gen_synthetic_for_label(
     kept_total = 0
     kept_per_split = {"train": 0, "val": 0, "test": 0}
     lang_id = LANG2ID.get(label_c, -1)
+    out_root = Path(out_root)
+    pool_cache: Dict[str, PlaintextPool] = {}
 
-    # Deterministic per-split plaintext pools (shared across all synthetic labels via base_seed+split)
-    # We iterate idx=0.. and consume as many as needed per split, guaranteeing no cross-split reuse.
     for split in SPLITS:
-        need = budget_per_split.get(split, 0)
-        if need <= 0:
+        target = budget_per_split.get(split, 0)
+        if target <= 0:
             continue
-        idx = 0
-        while need > 0:
-            pt = synthetic_plaintext(base_seed, split, idx, window_bytes)
-            idx += 1
-            try:
-                if family == "encoding":
-                    content_str = encode_bytes(method, pt)
-                else:
-                    ct = encrypt_bytes(method, base_seed, split, idx - 1, pt)
-                    # Store ciphertext as hex for portability/readability
-                    content_str = ct.hex()
-            except Exception as e:
-                # If crypto backend unavailable, surface the error clearly.
-                raise
 
-            uid = stable_uid_for_window(content_str.encode("utf-8", errors="ignore"))
-            if seen_uids is not None and uid in seen_uids:
-                continue  # avoid duplicates within label
-            ex = {
-                "content": content_str,
-                "lang_id": np.int16(lang_id).item(),
-                "uid": uid,
-            }
-            if add_meta:
-                ex.update({
-                    "win_idx": np.int64(0).item(),
-                    "source_ext": f"{family}:{method}",
-                    "source_hexsha": "",
-                    "source_repo": "synthetic",
-                    "source_repo_path": f"{family}/{method}",
-                    "license": "synthetic",
-                })
-            ex["split"] = split
-            if seen_uids is not None:
-                seen_uids.add(uid)
-            need -= 1
-            kept_total += 1
-            kept_per_split[split] += 1
-            pbar.update(1)
-            yield ex
+        pool = pool_cache.get(split)
+        if pool is None:
+            pool = build_plaintext_pool(out_root, split, label_c)
+            pool_cache[split] = pool
+        if pool.total == 0:
+            raise RuntimeError(
+                f"No base windows available in split '{split}' under {out_root} to build '{label_c}'. "
+                "Ensure core language labels are generated before derived transforms."
+            )
+
+        sampler = PlaintextSampler(total=pool.total, need=target, base_seed=base_seed, split=split, method=method)
+        produced = 0
+        while produced < target:
+            batch_count = min(4096, target - produced)
+            positions = list(range(produced, produced + batch_count))
+            per_dataset_rows: Dict[int, List[int]] = {}
+            per_dataset_positions: Dict[int, List[int]] = {}
+            for pos in positions:
+                global_idx = sampler.index_for(pos)
+                ds_idx, local_idx = pool.locate(global_idx)
+                per_dataset_rows.setdefault(ds_idx, []).append(local_idx)
+                per_dataset_positions.setdefault(ds_idx, []).append(pos)
+
+            plaintext_by_position: Dict[int, Tuple[bytes, str]] = {}
+            for ds_idx, rows in per_dataset_rows.items():
+                ds = pool.datasets[ds_idx]
+                try:
+                    subset = ds[rows]
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to retrieve plaintext rows for split '{split}' (dataset index {ds_idx})"
+                    ) from e
+                contents = subset["content"]
+                base_label = pool.labels[ds_idx] if ds_idx < len(pool.labels) else ""
+                for content, pos in zip(contents, per_dataset_positions[ds_idx]):
+                    if isinstance(content, str):
+                        raw = content.encode("utf-8", errors="ignore")
+                    elif isinstance(content, bytes):
+                        raw = content
+                    elif isinstance(content, bytearray):
+                        raw = bytes(content)
+                    elif isinstance(content, memoryview):
+                        raw = content.tobytes()
+                    elif content is None:
+                        raw = b""
+                    else:
+                        raw = str(content).encode("utf-8", errors="ignore")
+                    plaintext_by_position[pos] = (raw, base_label)
+
+            for pos in positions:
+                raw_plain, base_label = plaintext_by_position.get(pos, (b"", ""))
+                if family == "encoding":
+                    try:
+                        content_str = encode_bytes(method, raw_plain)
+                    except Exception as e:
+                        raise RuntimeError(f"Encoding failed for method '{method}'") from e
+                else:
+                    try:
+                        ct = encrypt_bytes(method, base_seed, split, pos, raw_plain)
+                    except Exception as e:
+                        raise RuntimeError(f"Encryption failed for method '{method}'") from e
+                    content_str = ct.hex()
+
+                uid = stable_uid_for_window(content_str.encode("utf-8", errors="ignore"))
+                if seen_uids is not None and uid in seen_uids:
+                    continue
+
+                ex = {
+                    "content": content_str,
+                    "lang_id": np.int16(lang_id).item(),
+                    "uid": uid,
+                    "split": split,
+                }
+                if add_meta:
+                    ex.update({
+                        "win_idx": np.int64(0).item(),
+                        "source_ext": f"{family}:{method}",
+                        "source_hexsha": "",
+                        "source_repo": "derived",
+                        "source_repo_path": f"{base_label}->{family}:{method}",
+                        "license": "derived",
+                    })
+                if seen_uids is not None:
+                    seen_uids.add(uid)
+                budget_per_split[split] = max(0, budget_per_split[split] - 1)
+                kept_total += 1
+                kept_per_split[split] += 1
+                pbar.update(1)
+                yield ex
+            produced += batch_count
 
     pbar.set_postfix(k_train=kept_per_split["train"],
                      k_val=kept_per_split["val"],
@@ -646,12 +783,13 @@ def gen_windows_for_label(
     seen_uids: Optional[Set[str]] = None,
     budget_per_split: Dict[str, int],
     base_seed: int,
+    out_root: str,
 ) -> Iterator[dict]:
     label_c = canonical_label(logical_label)
 
-    # Synthetic families: generate locally with no Magika or The Stack streaming
-    if is_synthetic_label(label_c):
-        yield from gen_synthetic_for_label(
+    # Derived families: generate locally using existing plaintext (no Magika or The Stack streaming)
+    if is_derived_label(label_c):
+        yield from gen_transformed_for_label(
             label_c=label_c,
             window_bytes=window_bytes,
             add_meta=add_meta,
@@ -660,6 +798,7 @@ def gen_windows_for_label(
             seen_uids=seen_uids,
             budget_per_split=budget_per_split,
             base_seed=base_seed,
+            out_root=out_root,
         )
         return
 
@@ -842,13 +981,13 @@ LANG2ID: Dict[str, int] = {
     "batchfile": 20,
     "visual_basic": 21,
     "dockerfile": 22,
-    # synthetic encodings
+    # derived encodings
     "encoding_hex": 100,
     "encoding_base64": 101,
     "encoding_base32": 102,
     "encoding_base58": 103,
     "encoding_base85": 104,
-    # synthetic encryptions
+    # derived encryptions
     "encryption_aes": 120,
     "encryption_des": 121,
     "encryption_blowfish": 122,
@@ -1038,6 +1177,7 @@ def build_arrow_for_label_with_splits(
         seen_uids=seen_uids,
         budget_per_split=per_split_budget,
         base_seed=base_seed,
+        out_root=str(out_root),
     )
 
     # Ensure Hugging Face datasets cache stays within the writable workspace
@@ -1135,7 +1275,7 @@ def parse_args() -> argparse.Namespace:
             "• PHP: strips foreign (HTML/etc.) content via regex\n"
             "• In-process Magika prefilter (no temp files)\n"
             "• Resume-safe, duplicate-proof with per-window uid and deterministic splits (70/20/10)\n"
-            "• Synthetic families: encoding_* and encryption_* generated per split with no leakage"
+            "• Derived families: encoding_*/encryption_* reuse existing splits and apply deterministic transforms"
         )
     )
     # Core IO
@@ -1182,7 +1322,7 @@ def parse_args() -> argparse.Namespace:
     # UX
     ap.add_argument("--progress", choices=["auto", "always", "never"], default="auto",
                     help="Show live progress bars (default: auto)")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed (also used for synthetic generation)")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed (also used for derived transforms)")
     ap.add_argument("--demo", action="store_true",
                     help="Demo mode: keep at most 100 windows per label TOTAL (overrides --max-windows-per-label)")
     return ap.parse_args()
