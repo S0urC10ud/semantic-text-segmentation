@@ -68,6 +68,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 #   datasets>=2.14, magika==0.6.*, numpy, tqdm
 #   For synthetic encryption labels: pycryptodome (Crypto)
 from datasets import Dataset, Features, Value, load_dataset, load_from_disk, concatenate_datasets
+from datasets.exceptions import DatasetGenerationError
 from tqdm import tqdm
 import numpy as np
 
@@ -146,6 +147,19 @@ def label_matches_target(target: str, magika_label: Optional[str], mime: Optiona
     ml = canonical_label(magika_label)
     accepts = LABEL_ACCEPTS.get(tgt, {tgt})
     return ml in accepts
+
+
+def describe_exc(exc: BaseException) -> str:
+    parts: List[str] = []
+    seen: Set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        name = cur.__class__.__name__
+        msg = str(cur)
+        parts.append(f"{name}: {msg}" if msg else name)
+        cur = cur.__cause__ or cur.__context__
+    return " -> ".join(parts)
 
 
 # ============================================================
@@ -1026,13 +1040,29 @@ def build_arrow_for_label_with_splits(
         base_seed=base_seed,
     )
 
-    ds_new_total = Dataset.from_generator(
-        gen_windows_for_label,
-        gen_kwargs=gen_kwargs,
-        features=feats,
-        keep_in_memory=False,
-        writer_batch_size=writer_batch_size,
-    )
+    # Ensure Hugging Face datasets cache stays within the writable workspace
+    local_cache_dir = out_root / ".hf_cache"
+    local_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ds_new_total = Dataset.from_generator(
+            gen_windows_for_label,
+            gen_kwargs=gen_kwargs,
+            features=feats,
+            cache_dir=str(local_cache_dir),
+            keep_in_memory=False,
+            writer_batch_size=writer_batch_size,
+        )
+    except DatasetGenerationError as e:
+        root = e.__cause__ or e.__context__
+        detail = describe_exc(root) if root else describe_exc(e)
+        raise RuntimeError(
+            f"Dataset generation failed for label '{label_c}': {detail}"
+        ) from (root if root else e)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to build dataset for label '{label_c}': {describe_exc(e)}"
+        ) from e
 
     new_by_split: Dict[str, Optional[Dataset]] = {}
     for s in SPLITS:
@@ -1232,8 +1262,9 @@ def main() -> None:
             print("\n[!] Interrupted by user.", file=sys.stderr)
             raise
         except Exception as e:
-            failures.append(f"{lbl}: {e}")
-            print(f"  ✗ Failed: {e}\n", file=sys.stderr)
+            detail = describe_exc(e)
+            failures.append(f"{lbl}: {detail}")
+            print(f"  ✗ Failed: {detail}\n", file=sys.stderr)
 
         gc.collect()
 
