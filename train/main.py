@@ -38,12 +38,7 @@ jax.config.update("jax_enable_x64", False)
 
 from config import DataConfig, TrainConfig, NUM_CLASSES, ID2LANG, PAD_ID, PAD_BYTE_ID
 from data_utils import prepare_dsets_by_lang_with_splits
-from window_generator import (
-    PrefetchBatcher,
-    make_pure_window,
-    make_mixed_window,
-    make_line_injected_window,
-)
+from window_generator import make_training_window
 from model import (
     create_train_state,
     train_step,
@@ -111,16 +106,12 @@ def _make_eval_batch(
     dsets_by_lang: Dict[int, dict],
     L: int,
     batch_size: int,
-    mix_prob: float,
-    min_seg: int,
+    cfg: DataConfig,
 ) -> Tuple[np.ndarray, np.ndarray]:
     xb = np.full((batch_size, L), PAD_BYTE_ID, dtype=np.int32)
     yb = np.full((batch_size, L), PAD_ID, dtype=np.uint8)
     for i in range(batch_size):
-        if np.random.rand() < mix_prob:
-            x, y = make_mixed_window(dsets_by_lang, target_len=L, min_seg=min_seg)
-        else:
-            x, y = make_pure_window(dsets_by_lang, target_len=L)
+        x, y = make_training_window(dsets_by_lang, L, cfg)
         xb[i] = x
         yb[i] = y
     return xb, yb
@@ -132,8 +123,7 @@ def evaluate_split(
     L: int,
     batch_size: int,
     batches: int,
-    mix_prob: float,
-    min_seg: int,
+    cfg: DataConfig,
     rng,
 ) -> Tuple[float, float]:
     losses, accs = [], []
@@ -141,7 +131,8 @@ def evaluate_split(
         data_rng, eval_rng = jax.random.split(jax.random.fold_in(rng, i))
         seed_val = int(jax.random.randint(data_rng, (), 0, 2**31 - 1).item())
         np.random.seed(seed_val)
-        xb, yb = _make_eval_batch(dsets_by_lang, L, batch_size, mix_prob, min_seg)
+        random.seed(seed_val)
+        xb, yb = _make_eval_batch(dsets_by_lang, L, batch_size, cfg)
         loss, acc = eval_step(
             state,
             jnp.array(xb, dtype=jnp.int32),
@@ -182,6 +173,13 @@ def main():
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
     parser.add_argument("--dont_use_train_windows", action="store_true", default=False,
                       help="Use train directory instead of train_windows for training data")
+    parser.add_argument(
+        "--lang",
+        dest="langs",
+        action="append",
+        default=None,
+        help="Restrict training to specific languages (repeatable or comma-separated).",
+    )
 
     # Pruning
     parser.add_argument("--prune_min_minutes", type=int, default=15)
@@ -206,6 +204,28 @@ def main():
     parser.add_argument("--preview_count", type=int, default=10)
 
     args = parser.parse_args()
+
+    selected_langs = None
+    if args.langs:
+        normalized = []
+        for entry in args.langs:
+            parts = [part.strip() for part in entry.split(",") if part.strip()]
+            if parts:
+                normalized.extend(parts)
+        if normalized:
+            seen = set()
+            selected_langs = []
+            for lang in normalized:
+                lang_key = lang.lower()
+                if lang_key not in seen:
+                    seen.add(lang_key)
+                    selected_langs.append(lang_key)
+            if selected_langs:
+                print(f"Restricting training to languages: {selected_langs}", flush=True)
+            else:
+                selected_langs = None
+        else:
+            print("No valid languages provided via --lang; falling back to all languages.", flush=True)
 
     # Build configs
     d_cfg = DataConfig(
@@ -245,57 +265,25 @@ def main():
     print("Preparing datasets...", flush=True)
     dsets = prepare_dsets_by_lang_with_splits(
         d_cfg.data_root,
-        use_train_windows=not args.dont_use_train_windows
+        use_train_windows=not args.dont_use_train_windows,
+        include_languages=selected_langs,
     )
     train_dsets = dsets["train"]
 
-    # Preview mode (now mirrors PrefetchBatcher distribution, incl. 'both' overlays)
+    # Preview mode (mirrors training distribution, including mixed overlays)
     if t_cfg.preview_only:
         print(
             f"--- PREVIEW MODE: generating {t_cfg.preview_count} examples ---",
             flush=True,
         )
         examples = []
-        both_prob = getattr(d_cfg, "both_prob", 0.2)
-        pad_tail_prob = getattr(d_cfg, "pad_tail_prob", 0.6)
-        pad_tail_max_frac = getattr(d_cfg, "pad_tail_max_frac", 0.9)
 
         for i in range(t_cfg.preview_start, t_cfg.preview_start + t_cfg.preview_count):
             np.random.seed(i)
             random.seed(i)
             L = random.choice(d_cfg.buckets())
 
-            r = random.random()
-            if r < d_cfg.pure_prob:
-                x, y = make_pure_window(train_dsets, L)
-            elif r < d_cfg.pure_prob + d_cfg.line_inject_prob:
-                x, y = make_line_injected_window(train_dsets, L, d_cfg)
-            else:
-                x, y = make_mixed_window(train_dsets, L, d_cfg.min_seg_len)
-
-            # Combine both modes sometimes (overlay mixed slices into base)
-            if random.random() < both_prob:
-                xm, ym = make_mixed_window(train_dsets, L, d_cfg.min_seg_len)
-                nslices = random.randint(1, 3)
-                for _ in range(nslices):
-                    max_len = max(d_cfg.min_seg_len, L // 4)
-                    seg_len = random.randint(d_cfg.min_seg_len, max_len)
-                    if seg_len >= L:
-                        seg_len = L - 1
-                    start = random.randint(0, L - seg_len)
-                    end = start + seg_len
-                    x[start:end] = xm[start:end]
-                    y[start:end] = ym[start:end]
-
-            # Varied tail padding to make “contained padding” obvious in preview too
-            if random.random() < pad_tail_prob:
-                max_pad = max(1, int(L * pad_tail_max_frac))
-                pad_len = random.randint(0, max_pad)
-                if pad_len > 0:
-                    content_end = max(1, L - pad_len)
-                    x[content_end:] = PAD_BYTE_ID
-                    y[content_end:] = PAD_ID
-
+            x, y = make_training_window(train_dsets, L, d_cfg)
             examples.append((x, y))
 
         out_path = "preview.html"
@@ -494,8 +482,7 @@ def main():
                         L=d_cfg.window_max_bytes,
                         batch_size=d_cfg.batch_size,
                         batches=t_cfg.eval_batches,
-                        mix_prob=d_cfg.mix_prob,
-                        min_seg=d_cfg.min_seg_len,
+                        data_cfg=d_cfg,
                         rng=eval_rng,
                         eval_step_fn=eval_step,
                     )

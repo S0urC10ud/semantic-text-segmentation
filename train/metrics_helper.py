@@ -5,13 +5,14 @@ and Weights & Biases logging.
 """
 from typing import Dict, Tuple
 import os
+import random
 import numpy as np
 import jax
 import jax.numpy as jnp
 import wandb
 
-from config import NUM_CLASSES, PAD_ID, PAD_BYTE_ID
-from window_generator import make_pure_window, make_mixed_window
+from config import DataConfig, NUM_CLASSES, PAD_ID, PAD_BYTE_ID
+from window_generator import make_training_window
 
 # Ensure any later matplotlib usage in this process prefers a headless backend.
 # (This is belt-and-suspenders; we don't import pyplot anywhere below.)
@@ -34,17 +35,13 @@ def _make_eval_batch(
     dsets_by_lang: Dict[int, dict],
     L: int,
     batch_size: int,
-    mix_prob: float,
-    min_seg: int,
+    cfg: DataConfig,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build an eval batch mirroring the data pipeline logic."""
     xb = np.full((batch_size, L), PAD_BYTE_ID, dtype=np.int32)
     yb = np.full((batch_size, L), PAD_ID, dtype=np.uint8)
     for i in range(batch_size):
-        if np.random.rand() < mix_prob:
-            x, y = make_mixed_window(dsets_by_lang, target_len=L, min_seg=min_seg)
-        else:
-            x, y = make_pure_window(dsets_by_lang, target_len=L)
+        x, y = make_training_window(dsets_by_lang, L, cfg)
         xb[i] = x
         yb[i] = y
     return xb, yb
@@ -505,8 +502,7 @@ def evaluate_split_with_metrics(
     L: int,
     batch_size: int,
     batches: int,
-    mix_prob: float,
-    min_seg: int,
+    data_cfg: DataConfig,
     rng,
     eval_step_fn=None,
 ) -> Tuple[float, float, np.ndarray]:
@@ -524,7 +520,8 @@ def evaluate_split_with_metrics(
         data_rng, eval_rng = jax.random.split(jax.random.fold_in(rng, i))
         seed_val = int(jax.random.randint(data_rng, (), 0, 2**31 - 1).item())
         np.random.seed(seed_val)
-        xb, yb = _make_eval_batch(dsets_by_lang, L, batch_size, mix_prob, min_seg)
+        random.seed(seed_val)
+        xb, yb = _make_eval_batch(dsets_by_lang, L, batch_size, data_cfg)
 
         # Standard eval (loss/acc)
         loss, acc = eval_step_fn(

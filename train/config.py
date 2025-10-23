@@ -57,11 +57,11 @@ class DataConfig:
     window_max_bytes: int = 512
     bucket_step: int = 128
     batch_size: int = 16
-    mix_prob: float = 0.5
+    mix_prob: float = 0.45
     min_seg_len: int = 64
-    pure_prob: float = 0.25
+    pure_prob: float = 0.05
     line_inject_prob: float = 0.5
-    # remaining percentage is for mixed prob!
+    # remaining probability mass is used for mixed windows
 
     # Prefetching
     prefetch_batches: int = 4
@@ -73,6 +73,7 @@ class DataConfig:
     line_inject_exp_rate: float = 0.06  # λ for exponential line count
     line_inject_max_lines: int = 100
     line_inject_min_single_len: int = 4
+    line_inject_min_letters: int = 4
     allow_same_lang_injection: bool = True
     reindent_prob: float = 0.5
     start_with_newline_prob: float = 0.5

@@ -158,11 +158,91 @@ def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
 
 
 # ---------------------------
+# Shared sampler for train/eval/preview
+# ---------------------------
+
+def _resolve_mix_probability(cfg: DataConfig) -> float:
+    mix_prob = getattr(cfg, "mix_prob", None)
+    pure_prob = max(0.0, getattr(cfg, "pure_prob", 0.0))
+    line_prob = max(0.0, getattr(cfg, "line_inject_prob", 0.0))
+    if mix_prob is None:
+        mix_prob = 1.0 - pure_prob - line_prob
+    return max(0.0, mix_prob)
+
+
+def _choose_window_mode(cfg: DataConfig) -> str:
+    pure_prob = max(0.0, getattr(cfg, "pure_prob", 0.0))
+    line_prob = max(0.0, getattr(cfg, "line_inject_prob", 0.0))
+    mix_prob = _resolve_mix_probability(cfg)
+    total = pure_prob + line_prob + mix_prob
+    if total <= 0.0:
+        return "mixed"
+
+    r = random.random() * total
+    if r < pure_prob:
+        return "pure"
+    if r < pure_prob + line_prob:
+        return "line_inject"
+    return "mixed"
+
+
+def make_training_window(
+    dsets_by_lang: Dict[int, hfds.Dataset],
+    target_len: int,
+    cfg: DataConfig,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Draw a window using the same probability distribution as the training
+    prefetchers, including mixed windows, line injection, optional overlays,
+    and tail padding variation.
+    """
+    mode = _choose_window_mode(cfg)
+    if mode == "pure":
+        x, y = make_pure_window(dsets_by_lang, target_len)
+    elif mode == "line_inject":
+        x, y = make_line_injected_window(dsets_by_lang, target_len, cfg)
+    else:
+        x, y = make_mixed_window(dsets_by_lang, target_len, cfg.min_seg_len)
+
+    # Optionally overlay mixed slices on top of base window
+    both_prob = getattr(cfg, "both_prob", 0.2)
+    if both_prob > 0.0 and random.random() < both_prob:
+        xm, ym = make_mixed_window(dsets_by_lang, target_len, cfg.min_seg_len)
+        nslices = random.randint(1, 3)
+        for _ in range(nslices):
+            max_len = max(cfg.min_seg_len, target_len // 4)
+            seg_len = random.randint(cfg.min_seg_len, max_len)
+            if seg_len >= target_len:
+                seg_len = target_len - 1
+            start = random.randint(0, target_len - seg_len)
+            end = start + seg_len
+            x[start:end] = xm[start:end]
+            y[start:end] = ym[start:end]
+
+    # Tail padding variation mirrors training augmentation
+    pad_tail_prob = getattr(cfg, "pad_tail_prob", 0.6)
+    if pad_tail_prob > 0.0 and random.random() < pad_tail_prob:
+        max_frac = getattr(cfg, "pad_tail_max_frac", 0.9)
+        max_pad = max(1, int(target_len * max_frac))
+        pad_len = random.randint(0, max_pad)
+        if pad_len > 0:
+            content_end = max(1, target_len - pad_len)
+            x[content_end:] = PAD_BYTE_ID
+            y[content_end:] = PAD_ID
+
+    return x, y
+
+
+# ---------------------------
 # LINE-LEVEL INJECTION
 # ---------------------------
 
 def _split_keepends_lines(text: str) -> List[str]:
     return text.splitlines(keepends=True) if text else []
+
+
+def _count_letters(text: str) -> int:
+    return sum(("a" <= c <= "z") or ("A" <= c <= "Z") for c in text)
 
 
 def _sample_truncated_exp_lines(lam: float, max_lines: int) -> int:
@@ -218,6 +298,28 @@ def _prepare_donor_block(donor_text: str, cfg: DataConfig, insertion_indent: str
         elif start_idx > 0:
             pick.insert(0, lines[start_idx - 1])
 
+    max_total_lines = min(len(lines), cfg.line_inject_max_lines)
+    min_letters = getattr(cfg, "line_inject_min_letters", 4)
+
+    def pick_letter_count() -> int:
+        return sum(_count_letters(ln) for ln in pick)
+
+    letter_count = pick_letter_count()
+    while letter_count < min_letters and len(pick) < max_total_lines:
+        expanded = False
+        if end_idx < len(lines) and len(pick) < max_total_lines:
+            pick.append(lines[end_idx])
+            end_idx += 1
+            expanded = True
+            letter_count = pick_letter_count()
+        if letter_count < min_letters and len(pick) < max_total_lines and start_idx > 0:
+            start_idx -= 1
+            pick.insert(0, lines[start_idx])
+            expanded = True
+            letter_count = pick_letter_count()
+        if not expanded:
+            break
+
     w_none, w_l, w_r, w_b = cfg.strip_weights
     mode = random.choices(["none", "lstrip", "rstrip", "strip"], weights=[w_none, w_l, w_r, w_b], k=1)[0]
 
@@ -235,7 +337,11 @@ def _prepare_donor_block(donor_text: str, cfg: DataConfig, insertion_indent: str
             core = insertion_indent + core.lstrip()
 
         processed.append(core + ('\n' if ln.endswith('\n') else ''))
-    return "".join(processed)
+
+    block = "".join(processed)
+    if _count_letters(block) < min_letters:
+        return ""
+    return block
 
 
 def _insert_block_at(chars: List[str], labels: List[int], idx: int, block: str, lid: int):
@@ -356,42 +462,7 @@ class PrefetchBatcher:
             yb = np.full((self.cfg.batch_size, L), PAD_ID, dtype=np.uint8)
 
             for i in range(self.cfg.batch_size):
-                r = random.random()
-                # Base mode selection
-                if r < self.cfg.pure_prob:
-                    x, y = make_pure_window(self.dsets_by_lang, L)
-                elif r < self.cfg.pure_prob + self.cfg.line_inject_prob:
-                    x, y = make_line_injected_window(self.dsets_by_lang, L, self.cfg)
-                else:
-                    x, y = make_mixed_window(self.dsets_by_lang, L, self.cfg.min_seg_len)
-
-                # Occasionally combine both (line-injected + mixed) in one sample
-                both_prob = getattr(self.cfg, "both_prob", 0.2)
-                if random.random() < both_prob:
-                    xm, ym = make_mixed_window(self.dsets_by_lang, L, self.cfg.min_seg_len)
-                    # Replace 1-3 random slices to blend modes
-                    nslices = random.randint(1, 3)
-                    for _ in range(nslices):
-                        max_len = max(self.cfg.min_seg_len, L // 4)
-                        seg_len = random.randint(self.cfg.min_seg_len, max_len)
-                        if seg_len >= L:
-                            seg_len = L - 1
-                        start = random.randint(0, L - seg_len)
-                        end = start + seg_len
-                        x[start:end] = xm[start:end]
-                        y[start:end] = ym[start:end]
-
-                # Intentionally introduce varied padding within the fixed-length window
-                pad_tail_prob = getattr(self.cfg, "pad_tail_prob", 0.6)
-                if random.random() < pad_tail_prob:
-                    max_frac = getattr(self.cfg, "pad_tail_max_frac", 0.9)
-                    max_pad = max(1, int(L * max_frac))
-                    pad_len = random.randint(0, max_pad)
-                    if pad_len > 0:
-                        content_end = max(1, L - pad_len)
-                        x[content_end:] = PAD_BYTE_ID
-                        y[content_end:] = PAD_ID
-
+                x, y = make_training_window(self.dsets_by_lang, L, self.cfg)
                 xb[i], yb[i] = x, y
 
             try:

@@ -1,49 +1,20 @@
 """
-Functions for generating training windows from datasets, with epoch-based iteration.
+Functions for generating training windows from datasets, with lightweight
+epoch-style progress tracking that matches the sampling distribution used
+for validation.
 """
-import math
 import random
 import queue
 import threading
 import time
-from typing import List, Tuple, Dict, Optional, Iterator
+from typing import Dict, List
 
 import numpy as np
 import datasets as hfds
 
 from config import DataConfig, PAD_ID, PAD_BYTE_ID
-from data_utils import bytes_from_text
+from window_generator import make_training_window
 
-class EpochIterator:
-    def __init__(self, dataset: hfds.Dataset):
-        self.dataset = dataset
-        self.current_idx = 0
-        self._length = None
-        self.epoch = 0
-        # Try to get length, fallback for streaming datasets
-        try:
-            self._length = len(dataset)
-        except Exception:
-            pass
-    
-    def __iter__(self):
-        return self
-    
-    def __next__(self) -> dict:
-        if self._length is not None:
-            if self.current_idx >= self._length:
-                self.current_idx = 0
-                self.epoch += 1
-            example = self.dataset[self.current_idx]
-            self.current_idx += 1
-            return example
-        else:
-            # For streaming datasets, do our best to iterate
-            try:
-                return next(iter(self.dataset))
-            except StopIteration:
-                self.epoch += 1
-                return next(iter(self.dataset))
 
 class EpochPrefetchBatcher:
     def __init__(self, dsets_by_lang: Dict[int, hfds.Dataset], cfg: DataConfig):
@@ -53,12 +24,20 @@ class EpochPrefetchBatcher:
         self.stop_flag = threading.Event()
         self.buckets = cfg.buckets()
         self.threads: List[threading.Thread] = []
-        
-        # Create iterators for each dataset
-        self.iterators = {
-            lang_id: EpochIterator(dataset) 
-            for lang_id, dataset in dsets_by_lang.items()
-        }
+
+        # Track per-language token usage to estimate fractional epochs
+        self._lang_token_counts = {lang_id: 0 for lang_id in dsets_by_lang.keys()}
+        self._token_targets = {}
+        max_len = max(1, cfg.window_max_bytes)
+        for lang_id, dataset in dsets_by_lang.items():
+            try:
+                length = len(dataset)
+            except Exception:
+                length = None
+            if length is None or length <= 0:
+                length = 1
+            self._token_targets[lang_id] = max_len * length
+        self._lock = threading.Lock()
 
         # Use fewer worker threads for better determinism
         for wid in range(max(1, cfg.num_workers // 2)):
@@ -66,32 +45,22 @@ class EpochPrefetchBatcher:
             t.start()
             self.threads.append(t)
 
-    def _make_window(self, example: dict, lang_id: int, target_len: int) -> Tuple[np.ndarray, np.ndarray]:
-        x = np.full((target_len,), PAD_BYTE_ID, dtype=np.int32)
-        y = np.full((target_len,), PAD_ID, dtype=np.uint8)
-        
-        if not example or not example.get("content", ""):
-            return x, y
-
-        b = bytes_from_text(example["content"])
-        if len(b) == 0:
-            return x, y
-
-        if len(b) >= target_len:
-            start = random.randint(0, len(b) - target_len)
-            b = b[start:start + target_len]
-
-        L = len(b)
-        x[:L] = b.astype(np.int32)
-        y[:L] = lang_id
-        return x, y
+    def _update_token_counts(self, labels: np.ndarray):
+        valid = labels[labels != PAD_ID]
+        if valid.size == 0:
+            return
+        unique, counts = np.unique(valid, return_counts=True)
+        with self._lock:
+            for lid, cnt in zip(unique.astype(int), counts.astype(int)):
+                if lid in self._lang_token_counts:
+                    self._lang_token_counts[lid] += cnt
 
     def _worker(self, wid: int):
         random.seed(self.cfg.seed ^ wid ^ int(time.time()))
         hold = max(1, self.cfg.bucket_hold_steps)
         L = random.choice(self.buckets)
         k = 0
-        
+
         while not self.stop_flag.is_set():
             if k % hold == 0:
                 L = random.choice(self.buckets)
@@ -100,31 +69,30 @@ class EpochPrefetchBatcher:
             xb = np.full((self.cfg.batch_size, L), PAD_BYTE_ID, dtype=np.int32)
             yb = np.full((self.cfg.batch_size, L), PAD_ID, dtype=np.uint8)
 
-            # For each item in the batch
             for i in range(self.cfg.batch_size):
-                # Randomly choose a language but iterate through its files sequentially
-                lang_id = random.choice(list(self.iterators.keys()))
-                example = next(self.iterators[lang_id])
-                
-                # Create window from example
-                x, y = self._make_window(example, lang_id, L)
+                x, y = make_training_window(self.dsets_by_lang, L, self.cfg)
                 xb[i], yb[i] = x, y
+                self._update_token_counts(y)
 
             try:
                 self.q.put((xb, yb), timeout=1.0)
             except queue.Full:
                 continue
 
-    def get_epochs(self) -> Dict[int, int]:
-        """Returns a dictionary of language ID to current epoch number"""
-        return {lang_id: it.epoch for lang_id, it in self.iterators.items()}
+    def get_epochs(self) -> Dict[int, float]:
+        """Approximate fractional epochs per language based on token usage."""
+        with self._lock:
+            epochs = {}
+            for lang_id, tokens in self._lang_token_counts.items():
+                target = max(1, self._token_targets.get(lang_id, 1))
+                epochs[lang_id] = tokens / target
+            return epochs
 
     def get(self):
         return self.q.get()
 
     def close(self):
         self.stop_flag.set()
-        # Drain queue to unblock workers
         while not self.q.empty():
             try:
                 self.q.get_nowait()

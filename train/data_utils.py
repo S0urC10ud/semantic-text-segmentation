@@ -63,7 +63,11 @@ def _build_local_dataset_for_lang(lang: str, data_root: str, split: str, use_tra
         return None
 
 
-def prepare_dsets_by_lang_with_splits(data_root: str, use_train_windows: bool = True) -> Dict[str, Dict[int, hfds.Dataset]]:
+def prepare_dsets_by_lang_with_splits(
+    data_root: str,
+    use_train_windows: bool = True,
+    include_languages: Optional[List[str]] = None,
+) -> Dict[str, Dict[int, hfds.Dataset]]:
     """
     Returns a nested dict: splits['train'|'val'|'test'][lang_id] -> dataset
     Datasets can contain windows of varying sizes - padding/truncation happens during training.
@@ -74,14 +78,39 @@ def prepare_dsets_by_lang_with_splits(data_root: str, use_train_windows: bool = 
     
     if not os.path.exists(data_root):
         raise ValueError(f"❌ DATA ROOT NOT FOUND: {data_root}")
-        
+
+    configured_langs = list(LANG2ID.keys())
+    canonical_map = {lang.lower(): lang for lang in configured_langs}
+    requested_langs: Optional[List[str]] = None
+    if include_languages:
+        requested_langs = []
+        invalid = []
+        for lang in include_languages:
+            key = lang.lower()
+            if key in canonical_map:
+                requested_langs.append(canonical_map[key])
+            else:
+                invalid.append(lang)
+        if invalid:
+            raise ValueError(
+                f"❌ Unknown languages requested via --lang: {invalid}. "
+                f"Available languages: {sorted(configured_langs)}"
+            )
+        # Deduplicate while preserving the configured order
+        deduped = list(dict.fromkeys(requested_langs))
+        requested_langs = [lang for lang in configured_langs if lang in deduped]
+        if not requested_langs:
+            requested_langs = None
+    
+    target_langs = requested_langs if requested_langs is not None else configured_langs
+
     # First scan: check existence and sample counts
     splits = {"train": {}, "val": {}, "test": {}}
-    lang_stats = {lang: {"splits": {}, "total_samples": 0} for lang in LANG2ID}
+    lang_stats = {lang: {"splits": {}, "total_samples": 0} for lang in target_langs}
     
     for split in ("train", "val", "test"):
         print(f"\n📂 Checking {split} split...")
-        for lang in LANG2ID:
+        for lang in target_langs:
             ds = _build_local_dataset_for_lang(lang, data_root, split, use_train_windows=use_train_windows)
             if ds is not None and len(ds) > 0:
                 lang_id = LANG2ID[lang]
@@ -98,7 +127,7 @@ def prepare_dsets_by_lang_with_splits(data_root: str, use_train_windows: bool = 
     
     available_langs = set()
     all_missing = True
-    for lang in sorted(LANG2ID.keys()):
+    for lang in sorted(target_langs):
         stats = lang_stats[lang]
         train_count = stats["splits"].get("train", 0)
         val_count = stats["splits"].get("val", 0)
@@ -133,6 +162,13 @@ def prepare_dsets_by_lang_with_splits(data_root: str, use_train_windows: bool = 
                        "- Required structure: <data_root>/<split>/<language>/dataset\n" +
                        "- Each language needs at least train and val splits\n" +
                        "!"*80)
+
+    if requested_langs is not None:
+        missing_requested = set(requested_langs) - available_langs
+        if missing_requested:
+            raise ValueError(
+                f"❌ Requested languages missing required splits: {sorted(missing_requested)}"
+            )
     
     # Rebuild LANG2ID with only available languages
     LANG2ID.clear()
