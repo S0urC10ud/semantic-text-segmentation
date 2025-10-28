@@ -36,7 +36,7 @@ Also supported (derived transforms):
 Example:
   python build_stack_windows_arrow_splits.py \
       --out-root arrow_out \
-      --langs html,css,javascript,c,cpp,csv,java,json,python,text,shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,encryption_aes,encryption_des,encryption_blowfish,encryption_rc4,encryption_chacha20 \
+      --langs html,css,javascript,typescript,c,cpp,csharp,go,rust,csv,java,json,python,ruby,text,shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85 \
       --max-windows-per-label 200000 \
       --window-bytes 1536 --magika-batch 1024 --threshold 0.82 \
       --shard-count 64 --shard-index 17 \
@@ -149,6 +149,32 @@ def label_matches_target(target: str, magika_label: Optional[str], mime: Optiona
     accepts = LABEL_ACCEPTS.get(tgt, {tgt})
     return ml in accepts
 
+# Placeholder for any character outside ASCII range (0–127).
+NON_ASCII_PLACEHOLDER = "\u00A4"  # generic currency sign as replacement sentinel
+
+def map_text_to_ascii(text: str, placeholder: str = NON_ASCII_PLACEHOLDER) -> str:
+    """
+    Ensure the returned string only contains ASCII codepoints, except for the
+    dedicated placeholder used wherever a character falls outside ASCII.
+    """
+    if not text:
+        return ""
+    return "".join(ch if ord(ch) < 128 else placeholder for ch in text)
+
+def extract_primary_text(ex: Dict[str, Any]) -> Optional[str]:
+    """
+    Fetch the best-effort textual payload from a dataset example.
+    Falls back through common field names used by different sources.
+    """
+    if not ex:
+        return None
+    candidates = ("content", "text", "raw_content", "body", "document", "content_text")
+    for key in candidates:
+        val = ex.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return None
+
 
 def describe_exc(exc: BaseException) -> str:
     parts: List[str] = []
@@ -227,6 +253,54 @@ def license_is_allowed(example: Dict[str, Any]) -> Tuple[bool, str]:
 #               PHP foreign content removal (regex)
 # ============================================================
 
+_BLADE_DIRECTIVE_RE = re.compile(
+    r"(?im)^\s*@(?:extends|section|yield|endsection|include|component|slot|push|stop|parent|stack|csrf|method|error|lang|forelse|empty|endforelse|php|endphp|verbatim|endverbatim)\b"
+)
+_BLADE_COMMENT_RE = re.compile(r"(?is)\{\{--.*?--\}\}")
+_TWIG_TAG_RE = re.compile(r"{%\s*[a-z]", re.IGNORECASE)
+_SMARTY_TAG_RE = re.compile(r"{/?\s*(?:if|foreach|section|block|capture|literal|extends|include)\b", re.IGNORECASE)
+_DOUBLE_CURLY_RE = re.compile(r"\{\{[^}]+\}\}")
+
+def is_probable_php_template(text: str, *, path: Optional[str] = None) -> bool:
+    """
+    Heuristic detection for PHP template languages (Blade/Twig/Smarty/etc.).
+    Returns True when the file is likely a template instead of executable PHP.
+    """
+    if not text:
+        return False
+
+    path_lower = (path or "").lower()
+    if (
+        path_lower.endswith(".blade.php")
+        or ".blade.php" in path_lower
+        or path_lower.endswith(".twig")
+        or path_lower.endswith(".tpl")
+        or path_lower.endswith(".tpl.php")
+        or "/resources/views/" in path_lower
+    ):
+        return True
+
+    php_tag_present = "<?" in text
+    markers = 0
+
+    if _BLADE_DIRECTIVE_RE.search(text):
+        markers += 1
+    if _BLADE_COMMENT_RE.search(text):
+        markers += 1
+
+    moustache_hits = len(_DOUBLE_CURLY_RE.findall(text))
+    if moustache_hits >= 2 and not php_tag_present:
+        markers += 1
+    if moustache_hits >= 1 and _BLADE_DIRECTIVE_RE.search(text):
+        markers += 1
+
+    if _TWIG_TAG_RE.search(text) and not php_tag_present:
+        markers += 1
+    if _SMARTY_TAG_RE.search(text) and not php_tag_present:
+        markers += 1
+
+    return markers >= 2
+
 _PHP_BLOCK_RE = re.compile(
     r"(?is)<\?(?!xml)(?:php|=)?(.*?)\?>"
 )
@@ -234,11 +308,13 @@ _ASP_PHP_BLOCK_RE = re.compile(
     r"(?is)<%(.*?)%>"
 )
 
-def extract_php_code_only(text: str) -> str:
+def extract_php_code_only(text: str, *, path: Optional[str] = None) -> str:
     """
     Keep ONLY PHP code regions, drop all HTML/other template text.
     """
     if not text:
+        return ""
+    if is_probable_php_template(text, path=path):
         return ""
     parts: List[str] = []
     for m in _PHP_BLOCK_RE.finditer(text):
@@ -290,6 +366,22 @@ LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     # derived enc/enc are generated locally and do not map to The Stack
 }
 
+def stream_madlad_iterable(*, shuffle_buffer: int) -> Optional[Any]:
+    """
+    Streaming loader for allenai/MADLAD-400 (clean split) backing the 'text' label.
+    """
+    try:
+        ds = load_dataset("allenai/MADLAD-400", split="clean", streaming=True)
+    except Exception as e:
+        sys.stderr.write(f"[warn] failed to open MADLAD-400 (clean split): {e}\n")
+        return None
+    if shuffle_buffer > 0:
+        try:
+            ds = ds.shuffle(seed=42, buffer_size=shuffle_buffer)
+        except Exception as e:
+            sys.stderr.write(f"[warn] MADLAD shuffle failed (falling back to sequential order): {e}\n")
+    return ds
+
 def try_load_streaming_dir(lang_dir: str, *, shuffle_buffer: int, token: Optional[bool]) -> Optional[Any]:
     load_kwargs = dict(
         path="bigcode/the-stack",
@@ -321,20 +413,23 @@ def stream_language_iterable(
     skip_first_n: int,
 ) -> Optional[Any]:
     logical_label = canonical_label(logical_label)
-    cands = LANG_CANDIDATE_DIRS.get(logical_label, [logical_label])
-    token_val: Optional[bool] = None
-    if use_auth_token:
-        try:
-            from huggingface_hub import get_token  # type: ignore
-            token_val = get_token() or True
-        except Exception:
-            token_val = True
+    if logical_label == "text":
+        ds = stream_madlad_iterable(shuffle_buffer=shuffle_buffer)
+    else:
+        cands = LANG_CANDIDATE_DIRS.get(logical_label, [logical_label])
+        token_val: Optional[bool] = None
+        if use_auth_token:
+            try:
+                from huggingface_hub import get_token  # type: ignore
+                token_val = get_token() or True
+            except Exception:
+                token_val = True
 
-    ds = None
-    for d in cands:
-        ds = try_load_streaming_dir(d, shuffle_buffer=shuffle_buffer, token=token_val)
-        if ds is not None:
-            break
+        ds = None
+        for d in cands:
+            ds = try_load_streaming_dir(d, shuffle_buffer=shuffle_buffer, token=token_val)
+            if ds is not None:
+                break
     if ds is None:
         return None
 
@@ -832,24 +927,25 @@ def gen_windows_for_label(
     lang_id = LANG2ID.get(canonical_label(logical_label), -1)
 
     buf_bytes: List[bytes] = []
-    buf_meta: List[Tuple[int, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], str, str]] = []
+    buf_meta: List[Tuple[int, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], str]] = []
     buf_uids: List[str] = []
+    buf_ascii_texts: List[str] = []
 
     def _flush_batch():
         nonlocal kept_total, rejected
         if not buf_bytes:
             return
         results = batcher.identify_many(buf_bytes)
-        for (res, meta, raw, uid) in zip(results, buf_meta, buf_bytes, buf_uids):
+        for (res, meta, raw, uid, ascii_text) in zip(results, buf_meta, buf_bytes, buf_uids, buf_ascii_texts):
             if kept_total >= total_budget and total_budget > 0:
                 break
-            win_idx, ext, hexsha, repo_name, repo_path, license_str, split, _uid = meta
+            win_idx, ext, hexsha, repo_name, repo_path, license_str, split = meta
             if budget_per_split.get(split, 0) <= 0:
                 rejected += 1
                 continue
             if res.ok and res.score >= threshold and label_matches_target(logical_label, res.label, res.mime):
                 payload = {
-                    "content": raw.decode("utf-8", errors="ignore"),
+                    "content": ascii_text,
                     "lang_id": np.int16(lang_id).item(),
                     "uid": uid,
                     "split": split,
@@ -875,42 +971,70 @@ def gen_windows_for_label(
         buf_bytes.clear()
         buf_meta.clear()
         buf_uids.clear()
+        buf_ascii_texts.clear()
 
     last_postfix = time.time()
     for ex in ds:
         if kept_total >= total_budget and total_budget > 0:
             break
 
-        ok_lic, _ = license_is_allowed(ex)
-        if not ok_lic:
-            continue
-
-        content = ex.get("content", "")
-        if not isinstance(content, str) or not content:
-            continue
-
-        if canonical_label(logical_label) == "php":
-            content = extract_php_code_only(content)
-            if not content:
-                continue
-
-        try:
-            b = content.encode("utf-8", errors="ignore")
-        except Exception:
-            continue
-        if not b:
+        raw_text = extract_primary_text(ex)
+        if not raw_text:
             continue
 
         ext = ex.get("ext")
         hexsha = ex.get("hexsha")
         repo_name = ex.get("max_stars_repo_name") or ex.get("repo_name")
-        repo_path = ex.get("max_stars_repo_path") or ex.get("path")
+        repo_path_raw = ex.get("max_stars_repo_path") or ex.get("path")
+        if repo_path_raw is None:
+            repo_path = None
+        elif isinstance(repo_path_raw, str):
+            repo_path = repo_path_raw
+        else:
+            repo_path = str(repo_path_raw)
         license_str = ex.get("max_stars_repo_license") or ex.get("license")
+
+        lbl_canon = canonical_label(logical_label)
+        if lbl_canon == "php":
+            content_filtered = extract_php_code_only(raw_text, path=repo_path)
+            if not content_filtered:
+                continue
+        else:
+            content_filtered = raw_text
+
+        if lbl_canon == "text":
+            ok_lic = True
+        else:
+            ok_lic, _ = license_is_allowed(ex)
+        if not ok_lic:
+            continue
+
+        try:
+            b = content_filtered.encode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not b:
+            continue
 
         for widx, wbytes in byte_windows(b, window_bytes):
             if kept_total >= total_budget and total_budget > 0:
                 break
-            uid = stable_uid_for_window(wbytes)
+            window_text = wbytes.decode("utf-8", errors="ignore")
+            if not window_text:
+                rejected += 1
+                continue
+
+            ascii_text = map_text_to_ascii(window_text)
+            if not ascii_text:
+                rejected += 1
+                continue
+
+            ascii_bytes = ascii_text.encode("utf-8", errors="ignore")
+            if not ascii_bytes:
+                rejected += 1
+                continue
+
+            uid = stable_uid_for_window(ascii_bytes)
 
             if seen_uids is not None and uid in seen_uids:
                 rejected += 1
@@ -922,8 +1046,9 @@ def gen_windows_for_label(
                 continue
 
             buf_bytes.append(wbytes)
-            buf_meta.append((widx, ext, hexsha, repo_name, repo_path, license_str, split, uid))
+            buf_meta.append((widx, ext, hexsha, repo_name, repo_path, license_str, split))
             buf_uids.append(uid)
+            buf_ascii_texts.append(ascii_text)
 
             if len(buf_bytes) >= magika_batch:
                 for out in _flush_batch():
@@ -939,7 +1064,7 @@ def gen_windows_for_label(
                              k_test=kept_per_split["test"])
             last_postfix = now
 
-        content = ""
+        raw_text = ""
         del b
         gc.collect()
 
@@ -1284,10 +1409,9 @@ def parse_args() -> argparse.Namespace:
     # NEW default labels per request
     ap.add_argument("--langs", type=str,
                     default=(
-                        "html,css,javascript,c,cpp,csv,java,json,python,text,"
+                        "html,css,javascript,typescript,c,cpp,csharp,go,rust,csv,java,json,python,ruby,text,"
                         "shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,"
-                        "encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,"
-                        "encryption_aes,encryption_des,encryption_blowfish,encryption_rc4,encryption_chacha20"
+                        "encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85"
                     ),
                     help="Comma-separated labels to process (logical names).")
     ap.add_argument("--rebuild", action="store_true",

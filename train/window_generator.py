@@ -8,12 +8,15 @@ import re
 import threading
 import queue
 import time
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, TYPE_CHECKING
 
 import numpy as np
 import datasets as hfds
 
-from config import DataConfig, PAD_ID, PAD_BYTE_ID
+import config as cfg
+
+if TYPE_CHECKING:
+    from config import DataConfig
 from data_utils import bytes_from_text
 
 # ---------------------------
@@ -88,8 +91,8 @@ def _choose_segment_slice(
 def make_pure_window(dsets_by_lang: Dict[int, hfds.Dataset],
                      target_len: int) -> Tuple[np.ndarray, np.ndarray]:
     lids = list(dsets_by_lang.keys())
-    x = np.full((target_len,), PAD_BYTE_ID, dtype=np.int32)
-    y = np.full((target_len,), PAD_ID, dtype=np.uint8)
+    x = np.full((target_len,), cfg.PAD_BYTE_ID, dtype=np.int32)
+    y = np.full((target_len,), cfg.PAD_ID, dtype=np.uint8)
     if not lids:
         return x, y
 
@@ -118,8 +121,8 @@ def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
                       target_len: int,
                       min_seg: int) -> Tuple[np.ndarray, np.ndarray]:
     # inputs are int32 to allow PAD_BYTE_ID=256
-    x_buf = np.full((target_len,), PAD_BYTE_ID, dtype=np.int32)
-    y_buf = np.full((target_len,), PAD_ID, dtype=np.uint8)
+    x_buf = np.full((target_len,), cfg.PAD_BYTE_ID, dtype=np.int32)
+    y_buf = np.full((target_len,), cfg.PAD_ID, dtype=np.uint8)
 
     lids = list(dsets_by_lang.keys())
     if not lids:
@@ -161,19 +164,19 @@ def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
 # Shared sampler for train/eval/preview
 # ---------------------------
 
-def _resolve_mix_probability(cfg: DataConfig) -> float:
-    mix_prob = getattr(cfg, "mix_prob", None)
-    pure_prob = max(0.0, getattr(cfg, "pure_prob", 0.0))
-    line_prob = max(0.0, getattr(cfg, "line_inject_prob", 0.0))
+def _resolve_mix_probability(data_cfg: "DataConfig") -> float:
+    mix_prob = getattr(data_cfg, "mix_prob", None)
+    pure_prob = max(0.0, getattr(data_cfg, "pure_prob", 0.0))
+    line_prob = max(0.0, getattr(data_cfg, "line_inject_prob", 0.0))
     if mix_prob is None:
         mix_prob = 1.0 - pure_prob - line_prob
     return max(0.0, mix_prob)
 
 
-def _choose_window_mode(cfg: DataConfig) -> str:
-    pure_prob = max(0.0, getattr(cfg, "pure_prob", 0.0))
-    line_prob = max(0.0, getattr(cfg, "line_inject_prob", 0.0))
-    mix_prob = _resolve_mix_probability(cfg)
+def _choose_window_mode(data_cfg: "DataConfig") -> str:
+    pure_prob = max(0.0, getattr(data_cfg, "pure_prob", 0.0))
+    line_prob = max(0.0, getattr(data_cfg, "line_inject_prob", 0.0))
+    mix_prob = _resolve_mix_probability(data_cfg)
     total = pure_prob + line_prob + mix_prob
     if total <= 0.0:
         return "mixed"
@@ -189,29 +192,29 @@ def _choose_window_mode(cfg: DataConfig) -> str:
 def make_training_window(
     dsets_by_lang: Dict[int, hfds.Dataset],
     target_len: int,
-    cfg: DataConfig,
+    data_cfg: "DataConfig",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Draw a window using the same probability distribution as the training
     prefetchers, including mixed windows, line injection, optional overlays,
     and tail padding variation.
     """
-    mode = _choose_window_mode(cfg)
+    mode = _choose_window_mode(data_cfg)
     if mode == "pure":
         x, y = make_pure_window(dsets_by_lang, target_len)
     elif mode == "line_inject":
-        x, y = make_line_injected_window(dsets_by_lang, target_len, cfg)
+        x, y = make_line_injected_window(dsets_by_lang, target_len, data_cfg)
     else:
-        x, y = make_mixed_window(dsets_by_lang, target_len, cfg.min_seg_len)
+        x, y = make_mixed_window(dsets_by_lang, target_len, data_cfg.min_seg_len)
 
     # Optionally overlay mixed slices on top of base window
-    both_prob = getattr(cfg, "both_prob", 0.2)
+    both_prob = getattr(data_cfg, "both_prob", 0.2)
     if both_prob > 0.0 and random.random() < both_prob:
-        xm, ym = make_mixed_window(dsets_by_lang, target_len, cfg.min_seg_len)
+        xm, ym = make_mixed_window(dsets_by_lang, target_len, data_cfg.min_seg_len)
         nslices = random.randint(1, 3)
         for _ in range(nslices):
-            max_len = max(cfg.min_seg_len, target_len // 4)
-            seg_len = random.randint(cfg.min_seg_len, max_len)
+            max_len = max(data_cfg.min_seg_len, target_len // 4)
+            seg_len = random.randint(data_cfg.min_seg_len, max_len)
             if seg_len >= target_len:
                 seg_len = target_len - 1
             start = random.randint(0, target_len - seg_len)
@@ -220,15 +223,15 @@ def make_training_window(
             y[start:end] = ym[start:end]
 
     # Tail padding variation mirrors training augmentation
-    pad_tail_prob = getattr(cfg, "pad_tail_prob", 0.6)
+    pad_tail_prob = getattr(data_cfg, "pad_tail_prob", 0.6)
     if pad_tail_prob > 0.0 and random.random() < pad_tail_prob:
-        max_frac = getattr(cfg, "pad_tail_max_frac", 0.9)
+        max_frac = getattr(data_cfg, "pad_tail_max_frac", 0.9)
         max_pad = max(1, int(target_len * max_frac))
         pad_len = random.randint(0, max_pad)
         if pad_len > 0:
             content_end = max(1, target_len - pad_len)
-            x[content_end:] = PAD_BYTE_ID
-            y[content_end:] = PAD_ID
+            x[content_end:] = cfg.PAD_BYTE_ID
+            y[content_end:] = cfg.PAD_ID
 
     return x, y
 
@@ -280,26 +283,26 @@ def _leading_indent_of_line(chars: List[str], at_char_idx: int) -> str:
     return "".join(indent)
 
 
-def _prepare_donor_block(donor_text: str, cfg: DataConfig, insertion_indent: str) -> str:
+def _prepare_donor_block(donor_text: str, data_cfg: "DataConfig", insertion_indent: str) -> str:
     lines = _split_keepends_lines(donor_text)
     if not lines:
         return ""
 
-    skip = random.randint(cfg.donor_skip_top_min, max(cfg.donor_skip_top_min, cfg.donor_skip_top_max))
+    skip = random.randint(data_cfg.donor_skip_top_min, max(data_cfg.donor_skip_top_min, data_cfg.donor_skip_top_max))
     start_idx = min(skip, len(lines) - 1)
 
-    L = _sample_truncated_exp_lines(cfg.line_inject_exp_rate, cfg.line_inject_max_lines)
+    L = _sample_truncated_exp_lines(data_cfg.line_inject_exp_rate, data_cfg.line_inject_max_lines)
     end_idx = min(len(lines), start_idx + L)
     pick = lines[start_idx:end_idx]
 
-    if len(pick) == 1 and len(pick[0]) < cfg.line_inject_min_single_len:
+    if len(pick) == 1 and len(pick[0]) < data_cfg.line_inject_min_single_len:
         if end_idx < len(lines):
             pick.append(lines[end_idx])
         elif start_idx > 0:
             pick.insert(0, lines[start_idx - 1])
 
-    max_total_lines = min(len(lines), cfg.line_inject_max_lines)
-    min_letters = getattr(cfg, "line_inject_min_letters", 4)
+    max_total_lines = min(len(lines), data_cfg.line_inject_max_lines)
+    min_letters = getattr(data_cfg, "line_inject_min_letters", 4)
 
     def pick_letter_count() -> int:
         return sum(_count_letters(ln) for ln in pick)
@@ -320,7 +323,7 @@ def _prepare_donor_block(donor_text: str, cfg: DataConfig, insertion_indent: str
         if not expanded:
             break
 
-    w_none, w_l, w_r, w_b = cfg.strip_weights
+    w_none, w_l, w_r, w_b = data_cfg.strip_weights
     mode = random.choices(["none", "lstrip", "rstrip", "strip"], weights=[w_none, w_l, w_r, w_b], k=1)[0]
 
     processed = []
@@ -333,7 +336,7 @@ def _prepare_donor_block(donor_text: str, cfg: DataConfig, insertion_indent: str
         elif mode == "strip":
             core = core.strip()
 
-        if random.random() < cfg.reindent_prob:
+        if random.random() < data_cfg.reindent_prob:
             core = insertion_indent + core.lstrip()
 
         processed.append(core + ('\n' if ln.endswith('\n') else ''))
@@ -372,10 +375,10 @@ def _to_bytes_with_byte_labels(chars: List[str], char_labels: List[int]) -> Tupl
 
 def make_line_injected_window(dsets_by_lang: Dict[int, hfds.Dataset],
                               target_len: int,
-                              cfg: DataConfig) -> Tuple[np.ndarray, np.ndarray]:
+                              data_cfg: "DataConfig") -> Tuple[np.ndarray, np.ndarray]:
     lids = list(dsets_by_lang.keys())
-    x = np.full((target_len,), PAD_BYTE_ID, dtype=np.int32)
-    y = np.full((target_len,), PAD_ID, dtype=np.uint8)
+    x = np.full((target_len,), cfg.PAD_BYTE_ID, dtype=np.int32)
+    y = np.full((target_len,), cfg.PAD_ID, dtype=np.uint8)
     if not lids:
         return x, y
 
@@ -393,12 +396,12 @@ def make_line_injected_window(dsets_by_lang: Dict[int, hfds.Dataset],
     chars, labs = list(host_text), [host_lid] * len(host_text)
 
     boundaries = _choose_injection_boundaries(
-        host_text, cfg.host_skip_top_min, cfg.host_skip_top_max, cfg.line_inject_max_injections
+        host_text, data_cfg.host_skip_top_min, data_cfg.host_skip_top_max, data_cfg.line_inject_max_injections
     )
 
     for bidx in boundaries:
         donor_lid = random.choice(lids)
-        if not cfg.allow_same_lang_injection and donor_lid == host_lid:
+        if not data_cfg.allow_same_lang_injection and donor_lid == host_lid:
             alts = [l for l in lids if l != host_lid]
             if alts:
                 donor_lid = random.choice(alts)
@@ -408,9 +411,9 @@ def make_line_injected_window(dsets_by_lang: Dict[int, hfds.Dataset],
         donor_text = donor_ex.get("content", "") if donor_ex else ""
 
         insertion_indent = _leading_indent_of_line(chars, bidx)
-        donor_block = _prepare_donor_block(donor_text, cfg, insertion_indent)
+        donor_block = _prepare_donor_block(donor_text, data_cfg, insertion_indent)
 
-        if random.random() > cfg.start_with_newline_prob:
+        if random.random() > data_cfg.start_with_newline_prob:
             bidx = _ensure_merge_without_newline(chars, labs, bidx)
 
         _insert_block_at(chars, labs, bidx, donor_block, donor_lid)
@@ -433,17 +436,17 @@ def make_line_injected_window(dsets_by_lang: Dict[int, hfds.Dataset],
 # ---------------------------
 
 class PrefetchBatcher:
-    def __init__(self, dsets_by_lang, cfg: DataConfig):
+    def __init__(self, dsets_by_lang, data_cfg: "DataConfig"):
         self.dsets_by_lang = dsets_by_lang
-        self.cfg = cfg
+        self.cfg = data_cfg
         # Smaller queue size to prevent memory buildup
-        self.q = queue.Queue(maxsize=max(2, cfg.prefetch_batches))
+        self.q = queue.Queue(maxsize=max(2, data_cfg.prefetch_batches))
         self.stop_flag = threading.Event()
-        self.buckets = cfg.buckets()
+        self.buckets = data_cfg.buckets()
         self.threads: List[threading.Thread] = []
         self._gc_counter = 0
         # Use fewer worker threads
-        for wid in range(max(1, cfg.num_workers // 2)):
+        for wid in range(max(1, data_cfg.num_workers // 2)):
             t = threading.Thread(target=self._worker, args=(wid,), daemon=True)
             t.start()
             self.threads.append(t)
@@ -458,8 +461,8 @@ class PrefetchBatcher:
                 L = random.choice(self.buckets)
             k += 1
 
-            xb = np.full((self.cfg.batch_size, L), PAD_BYTE_ID, dtype=np.int32)
-            yb = np.full((self.cfg.batch_size, L), PAD_ID, dtype=np.uint8)
+            xb = np.full((self.cfg.batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
+            yb = np.full((self.cfg.batch_size, L), cfg.PAD_ID, dtype=np.uint8)
 
             for i in range(self.cfg.batch_size):
                 x, y = make_training_window(self.dsets_by_lang, L, self.cfg)

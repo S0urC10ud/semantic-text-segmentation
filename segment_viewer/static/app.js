@@ -7,17 +7,21 @@
 let LABELS = [];
 let STATE = []; // per-example state: { lastJson: null }
 let tooltip = null;
+let focusMode = false;
 
 function el(sel){ return document.querySelector(sel) }
 function els(sel, root=document){ return Array.from(root.querySelectorAll(sel)) }
 function esc(s){ return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;') }
 
 function showTooltip(event) {
-  const char = event.target;
-  if (!char.classList.contains('char')) return;
+  const target = event.target;
+  if (!target || !target.classList || !target.classList.contains('char')) {
+    hideTooltip();
+    return;
+  }
   if (!tooltip) tooltip = el('#tooltip');
 
-  const probs = JSON.parse(char.dataset.probs || '{}');
+  const probs = JSON.parse(target.dataset.probs || '{}');
   let html = '';
 
   const sortedProbs = Object.entries(probs)
@@ -45,7 +49,7 @@ function showTooltip(event) {
   tooltip.innerHTML = html || '<div class="prob-bar"><div class="label">No data</div></div>';
   tooltip.style.display = 'block';
 
-  const rect = char.getBoundingClientRect();
+  const rect = target.getBoundingClientRect();
   const tooltipRect = tooltip.getBoundingClientRect();
   let left = rect.left;
   let top = rect.bottom + 8;
@@ -97,10 +101,14 @@ async function runOne(section){
   const chunk = parseInt(section.querySelector('.chunk').value || '1024', 10);
   const render = section.querySelector('.render');
   const stats = section.querySelector('.stats');
+  const timeLabel = section.querySelector('.inferenceTime');
 
   runBtn.disabled = true;
   const orig = runBtn.textContent;
   runBtn.textContent = 'Running…';
+  if (timeLabel) {
+    timeLabel.textContent = '…';
+  }
 
   try{
     const res = await fetch('/api/segment', {
@@ -116,8 +124,19 @@ async function runOne(section){
     STATE[idx].lastJson = data;
     render.innerHTML = data.html || '';
     renderStatsInto(stats, data.stats || []);
+    if (timeLabel) {
+      const elapsed = typeof data.elapsed_ms === 'number' ? data.elapsed_ms : null;
+      if (elapsed !== null && isFinite(elapsed)) {
+        timeLabel.textContent = elapsed >= 1000 ? (elapsed / 1000).toFixed(2) + ' s' : elapsed.toFixed(1) + ' ms';
+      } else {
+        timeLabel.textContent = '—';
+      }
+    }
   }catch(err){
     alert('Error: ' + err.message);
+    if (timeLabel) {
+      timeLabel.textContent = 'Err';
+    }
   }finally{
     runBtn.disabled = false;
     runBtn.textContent = orig;
@@ -125,7 +144,7 @@ async function runOne(section){
 }
 
 async function runAll(){
-  const sections = els('section.panel.example');
+  const sections = els('section.panel.example').filter(sec => !sec.hasAttribute('aria-hidden'));
   for (const s of sections){
     await runOne(s);
   }
@@ -152,10 +171,57 @@ function downloadJSON(section){
   URL.revokeObjectURL(a.href);
 }
 
+function applyFocusMode(scrollToPrimary = false){
+  const toggle = el('#focusToggle');
+  focusMode = !!(toggle && toggle.checked);
+  document.body.classList.toggle('focus-mode', focusMode);
+
+  const sections = els('section.panel.example');
+  sections.forEach((section, idx) => {
+    const isPrimary = idx === 0;
+    if (isPrimary) {
+      section.classList.add('primary-example');
+    }
+    if (focusMode) {
+      if (!isPrimary) {
+        section.setAttribute('aria-hidden', 'true');
+      } else {
+        section.removeAttribute('aria-hidden');
+      }
+    } else {
+      section.removeAttribute('aria-hidden');
+    }
+  });
+
+  const label = el('#focusToggleLabel .toggle-text');
+  if (label) {
+    label.textContent = focusMode ? 'Show All Examples' : 'Focus Example 1';
+  }
+  const labelContainer = el('#focusToggleLabel');
+  if (labelContainer) {
+    labelContainer.classList.toggle('active', focusMode);
+  }
+
+  const primary = sections[0];
+  if (primary) {
+    if (focusMode) {
+      primary.setAttribute('tabindex', '-1');
+      if (scrollToPrimary) {
+        primary.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    } else {
+      primary.removeAttribute('tabindex');
+    }
+  }
+}
+
 function createExampleSection(index, initialText){
   const section = document.createElement('section');
   section.className = 'panel example';
   section.dataset.index = String(index);
+  if (index === 0){
+    section.classList.add('primary-example');
+  }
   section.innerHTML = `
     <div class="panel-head">
       <h2>Example ${index+1}</h2>
@@ -166,15 +232,22 @@ function createExampleSection(index, initialText){
         <label>Window (bytes)
           <input class="chunk" type="number" min="64" step="64" value="1024" />
         </label>
+        <span class="inferenceTime" aria-live="polite" title="Wall-clock inference time">—</span>
         <button class="btn primary runBtn">Segment</button>
         <button class="btn copyHtml">Copy HTML</button>
         <button class="btn downloadJson">Download JSON</button>
       </div>
     </div>
-    <textarea class="code" spellcheck="false" placeholder="Paste code/text (HTML/CSS/JS/C/CPP/CSV/Java/JSON/Python/Text)…"></textarea>
-    <div class="legend"></div>
-    <div class="render" aria-live="polite"></div>
-    <div class="stats"></div>
+    <div class="body">
+      <div class="editor-pane">
+        <textarea class="code" spellcheck="false" placeholder="Paste code/text (HTML/CSS/JS/C/CPP/CSV/Java/JSON/Python/Text)…"></textarea>
+      </div>
+      <div class="output-pane">
+        <div class="legend"></div>
+        <div class="render" aria-live="polite"></div>
+        <div class="stats"></div>
+      </div>
+    </div>
   `;
 
   section.querySelector('.code').value = initialText;
@@ -211,6 +284,12 @@ async function bootstrap(){
     el('#device').textContent = 'Load error ✕';
     console.error(err);
   }
+
+  const focusToggle = el('#focusToggle');
+  if (focusToggle){
+    focusToggle.addEventListener('change', ()=> applyFocusMode(focusToggle.checked));
+  }
+  applyFocusMode(focusToggle ? focusToggle.checked : false);
 
   // Segment All
   const runAllBtn = el('#runAll');

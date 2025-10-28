@@ -2,7 +2,7 @@
 The 1D U-Net model architecture and training-related utilities like the
 TrainState, loss functions, and train/eval steps.
 """
-from typing import Tuple, Optional
+from typing import Tuple, Optional, TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -11,7 +11,10 @@ import optax
 from flax import linen as nn
 from flax.training import train_state
 
-from config import TrainConfig, NUM_CLASSES, PAD_ID, NUM_TOKEN_EMBEDDINGS
+import config as cfg
+
+if TYPE_CHECKING:
+    from config import TrainConfig
 
 # ---------------------------
 # Model: 1D U-Net
@@ -49,7 +52,7 @@ def upsample_nn_1d(x, factor: int):
     return jnp.repeat(x, repeats=factor, axis=1)
 
 class UNet1D(nn.Module):
-    num_classes: int = NUM_CLASSES
+    num_classes: int = cfg.NUM_CLASSES
     emb_dim: int = 128
     channels: Tuple[int, ...] = (128, 256, 384, 512)
     dropout_rate: float = 0.0
@@ -57,7 +60,7 @@ class UNet1D(nn.Module):
 
     @nn.compact
     def __call__(self, tokens: jnp.ndarray, train: bool = True):
-        h = nn.Embed(num_embeddings=NUM_TOKEN_EMBEDDINGS, features=self.emb_dim,
+        h = nn.Embed(num_embeddings=cfg.NUM_TOKEN_EMBEDDINGS, features=self.emb_dim,
                      embedding_init=nn.initializers.normal(stddev=0.02),
                      dtype=self.dtype, param_dtype=jnp.float32)(tokens)
 
@@ -94,7 +97,7 @@ class TrainState(train_state.TrainState):
 def count_params(params) -> int:
     return sum([np.prod(x.shape) for x in jtu.tree_leaves(params)])
 
-def create_train_state(rng, cfg: TrainConfig, num_classes: int):
+def create_train_state(rng, cfg: "TrainConfig", num_classes: int):
     model = UNet1D(num_classes=num_classes, emb_dim=cfg.model_dim,
                    channels=cfg.channels, dropout_rate=cfg.dropout_rate, dtype=cfg.dtype)
     dummy_tokens = jnp.zeros((1, 512), dtype=jnp.int32)
@@ -116,7 +119,9 @@ def create_train_state(rng, cfg: TrainConfig, num_classes: int):
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 @jax.jit
-def cross_entropy_masked(logits: jnp.ndarray, labels: jnp.ndarray, pad_id: int = PAD_ID) -> jnp.ndarray:
+def cross_entropy_masked(logits: jnp.ndarray, labels: jnp.ndarray, pad_id: Optional[int] = None) -> jnp.ndarray:
+    if pad_id is None:
+        pad_id = cfg.PAD_ID
     mask = (labels != pad_id)
     safe_labels = jnp.where(mask, labels, 0)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, safe_labels.astype(jnp.int32))
@@ -125,7 +130,9 @@ def cross_entropy_masked(logits: jnp.ndarray, labels: jnp.ndarray, pad_id: int =
     return jnp.sum(loss) / denom
 
 @jax.jit
-def accuracy_masked(logits: jnp.ndarray, labels: jnp.ndarray, pad_id: int = PAD_ID) -> jnp.ndarray:
+def accuracy_masked(logits: jnp.ndarray, labels: jnp.ndarray, pad_id: Optional[int] = None) -> jnp.ndarray:
+    if pad_id is None:
+        pad_id = cfg.PAD_ID
     pred = jnp.argmax(logits, axis=-1).astype(labels.dtype)
     mask = (labels != pad_id)
     correct = jnp.sum(jnp.logical_and(pred == labels, mask).astype(jnp.int32))

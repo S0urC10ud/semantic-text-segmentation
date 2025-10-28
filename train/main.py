@@ -3,7 +3,7 @@ import os
 import random
 import sys
 import time
-from typing import Dict, Tuple
+from typing import Dict, Tuple, TYPE_CHECKING
 
 # Unbuffered/stdout-friendly logs
 try:
@@ -36,7 +36,7 @@ from wandb import Settings
 jax.config.update("jax_disable_jit", False)
 jax.config.update("jax_enable_x64", False)
 
-from config import DataConfig, TrainConfig, NUM_CLASSES, ID2LANG, PAD_ID, PAD_BYTE_ID
+import config as cfg
 from data_utils import prepare_dsets_by_lang_with_splits
 from window_generator import make_training_window
 from model import (
@@ -55,6 +55,9 @@ from metrics_helper import (
     print_metrics_table,
     wandb_log_metrics,
 )
+
+if TYPE_CHECKING:
+    from config import DataConfig, TrainConfig
 
 import signal
 
@@ -106,12 +109,12 @@ def _make_eval_batch(
     dsets_by_lang: Dict[int, dict],
     L: int,
     batch_size: int,
-    cfg: DataConfig,
+    data_cfg: "DataConfig",
 ) -> Tuple[np.ndarray, np.ndarray]:
-    xb = np.full((batch_size, L), PAD_BYTE_ID, dtype=np.int32)
-    yb = np.full((batch_size, L), PAD_ID, dtype=np.uint8)
+    xb = np.full((batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
+    yb = np.full((batch_size, L), cfg.PAD_ID, dtype=np.uint8)
     for i in range(batch_size):
-        x, y = make_training_window(dsets_by_lang, L, cfg)
+        x, y = make_training_window(dsets_by_lang, L, data_cfg)
         xb[i] = x
         yb[i] = y
     return xb, yb
@@ -123,7 +126,7 @@ def evaluate_split(
     L: int,
     batch_size: int,
     batches: int,
-    cfg: DataConfig,
+    data_cfg: "DataConfig",
     rng,
 ) -> Tuple[float, float]:
     losses, accs = [], []
@@ -132,7 +135,7 @@ def evaluate_split(
         seed_val = int(jax.random.randint(data_rng, (), 0, 2**31 - 1).item())
         np.random.seed(seed_val)
         random.seed(seed_val)
-        xb, yb = _make_eval_batch(dsets_by_lang, L, batch_size, cfg)
+        xb, yb = _make_eval_batch(dsets_by_lang, L, batch_size, data_cfg)
         loss, acc = eval_step(
             state,
             jnp.array(xb, dtype=jnp.int32),
@@ -149,6 +152,8 @@ def evaluate_split(
 def main():
     # Force garbage collection at start
     gc.collect()
+
+    ckpt_async_manager = None
 
     parser = argparse.ArgumentParser()
 
@@ -228,7 +233,7 @@ def main():
             print("No valid languages provided via --lang; falling back to all languages.", flush=True)
 
     # Build configs
-    d_cfg = DataConfig(
+    d_cfg = cfg.DataConfig(
         data_root=args.data_root,
         allow_hf_fallback=args.allow_hf_fallback,
         num_proc=args.num_proc,
@@ -243,7 +248,7 @@ def main():
         prefetch_batches=args.prefetch_batches,
         num_workers=args.num_workers,
     )
-    t_cfg = TrainConfig(
+    t_cfg = cfg.TrainConfig(
         steps=args.steps,
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -313,11 +318,12 @@ def main():
     rng, init_rng = jax.random.split(rng)
 
     print("Creating train state (may trigger JIT/compile)...", flush=True)
-    state = create_train_state(init_rng, t_cfg, NUM_CLASSES)
+    state = create_train_state(init_rng, t_cfg, cfg.NUM_CLASSES)
     num_params = count_params(state.params)
     print(f"Model created with {num_params/1e6:.2f}M parameters.", flush=True)
 
     ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(t_cfg.ckpt_path)
+    ckpt_async_manager = checkpoints.AsyncManager() if hasattr(checkpoints, "AsyncManager") else None
     if os.path.exists(ckpt_blob) or os.path.exists(
         os.path.join(ckpt_dir, f"{ckpt_prefix}0")
     ):
@@ -408,8 +414,11 @@ def main():
 
                 # Get current epochs from the batcher
                 epochs_by_lang = data_fetcher.get_epochs()
-                min_epochs = min(epochs_by_lang.values())
-                max_epochs = max(epochs_by_lang.values())
+                if epochs_by_lang:
+                    min_epochs = float(min(epochs_by_lang.values()))
+                    max_epochs = float(max(epochs_by_lang.values()))
+                else:
+                    min_epochs = max_epochs = 0.0
 
                 metrics = {
                     "train/loss": float(loss),
@@ -455,7 +464,7 @@ def main():
                     elapsed = time.time() - last_log_time
                     sps = t_cfg.log_every / elapsed if elapsed > 0 else 0
                     print(
-                        f"Step {step}/{t_cfg.steps} [Epochs {min_epochs}-{max_epochs}] | "
+                        f"Step {step}/{t_cfg.steps} [Epochs {min_epochs:.3f}-{max_epochs:.3f}] | "
                         f"Loss: {loss:.4f} (±{metrics['train/loss_std']:.4f}), "
                         f"Acc: {acc:.4f} (±{metrics['train/acc_std']:.4f}), SPS: {sps:.2f}",
                         flush=True,
@@ -489,7 +498,7 @@ def main():
 
                     # Compute per-class and aggregates
                     per_class, aggregates = compute_metrics_from_confusion(
-                        conf_mat, NUM_CLASSES, PAD_ID
+                        conf_mat, cfg.NUM_CLASSES, cfg.PAD_ID
                     )
 
                     print(
@@ -507,15 +516,15 @@ def main():
 
                     # Print table and log to W&B
                     print_metrics_table(
-                        per_class, aggregates, ID2LANG, NUM_CLASSES, PAD_ID
+                        per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID
                     )
                     wandb_log_metrics(
                         step,
                         per_class,
                         aggregates,
-                        ID2LANG,
-                        NUM_CLASSES,
-                        PAD_ID,
+                        cfg.ID2LANG,
+                        cfg.NUM_CLASSES,
+                        cfg.PAD_ID,
                         conf_mat,
                     )
 
@@ -530,6 +539,7 @@ def main():
                         prefix=ckpt_prefix,
                         keep=2,
                         overwrite=True,
+                        async_manager=ckpt_async_manager,
                     )
 
                     try:
@@ -599,6 +609,12 @@ def main():
             )
         elif stopped_reason:
             final_reason = stopped_reason
+
+        if ckpt_async_manager is not None:
+            try:
+                ckpt_async_manager.wait_previous_save()
+            except Exception:
+                pass
 
         _wandb_safe_log(
             {

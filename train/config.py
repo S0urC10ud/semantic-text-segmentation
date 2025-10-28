@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import jax.numpy as jnp
 
 # Language and class mapping
@@ -25,20 +25,22 @@ LANG2ID = {
 }
 
 # These will be updated dynamically based on available data
-ID2LANG = {}
+ID2LANG: Dict[int, str] = {}
 NUM_CLASSES = 0
 
 def update_lang_mappings():
     """Update ID2LANG and NUM_CLASSES based on current LANG2ID state"""
-    global ID2LANG, NUM_CLASSES
-    ID2LANG = {v: k for k, v in LANG2ID.items()}
+    global NUM_CLASSES, PAD_ID
+    ID2LANG.clear()
+    ID2LANG.update({v: k for k, v in LANG2ID.items()})
     NUM_CLASSES = len(LANG2ID)
+    PAD_ID = NUM_CLASSES
 
 # Initialize mappings
 update_lang_mappings()
 
 # Special IDs for padding in labels and inputs
-PAD_ID = NUM_CLASSES  # Label PAD is 3 (masked out of loss/metrics)
+PAD_ID = NUM_CLASSES  # Label PAD is masked out of loss/metrics
 BYTE_VOCAB_SIZE = 256
 PAD_BYTE_ID = 256
 NUM_TOKEN_EMBEDDINGS = BYTE_VOCAB_SIZE + 1  # 257 for embeddings table

@@ -3,7 +3,7 @@ Metrics helpers for per-class and aggregated accuracy / precision / recall / F1,
 plus nice console tables, a high-res Sankey diagram,
 and Weights & Biases logging.
 """
-from typing import Dict, Tuple
+from typing import Dict, Tuple, TYPE_CHECKING
 import os
 import random
 import numpy as np
@@ -11,8 +11,11 @@ import jax
 import jax.numpy as jnp
 import wandb
 
-from config import DataConfig, NUM_CLASSES, PAD_ID, PAD_BYTE_ID
+import config as cfg
 from window_generator import make_training_window
+
+if TYPE_CHECKING:
+    from config import DataConfig
 
 # Ensure any later matplotlib usage in this process prefers a headless backend.
 # (This is belt-and-suspenders; we don't import pyplot anywhere below.)
@@ -35,13 +38,13 @@ def _make_eval_batch(
     dsets_by_lang: Dict[int, dict],
     L: int,
     batch_size: int,
-    cfg: DataConfig,
+    data_cfg: "DataConfig",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Build an eval batch mirroring the data pipeline logic."""
-    xb = np.full((batch_size, L), PAD_BYTE_ID, dtype=np.int32)
-    yb = np.full((batch_size, L), PAD_ID, dtype=np.uint8)
+    xb = np.full((batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
+    yb = np.full((batch_size, L), cfg.PAD_ID, dtype=np.uint8)
     for i in range(batch_size):
-        x, y = make_training_window(dsets_by_lang, L, cfg)
+        x, y = make_training_window(dsets_by_lang, L, data_cfg)
         xb[i] = x
         yb[i] = y
     return xb, yb
@@ -502,7 +505,7 @@ def evaluate_split_with_metrics(
     L: int,
     batch_size: int,
     batches: int,
-    data_cfg: DataConfig,
+    data_cfg: "DataConfig",
     rng,
     eval_step_fn=None,
 ) -> Tuple[float, float, np.ndarray]:
@@ -514,7 +517,7 @@ def evaluate_split_with_metrics(
         raise ValueError("evaluate_split_with_metrics requires eval_step_fn=eval_step")
 
     losses, accs = [], []
-    conf_mat = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
+    conf_mat = np.zeros((cfg.NUM_CLASSES, cfg.NUM_CLASSES), dtype=np.int64)
 
     for i in range(batches):
         data_rng, eval_rng = jax.random.split(jax.random.fold_in(rng, i))
@@ -539,7 +542,7 @@ def evaluate_split_with_metrics(
         y_true = yb.astype(np.int32)
 
         # Mask PAD
-        mask = (y_true != PAD_ID)
+        mask = (y_true != cfg.PAD_ID)
         if mask.any():
             accumulate_confusion(conf_mat, y_true[mask], preds[mask])
 

@@ -8,7 +8,7 @@ import datasets as hfds
 from datasets import load_dataset
 from datasets import load_from_disk
 
-from config import LANG2ID, update_lang_mappings
+import config as cfg
 
 # ---------------------------
 # Dataset utilities
@@ -79,7 +79,7 @@ def prepare_dsets_by_lang_with_splits(
     if not os.path.exists(data_root):
         raise ValueError(f"❌ DATA ROOT NOT FOUND: {data_root}")
 
-    configured_langs = list(LANG2ID.keys())
+    configured_langs = list(cfg.LANG2ID.keys())
     canonical_map = {lang.lower(): lang for lang in configured_langs}
     requested_langs: Optional[List[str]] = None
     if include_languages:
@@ -106,17 +106,26 @@ def prepare_dsets_by_lang_with_splits(
 
     # First scan: check existence and sample counts
     splits = {"train": {}, "val": {}, "test": {}}
+    path_registry: Dict[str, str] = {}
     lang_stats = {lang: {"splits": {}, "total_samples": 0} for lang in target_langs}
     
     for split in ("train", "val", "test"):
         print(f"\n📂 Checking {split} split...")
         for lang in target_langs:
+            data_path = os.path.join(data_root, split, lang, "dataset")
             ds = _build_local_dataset_for_lang(lang, data_root, split, use_train_windows=use_train_windows)
             if ds is not None and len(ds) > 0:
-                lang_id = LANG2ID[lang]
+                lang_id = cfg.LANG2ID[lang]
                 splits[split][lang_id] = ds
                 lang_stats[lang]["splits"][split] = len(ds)
                 lang_stats[lang]["total_samples"] += len(ds)
+                canonical_path = os.path.realpath(data_path)
+                prev_split = path_registry.get(canonical_path)
+                if prev_split is not None and prev_split != split:
+                    raise ValueError(
+                        f"❌ DATA LEAKAGE: dataset at {canonical_path} reused for both '{prev_split}' and '{split}' splits."
+                    )
+                path_registry[canonical_path] = split
     
     # Print summary table
     print("\n" + "="*80)
@@ -171,19 +180,19 @@ def prepare_dsets_by_lang_with_splits(
             )
     
     # Rebuild LANG2ID with only available languages
-    LANG2ID.clear()
+    cfg.LANG2ID.clear()
     for i, lang in enumerate(sorted(available_langs)):
-        LANG2ID[lang] = i
-        
+        cfg.LANG2ID[lang] = i
+    
     print("\n" + "="*80)
     print(f"✅ USING {len(available_langs)} LANGUAGES: {sorted(available_langs)}")
-    print(f"🔢 Language ID mapping: {dict(sorted(LANG2ID.items(), key=lambda x: x[1]))}")
+    print(f"🔢 Language ID mapping: {dict(sorted(cfg.LANG2ID.items(), key=lambda x: x[1]))}")
     print("="*80 + "\n")
     
     # Build the final splits dict
     splits = {"train": {}, "val": {}, "test": {}}
     for split in ("train", "val", "test"):
-        for lang, lang_id in LANG2ID.items():
+        for lang, lang_id in cfg.LANG2ID.items():
             ds = _build_local_dataset_for_lang(lang, data_root, split, use_train_windows=use_train_windows)
             if ds is not None and len(ds) > 0:
                 splits[split][lang_id] = ds
@@ -203,14 +212,14 @@ def prepare_dsets_by_lang_with_splits(
     # Rebuild the splits dictionary with new language IDs
     new_splits = {"train": {}, "val": {}, "test": {}}
     for split_name, mp in splits.items():
-        for lang, lang_id in LANG2ID.items():
+        for lang, lang_id in cfg.LANG2ID.items():
             ds = _build_local_dataset_for_lang(lang, data_root, split_name, use_train_windows=use_train_windows)
             if ds is not None and len(ds) > 0:
                 new_splits[split_name][lang_id] = ds
     
-    print(f"Found {len(LANG2ID)} available languages: {sorted(LANG2ID.keys())}")
-    print(f"Language ID mapping: {dict(sorted(LANG2ID.items(), key=lambda x: x[1]))}")
+    print(f"Found {len(cfg.LANG2ID)} available languages: {sorted(cfg.LANG2ID.keys())}")
+    print(f"Language ID mapping: {dict(sorted(cfg.LANG2ID.items(), key=lambda x: x[1]))}")
     
     # Update the global mappings in config
-    update_lang_mappings()
+    cfg.update_lang_mappings()
     return new_splits

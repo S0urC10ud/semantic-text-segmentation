@@ -5,7 +5,7 @@ Segmenter Viewer — FastAPI backend + beautiful frontend
 Run:
   pip install fastapi uvicorn jax jaxlib flax optax numpy orbax-checkpoint
   # (Install the right jax/jaxlib for your CUDA setup if using GPU.)
-  python app.py --ckpt ./seg-unet1d.msgpack --num-classes 3 --model-dim 128 --channels 128,256,384,512 --dtype bfloat16 --chunk 1024
+  python app.py --ckpt ./seg-unet1d.msgpack --model-dim 256 --channels 96,128,192,256 --dtype bfloat16 --chunk 1024 --lang html,css,javascript,php
 
 Then open http://127.0.0.1:8000
 """
@@ -32,8 +32,192 @@ from collections.abc import Mapping
 import dataclasses
 from pathlib import Path
 import re
+import importlib.util
 import orbax.checkpoint as ocp
 import flax.serialization as serialization
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_train_module(module_name: str):
+    module_path = REPO_ROOT / "train" / f"{module_name}.py"
+    if not module_path.exists():
+        raise ImportError(
+            f"Expected to find train/{module_name}.py next to segment_viewer, "
+            f"but {module_path} does not exist."
+        )
+    spec = importlib.util.spec_from_file_location(
+        f"segment_viewer.train_{module_name}", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load spec for train/{module_name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    TRAIN_CONFIG = _load_train_module("config")
+except ImportError:
+    TRAIN_CONFIG = None
+
+
+def _configured_languages() -> List[str]:
+    if TRAIN_CONFIG is None:
+        raise RuntimeError(
+            "train/config.py could not be loaded; unable to resolve label ordering automatically."
+        )
+    return sorted(TRAIN_CONFIG.LANG2ID.keys())
+
+
+def _resolve_langs_and_display(
+    lang_arg: Optional[str],
+) -> Tuple[List[str], List[str]]:
+    configured_langs = _configured_languages()
+    canonical_map = {lang.lower(): lang for lang in configured_langs}
+
+    if not lang_arg:
+        return configured_langs, configured_langs[:]
+
+    requested: List[str] = []
+    display_map: Dict[str, str] = {}
+    for raw in lang_arg.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if "=" in item:
+            key, value = item.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+        else:
+            key = item
+            value = ""
+        key_lower = key.lower()
+        if key_lower not in canonical_map:
+            raise ValueError(
+                f"Unknown language '{key}'. Available: {sorted(canonical_map.values())}"
+            )
+        canonical = canonical_map[key_lower]
+        requested.append(canonical)
+        if value:
+            display_map[canonical] = value
+
+    deduped = list(dict.fromkeys(requested))
+    if not deduped:
+        raise ValueError("No languages resolved from --lang.")
+
+    selection_set = set(deduped)
+    ordered = [lang for lang in configured_langs if lang in selection_set]
+    if not ordered:
+        raise ValueError("No overlap between --lang selection and training labels.")
+
+    if ordered != deduped:
+        print(
+            f"Subset derived from --lang reordered to match training: {ordered}",
+            flush=True,
+        )
+
+    display_names = [display_map.get(name, name) for name in ordered]
+    return ordered, display_names
+
+
+def auto_color(k: int, n: int) -> str:
+    import colorsys
+
+    h = (k / max(n, 1)) % 1.0
+    s, l = 0.65, 0.55
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
+
+
+DEFAULT_COLOR_BY_LABEL = {
+    "html": "#f2994a",
+    "css": "#3498db",
+    "javascript": "#f1c40f",
+    "php": "#9b59b6",
+    "python": "#2ecc71",
+    "json": "#1abc9c",
+    "sql": "#e74c3c",
+    "java": "#8e44ad",
+    "go": "#16a085",
+    "typescript": "#95a5a6",
+    "c": "#9b59b6",
+    "cpp": "#2ecc71",
+    "csharp": "#1abc9c",
+    "csv": "#e74c3c",
+    "ruby": "#8e44ad",
+    "rust": "#16a085",
+    "text": "#95a5a6",
+    "yaml": "#d35400",
+}
+
+
+def _default_color_for_label(name: str, index: int, total: int) -> str:
+    return DEFAULT_COLOR_BY_LABEL.get(name.lower(), auto_color(index, total))
+
+
+def _resolve_colors(base_names: List[str], colors_arg: Optional[str]) -> List[str]:
+    total = len(base_names)
+    if total == 0:
+        return []
+
+    if not colors_arg:
+        return [
+            _default_color_for_label(name, idx, total)
+            for idx, name in enumerate(base_names)
+        ]
+
+    entries = [item.strip() for item in colors_arg.split(",") if item.strip()]
+    if not entries:
+        return [
+            _default_color_for_label(name, idx, total)
+            for idx, name in enumerate(base_names)
+        ]
+
+    named: Dict[str, str] = {}
+    positional: List[str] = []
+    for entry in entries:
+        if "=" in entry:
+            key, value = entry.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            match = next((name for name in base_names if name.lower() == key.lower()), None)
+            if match is None:
+                raise ValueError(f"Color override references unknown class '{key}'.")
+            if value:
+                named[match] = value
+        else:
+            positional.append(entry)
+
+    if named:
+        if positional:
+            raise ValueError("Mixing named and positional colors in --colors is not supported.")
+        return [
+            named.get(name, _default_color_for_label(name, idx, total))
+            for idx, name in enumerate(base_names)
+        ]
+
+    # Pure positional overrides
+    colors = positional[:total]
+    while len(colors) < total:
+        idx = len(colors)
+        colors.append(_default_color_for_label(base_names[idx], idx, total))
+    return colors[:total]
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = (hex_color or "").strip().lstrip("#")
+    if len(hex_color) == 3:
+        hex_color = "".join(ch * 2 for ch in hex_color)
+    if len(hex_color) != 6:
+        return f"rgba(136, 136, 136, {max(0.0, min(alpha, 1.0)):.2f})"
+    try:
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+    except ValueError:
+        return f"rgba(136, 136, 136, {max(0.0, min(alpha, 1.0)):.2f})"
+    return f"rgba({r}, {g}, {b}, {max(0.0, min(alpha, 1.0)):.2f})"
 
 def _looks_like_orbax_step_dir(p: Path) -> bool:
     if not p.is_dir():
@@ -272,13 +456,24 @@ class Predictor:
         # Precompile apply fn; JIT caches per-seq-length (shape-polymorphic)
         self._apply = jax.jit(lambda tok: self.model.apply({"params": self.params}, tok, train=False))
 
+    @staticmethod
+    def _window_weights(length: int) -> np.ndarray:
+        """Return center-weighted coefficients for a window of given length."""
+        if length <= 1:
+            return np.ones((length,), dtype=np.float32)
+        positions = np.linspace(-1.0, 1.0, num=length, dtype=np.float32)
+        sigma = 0.5
+        weights = np.exp(-0.5 * (positions / sigma) ** 2)
+        return weights.astype(np.float32)
+
     def _segment_bytes(self, byte_arr: np.ndarray, chunk: int = None) -> tuple[np.ndarray, np.ndarray]:
         chunk = int(chunk or self.chunk)
         N = int(len(byte_arr))
         out = np.zeros((N,), dtype=np.uint8)
-        probs = np.zeros((N, self.num_classes), dtype=np.float32)
+        probs_accum = np.zeros((N, self.num_classes), dtype=np.float32)
+        weight_accum = np.zeros((N,), dtype=np.float32)
         if N == 0:
-            return out, probs
+            return out, probs_accum
         win = max(64, int(chunk))
         stride = max(1, win // 2)
         xs, idxs = [], []
@@ -296,13 +491,25 @@ class Predictor:
                 tokens[j, :len(b)] = b.astype(np.int32)
             logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
             # Convert logits to probabilities using softmax
-            probs_batch = jax.nn.softmax(logits, axis=-1)
-            pred = np.argmax(np.array(logits), axis=-1).astype(np.uint8)
+            probs_batch = np.array(jax.nn.softmax(logits, axis=-1))
             for j, (s, e) in enumerate(idxs[i:i+bs]):
                 plen = e - s
-                out[s:e] = pred[j, :plen]
-                probs[s:e] = np.array(probs_batch[j, :plen])
-        return out, probs
+                if plen <= 0:
+                    continue
+                weights = self._window_weights(plen)
+                window_probs = probs_batch[j, :plen]
+                probs_accum[s:e] += window_probs * weights[:, None]
+                weight_accum[s:e] += weights
+        if np.any(weight_accum > 0):
+            nonzero = weight_accum > 0
+            probs_accum[nonzero] /= weight_accum[nonzero, None]
+            zero_mask = ~nonzero
+            if np.any(zero_mask):
+                probs_accum[zero_mask] = 1.0 / self.num_classes
+        else:
+            probs_accum[:] = 1.0 / self.num_classes
+        out = np.argmax(probs_accum, axis=-1).astype(np.uint8)
+        return out, probs_accum
 
     def _byte_labels_to_char_labels(self, text: str, byte_labels: np.ndarray, byte_probs: np.ndarray = None) -> tuple[List[int], List[Dict[str, float]]]:
         labels = []
@@ -387,45 +594,48 @@ parser.add_argument(
     required=True,
     help="Path to a .msgpack file OR an Orbax checkpoint dir/root"
 )
-parser.add_argument("--model-dim", type=int, default=128)
-parser.add_argument("--channels", type=str, default="128,256,384,512")
+parser.add_argument("--model-dim", type=int, default=256)
+parser.add_argument("--channels", type=str, default="96,128,192,256")
 parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16","float32","float16"])
 parser.add_argument("--chunk", type=int, default=1024, help="Inference window")
-parser.add_argument("--labels", type=str, default="html,css,javascript,c,cpp,csharp,csv,go,java,json,php,python,ruby,rust,sql,text,typescript,yaml", help="Comma-separated class names")
-parser.add_argument("--colors", type=str, default="#e67e22,#3498db,#f1c40f,#9b59b6,#2ecc71,#1abc9c,#e74c3c,#8e44ad,#16a085,#95a5a6", help="Optional comma-separated hex colors per class")
+parser.add_argument(
+    "--lang",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated subset of languages. "
+        "Use entries like 'php=PHP (Server)' to override display names."
+    ),
+)
+parser.add_argument(
+    "--colors",
+    type=str,
+    default=None,
+    help="Optional colors; either positional list or 'lang=#hex' mappings.",
+)
 parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8000)
 parser.add_argument("--openapi", action="store_true")
 args, _ = parser.parse_known_args()
 
 channels = tuple(int(x) for x in args.channels.split(",") if x.strip())
-label_names = [x.strip() for x in args.labels.split(",") if x.strip()]
-num_classes = len(label_names)
-if len(label_names) != num_classes:
-    while len(label_names) < num_classes:
-        label_names.append(f"class-{len(label_names)}")
-    label_names = label_names[:num_classes]
 
-def auto_color(k: int, n: int) -> str:
-    import colorsys
-    h = (k / max(n,1)) % 1.0
-    s, l = 0.65, 0.55
-    r, g, b = colorsys.hls_to_rgb(h, l, s)
-    return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
+try:
+    canonical_label_names, display_label_names = _resolve_langs_and_display(args.lang)
+    cols = _resolve_colors(canonical_label_names, args.colors)
+except (RuntimeError, ValueError) as exc:
+    parser.error(str(exc))
 
-if args.colors:
-    cols = [c.strip() for c in args.colors.split(",") if c.strip()]
-else:
-    defaults = ["#e67e22", "#3498db", "#f1c40f"]
-    cols = [defaults[i] if i < len(defaults) else auto_color(i, num_classes) for i in range(num_classes)]
-if len(cols) != num_classes:
-    while len(cols) < num_classes:
-        cols.append(auto_color(len(cols), num_classes))
-    cols = cols[:num_classes]
+num_classes = len(canonical_label_names)
+print(
+    f"Label order resolved from training config: {canonical_label_names}",
+    flush=True,
+)
 
-ID2NAME = {i: label_names[i] for i in range(num_classes)}
+ID2CANONICAL = {i: canonical_label_names[i] for i in range(num_classes)}
+ID2NAME = {i: display_label_names[i] for i in range(num_classes)}
 ID2COLOR = {i: cols[i] for i in range(num_classes)}
-ID2SLUG  = {i: make_slug(ID2NAME[i]) for i in range(num_classes)}
+ID2SLUG  = {i: make_slug(ID2CANONICAL[i]) for i in range(num_classes)}
 
 predictor = None
 load_error = None
@@ -472,10 +682,13 @@ def api_segment(req: SegmentRequest):
     if not isinstance(req.text, str) or len(req.text) == 0:
         return {"segments": [], "stats": {}, "html": ""}
 
+    import time as _time
+    t0 = _time.perf_counter()
     segs, char_labels, char_probs = predictor.segment_text(
         req.text, min_run_chars=int(req.min_run),
         chunk=int(req.chunk) if req.chunk else args.chunk
     )
+    elapsed_ms = float((_time.perf_counter() - t0) * 1000.0)
 
     def esc(s: str) -> str:
         return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -487,6 +700,8 @@ def api_segment(req: SegmentRequest):
         raw = req.text[s:e]
         cls = ID2SLUG.get(lbl, f"class-{lbl}")
         color = ID2COLOR.get(lbl, "#888888")
+        bg_color = _hex_to_rgba(color, 0.22)
+        border_color = _hex_to_rgba(color, 0.35)
         # Create character spans with probability data
         chars_html = []
         for i, ch in enumerate(raw):
@@ -497,8 +712,10 @@ def api_segment(req: SegmentRequest):
             chars_html.append(f'<span class="char" data-probs="{probs_attr}">{esc(ch)}</span>')
         # Add single span that combines coloring and character-level probabilities
         out_html.append(
-            f'<span class="seg {cls}" data-label="{esc(ID2NAME.get(lbl, str(lbl)))}" '
-            f'style="--seg-color:{color}; background: linear-gradient(0deg, {color}22, {color}22), transparent;">'
+            f'<span class="seg {cls}" '
+            f'data-label="{esc(ID2NAME.get(lbl, str(lbl)))}" '
+            f'style="--seg-color:{color}; background-color:{bg_color}; '
+            f'box-shadow: inset 0 -1px 0 {border_color};">'
             f'{"".join(chars_html)}</span>'
         )
     html_joined = "".join(out_html)
@@ -514,6 +731,7 @@ def api_segment(req: SegmentRequest):
         "segments": [{"start": int(s), "end": int(e), "label": int(lbl)} for (s, e, lbl) in segs],
         "stats": stats,
         "html": html_joined,
+        "elapsed_ms": elapsed_ms,
     }
 
 if __name__ == "__main__":

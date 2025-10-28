@@ -7,28 +7,31 @@ import random
 import queue
 import threading
 import time
-from typing import Dict, List
+from typing import Dict, List, TYPE_CHECKING
 
 import numpy as np
 import datasets as hfds
 
-from config import DataConfig, PAD_ID, PAD_BYTE_ID
+import config as cfg
 from window_generator import make_training_window
+
+if TYPE_CHECKING:
+    from config import DataConfig
 
 
 class EpochPrefetchBatcher:
-    def __init__(self, dsets_by_lang: Dict[int, hfds.Dataset], cfg: DataConfig):
+    def __init__(self, dsets_by_lang: Dict[int, hfds.Dataset], data_cfg: "DataConfig"):
         self.dsets_by_lang = dsets_by_lang
-        self.cfg = cfg
-        self.q = queue.Queue(maxsize=max(2, cfg.prefetch_batches))
+        self.cfg = data_cfg
+        self.q = queue.Queue(maxsize=max(2, data_cfg.prefetch_batches))
         self.stop_flag = threading.Event()
-        self.buckets = cfg.buckets()
+        self.buckets = data_cfg.buckets()
         self.threads: List[threading.Thread] = []
 
         # Track per-language token usage to estimate fractional epochs
         self._lang_token_counts = {lang_id: 0 for lang_id in dsets_by_lang.keys()}
         self._token_targets = {}
-        max_len = max(1, cfg.window_max_bytes)
+        max_len = max(1, data_cfg.window_max_bytes)
         for lang_id, dataset in dsets_by_lang.items():
             try:
                 length = len(dataset)
@@ -40,13 +43,13 @@ class EpochPrefetchBatcher:
         self._lock = threading.Lock()
 
         # Use fewer worker threads for better determinism
-        for wid in range(max(1, cfg.num_workers // 2)):
+        for wid in range(max(1, data_cfg.num_workers // 2)):
             t = threading.Thread(target=self._worker, args=(wid,), daemon=True)
             t.start()
             self.threads.append(t)
 
     def _update_token_counts(self, labels: np.ndarray):
-        valid = labels[labels != PAD_ID]
+        valid = labels[labels != cfg.PAD_ID]
         if valid.size == 0:
             return
         unique, counts = np.unique(valid, return_counts=True)
@@ -66,8 +69,8 @@ class EpochPrefetchBatcher:
                 L = random.choice(self.buckets)
             k += 1
 
-            xb = np.full((self.cfg.batch_size, L), PAD_BYTE_ID, dtype=np.int32)
-            yb = np.full((self.cfg.batch_size, L), PAD_ID, dtype=np.uint8)
+            xb = np.full((self.cfg.batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
+            yb = np.full((self.cfg.batch_size, L), cfg.PAD_ID, dtype=np.uint8)
 
             for i in range(self.cfg.batch_size):
                 x, y = make_training_window(self.dsets_by_lang, L, self.cfg)

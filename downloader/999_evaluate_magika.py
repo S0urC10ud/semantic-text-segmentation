@@ -10,7 +10,7 @@ Constraints (matches your usage style):
   then iterate and call identify_bytes() on each entry in that chunk).
   This is compatible with Magika versions that only expose identify_bytes.
 - Reports per-label accuracy + an ASCII bar chart and overall accuracy.
-- NEW: For each class, also lists the top-K misclassification classes with percentages
+- For each class, also lists the top-K misclassification classes with percentages
        (relative to total windows for that class).
 
 Example:
@@ -86,16 +86,6 @@ def pick_random_window(fp: Path, window_size: int) -> Optional[bytes]:
     except Exception:
         return None
 
-def is_correct(dir_label: str, magika_label: Optional[str]) -> bool:
-    if not magika_label:
-        return False
-    gt = dir_label.lower()
-    pred = str(magika_label).lower()
-    for syn in SYNONYMS.get(gt, (gt,)):
-        if syn in pred:
-            return True
-    return False
-
 def extract_label_from_result(res) -> Optional[str]:
     """
     Compatible with common Magika result objects.
@@ -116,14 +106,40 @@ def extract_label_from_result(res) -> Optional[str]:
         pass
     return None
 
-def find_label_dir(root: Path, label: str) -> Optional[Path]:
-    p = root / label
-    if p.exists() and p.is_dir():
-        return p
+def _count_candidate_files(dir_path: Path, window_size: int) -> int:
+    """Count files large enough to sample ``window_size`` bytes from."""
+    count = 0
+    for p in dir_path.rglob("*"):
+        try:
+            if p.is_file() and p.stat().st_size >= window_size:
+                count += 1
+        except OSError:
+            continue
+    return count
+
+
+def find_label_dir(root: Path, label: str, *, window_size: int) -> Tuple[Optional[Path], int]:
+    """Locate the best directory under ``root`` that matches ``label``."""
+    best_path: Optional[Path] = None
+    best_count = -1
+
+    direct = root / label
+    if direct.exists() and direct.is_dir():
+        count = _count_candidate_files(direct, window_size)
+        best_path = direct if count >= 0 else None
+        best_count = count
+
     for q in root.rglob(label):
-        if q.is_dir() and q.name == label:
-            return q
-    return None
+        if not (q.is_dir() and q.name == label):
+            continue
+        if best_path is not None and q.resolve() == best_path.resolve():
+            continue
+        count = _count_candidate_files(q, window_size)
+        if count > best_count:
+            best_path = q
+            best_count = count
+
+    return best_path, max(best_count, 0)
 
 def choose_files(dir_path: Path, k: int, window_size: int) -> List[Path]:
     candidates: List[Path] = []
@@ -141,22 +157,43 @@ def choose_files(dir_path: Path, k: int, window_size: int) -> List[Path]:
     return random.sample(candidates, k)
 
 def canonicalize_label(pred_label: Optional[str], targets: Sequence[str]) -> str:
-    """
-    Map a raw Magika label to one of the 'targets' (our canonical label set) using SYNONYMS.
-    If nothing matches, return the original lowered label (or '(none)' if absent).
-    """
+    """Map raw Magika label to a canonical label from ``targets`` using SYNONYMS."""
     if not pred_label:
         return "(none)"
-    p = str(pred_label).lower()
+
+    p = str(pred_label).strip().lower()
+    if not targets:
+        return p
+
+    # First pass: exact matches against synonyms (preferred).
     for canon in targets:
-        for syn in SYNONYMS.get(canon, (canon,)):
-            if syn in p:
+        canon_lower = canon.lower()
+        synonyms = SYNONYMS.get(canon_lower, (canon_lower,))
+        for syn in synonyms:
+            syn_lower = syn.lower()
+            if p == syn_lower:
                 return canon
-    return p  # keep the raw label bucket so we can see off-manifold predictions
+
+    # Second pass: pick the synonym with the longest substring match.
+    best_canon: Optional[str] = None
+    best_len = -1
+    for canon in targets:
+        canon_lower = canon.lower()
+        synonyms = SYNONYMS.get(canon_lower, (canon_lower,))
+        for syn in synonyms:
+            syn_lower = syn.lower()
+            if syn_lower and syn_lower in p:
+                match_len = len(syn_lower)
+                if match_len > best_len:
+                    best_len = match_len
+                    best_canon = canon
+
+    if best_canon is not None:
+        return best_canon
+
+    return p  # off-manifold prediction bucket
 
 # -------------------- Core evaluation (main-thread, app-level batching) --------------------
-
-from typing import Mapping
 
 def eval_label(
     *,
@@ -168,6 +205,7 @@ def eval_label(
     batch_size: int,
     show_progress: bool,
     all_labels: Sequence[str],
+    threshold: float,
 ) -> Tuple[int, int, int, Dict[str, int]]:
     """
     Returns (total_evaluated, correct, skipped_small, misclass_counts)
@@ -203,11 +241,24 @@ def eval_label(
         for w in chunk:
             res = m.identify_bytes(w)
             pred_label = extract_label_from_result(res)
-            if is_correct(label, pred_label):
+            pred_str = str(pred_label).strip().lower() if pred_label else "(none)"
+
+            ok = bool(getattr(res, "ok", False))
+            score = float(getattr(res, "score", 0.0)) if ok else 0.0
+
+            canon = canonicalize_label(pred_label, all_labels)
+            matches_label = canon == label
+            meets_threshold = score > threshold
+
+            if matches_label and meets_threshold:
                 correct += 1
+                continue
+
+            if matches_label:
+                key = f"{pred_str} (below-threshold)"
             else:
-                canon = canonicalize_label(pred_label, all_labels)
-                miscls[canon] = miscls.get(canon, 0) + 1
+                key = canon if canon != "(none)" else pred_str
+            miscls[key] = miscls.get(key, 0) + 1
 
     return total, correct, skipped_small, miscls
 
@@ -224,6 +275,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars.")
     ap.add_argument("--bar-width", type=int, default=BAR_WIDTH, help="ASCII bar width.")
     ap.add_argument("--topk-miscls", type=int, default=3, help="How many top misclassification classes to list per label.")
+    ap.add_argument("--threshold", type=float, default=0.0, help="Min confidence score (0-1) to count a correct prediction.")
     return ap.parse_args()
 
 # -------------------- Main --------------------
@@ -244,6 +296,8 @@ def main() -> None:
     print(f"Evaluating Magika on random {args.window_size}-byte windows (up to {args.samples_per_dir} files/dir)")
     print(f"Root: {root}")
     print("Labels:", ", ".join(labels))
+    if args.threshold > 0:
+        print(f"Confidence threshold: > {args.threshold:.2f}")
     print("")
 
     # ONE Magika instance; main thread only.
@@ -254,7 +308,9 @@ def main() -> None:
     overall_correct = 0
 
     for label in labels:
-        d = find_label_dir(root, label)
+        d, candidate_count = find_label_dir(root, label, window_size=args.window_size)
+        if d and d != (root / label):
+            print(f"[info] Using {d} ({candidate_count} files ≥ {args.window_size} bytes) for label '{label}'")
         if not d:
             per_label_stats[label] = {"total": 0, "correct": 0, "skipped_small": 0, "missing": 1, "miscls": {}}
             print(f"[warn] Missing directory: {root / label}")
@@ -269,6 +325,7 @@ def main() -> None:
             batch_size=args.batch_size,
             show_progress=not args.no_progress and sys.stderr.isatty(),
             all_labels=labels,
+            threshold=float(args.threshold),
         )
         per_label_stats[label] = {
             "total": total,
