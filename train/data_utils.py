@@ -7,8 +7,13 @@ import numpy as np
 import datasets as hfds
 from datasets import load_dataset
 from datasets import load_from_disk
+from datasets import concatenate_datasets
 
 import config as cfg
+
+LANG_ALIASES: Dict[str, List[str]] = {
+    "c_family": ["c", "cpp"],
+}
 
 # ---------------------------
 # Dataset utilities
@@ -57,10 +62,53 @@ def _build_local_dataset_for_lang(lang: str, data_root: str, split: str, use_tra
             print(f"   These will be truncated during training")
         
         return ds
-        
+       
     except Exception as e:
         print(f"❌ ERROR loading dataset for '{lang}' {split}: {e}")
         return None
+
+
+def _load_dataset_with_aliases(
+    lang: str,
+    data_root: str,
+    split: str,
+    use_train_windows: bool = True,
+) -> Tuple[Optional[hfds.Dataset], List[str]]:
+    """
+    Attempt to load the dataset for ``lang``; if not present, fall back to any alias
+    directories defined in LANG_ALIASES (e.g., old 'c'/'cpp' buckets now merged into
+    'c_family'). Returns the combined dataset (if any) plus the list of source labels
+    that contributed data.
+    """
+    primary_path = os.path.join(data_root, split, lang, "dataset")
+    if os.path.exists(primary_path):
+        primary = _build_local_dataset_for_lang(
+            lang, data_root, split, use_train_windows=use_train_windows
+        )
+        if primary is not None and len(primary) > 0:
+            return primary, [lang]
+
+    alias_sources = []
+    alias_datasets = []
+    for alias in LANG_ALIASES.get(lang, []):
+        alias_path = os.path.join(data_root, split, alias, "dataset")
+        if not os.path.exists(alias_path):
+            continue
+        alias_ds = _build_local_dataset_for_lang(
+            alias, data_root, split, use_train_windows=use_train_windows
+        )
+        if alias_ds is not None and len(alias_ds) > 0:
+            alias_sources.append(alias)
+            alias_datasets.append(alias_ds)
+
+    if not alias_datasets:
+        return None, []
+
+    if len(alias_datasets) == 1:
+        return alias_datasets[0], alias_sources
+
+    combined = concatenate_datasets(alias_datasets)
+    return combined, alias_sources
 
 
 def prepare_dsets_by_lang_with_splits(
@@ -81,6 +129,13 @@ def prepare_dsets_by_lang_with_splits(
 
     configured_langs = list(cfg.LANG2ID.keys())
     canonical_map = {lang.lower(): lang for lang in configured_langs}
+    for canonical, aliases in LANG_ALIASES.items():
+        for alias in aliases:
+            canonical_map.setdefault(alias.lower(), canonical)
+    # Common textual variants for merged families
+    canonical_map.setdefault("c++", "c_family")
+    canonical_map.setdefault("c-family", "c_family")
+    canonical_map.setdefault("cfamily", "c_family")
     requested_langs: Optional[List[str]] = None
     if include_languages:
         requested_langs = []
@@ -112,20 +167,27 @@ def prepare_dsets_by_lang_with_splits(
     for split in ("train", "val", "test"):
         print(f"\n📂 Checking {split} split...")
         for lang in target_langs:
-            data_path = os.path.join(data_root, split, lang, "dataset")
-            ds = _build_local_dataset_for_lang(lang, data_root, split, use_train_windows=use_train_windows)
+            ds, source_labels = _load_dataset_with_aliases(
+                lang, data_root, split, use_train_windows=use_train_windows
+            )
             if ds is not None and len(ds) > 0:
                 lang_id = cfg.LANG2ID[lang]
                 splits[split][lang_id] = ds
                 lang_stats[lang]["splits"][split] = len(ds)
                 lang_stats[lang]["total_samples"] += len(ds)
-                canonical_path = os.path.realpath(data_path)
-                prev_split = path_registry.get(canonical_path)
-                if prev_split is not None and prev_split != split:
-                    raise ValueError(
-                        f"❌ DATA LEAKAGE: dataset at {canonical_path} reused for both '{prev_split}' and '{split}' splits."
+                if source_labels and source_labels != [lang]:
+                    print(
+                        f"   ℹ️  Loaded '{lang}' {split} data from legacy buckets: {', '.join(source_labels)}"
                     )
-                path_registry[canonical_path] = split
+                for source_label in (source_labels or [lang]):
+                    data_path = os.path.join(data_root, split, source_label, "dataset")
+                    canonical_path = os.path.realpath(data_path)
+                    prev_split = path_registry.get(canonical_path)
+                    if prev_split is not None and prev_split != split:
+                        raise ValueError(
+                            f"❌ DATA LEAKAGE: dataset at {canonical_path} reused for both '{prev_split}' and '{split}' splits."
+                        )
+                    path_registry[canonical_path] = split
     
     # Print summary table
     print("\n" + "="*80)
@@ -193,7 +255,9 @@ def prepare_dsets_by_lang_with_splits(
     splits = {"train": {}, "val": {}, "test": {}}
     for split in ("train", "val", "test"):
         for lang, lang_id in cfg.LANG2ID.items():
-            ds = _build_local_dataset_for_lang(lang, data_root, split, use_train_windows=use_train_windows)
+            ds, _ = _load_dataset_with_aliases(
+                lang, data_root, split, use_train_windows=use_train_windows
+            )
             if ds is not None and len(ds) > 0:
                 splits[split][lang_id] = ds
                 
@@ -213,7 +277,9 @@ def prepare_dsets_by_lang_with_splits(
     new_splits = {"train": {}, "val": {}, "test": {}}
     for split_name, mp in splits.items():
         for lang, lang_id in cfg.LANG2ID.items():
-            ds = _build_local_dataset_for_lang(lang, data_root, split_name, use_train_windows=use_train_windows)
+            ds, _ = _load_dataset_with_aliases(
+                lang, data_root, split_name, use_train_windows=use_train_windows
+            )
             if ds is not None and len(ds) > 0:
                 new_splits[split_name][lang_id] = ds
     

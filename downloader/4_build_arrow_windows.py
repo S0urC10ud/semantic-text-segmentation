@@ -32,8 +32,33 @@ from datasets import Dataset, Features, Value, load_from_disk
 # -------------------- Label set & ids --------------------
 
 LANG2ID: Dict[str, int] = {
-    "html": 0, "css": 1, "javascript": 2, "c": 3, "cpp": 4,
-    "csv": 5, "java": 6, "json": 7, "python": 8, "text": 9,
+    "php": 0,
+    "csharp": 1,
+    "typescript": 2,
+    "go": 3,
+    "sql": 4,
+    "rust": 5,
+    "yaml": 6,
+    "ruby": 7,
+    "python": 8,
+    "javascript": 9,
+    "java": 10,
+    "c_family": 11,
+    "json": 12,
+    "css": 13,
+    "html": 14,
+    "text": 15,
+    "csv": 16,
+    "shell": 17,
+    "powershell": 18,
+    "batchfile": 19,
+    "visual_basic": 20,
+    "dockerfile": 21,
+    "encoding_hex": 100,
+    "encoding_base64": 101,
+    "encoding_base32": 102,
+    "encoding_base58": 103,
+    "encoding_base85": 104,
 }
 
 # -------------------- Magika label matching --------------------

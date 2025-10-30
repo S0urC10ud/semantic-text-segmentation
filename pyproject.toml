@@ -5,7 +5,7 @@ description = "Byte-wise HTML/CSS/JS segmentation with JAX/Flax"
 readme = "README.md"
 requires-python = "~=3.11.0"
 dependencies = [
-    "datasets>=2.18.0",      # uses map/filter/shuffle with num_proc
+    "datasets==3.6.0",      # uses map/filter/shuffle with num_proc
     "flax>=0.11.2",
     "optax>=0.2.5",
     "numpy>=1.26",           # JAX works well with >=1.26; NumPy 2.x also fine on recent JAX

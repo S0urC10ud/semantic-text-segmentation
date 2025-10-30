@@ -37,8 +37,8 @@ jax.config.update("jax_disable_jit", False)
 jax.config.update("jax_enable_x64", False)
 
 import config as cfg
-from data_utils import prepare_dsets_by_lang_with_splits
-from window_generator import make_training_window
+from data_utils import prepare_dsets_by_lang_with_splits, LANG_ALIASES
+from window_generator import make_training_window, make_training_window_with_metadata
 from model import (
     create_train_state,
     train_step,
@@ -55,6 +55,7 @@ from metrics_helper import (
     print_metrics_table,
     wandb_log_metrics,
 )
+from token_utils import sanitize_tokens
 
 if TYPE_CHECKING:
     from config import DataConfig, TrainConfig
@@ -117,6 +118,7 @@ def _make_eval_batch(
         x, y = make_training_window(dsets_by_lang, L, data_cfg)
         xb[i] = x
         yb[i] = y
+    xb = sanitize_tokens(xb)
     return xb, yb
 
 
@@ -165,15 +167,9 @@ def main():
     parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     # 4KB fixed windows by default
-    parser.add_argument("--window_min_bytes", type=int, default=1536)
-    parser.add_argument("--window_max_bytes", type=int, default=1536)
     parser.add_argument("--bucket_step", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--prefetch_batches", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--mix_prob", type=float, default=0.45)
-    parser.add_argument("--pure_prob", type=float, default=0.05)
-    parser.add_argument("--line_inject_prob", type=float, default=0.5)
     parser.add_argument("--max_minutes", type=int, default=0)
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
     parser.add_argument("--dont_use_train_windows", action="store_true", default=False,
@@ -197,7 +193,7 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--model_dim", type=int, default=256)
-    parser.add_argument("--channels", type=str, default="96,128,192,256")
+    parser.add_argument("--channels", type=str, default="96,128,160,192,224,256,288,320")
     parser.add_argument("--dropout_rate", type=float, default=0.15)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=250)
@@ -220,11 +216,22 @@ def main():
         if normalized:
             seen = set()
             selected_langs = []
+            alias_map = {
+                alias.lower(): canonical
+                for canonical, aliases in LANG_ALIASES.items()
+                for alias in aliases
+            }
+            alias_map.update({
+                "c++": "c_family",
+                "c-family": "c_family",
+                "cfamily": "c_family",
+            })
             for lang in normalized:
                 lang_key = lang.lower()
-                if lang_key not in seen:
-                    seen.add(lang_key)
-                    selected_langs.append(lang_key)
+                canonical = alias_map.get(lang_key, lang_key)
+                if canonical not in seen:
+                    seen.add(canonical)
+                    selected_langs.append(canonical)
             if selected_langs:
                 print(f"Restricting training to languages: {selected_langs}", flush=True)
             else:
@@ -238,14 +245,8 @@ def main():
         allow_hf_fallback=args.allow_hf_fallback,
         num_proc=args.num_proc,
         seed=args.seed,
-        window_min_bytes=args.window_min_bytes,
-        window_max_bytes=args.window_max_bytes,
         bucket_step=args.bucket_step,
         batch_size=args.batch_size,
-        mix_prob=args.mix_prob,
-        pure_prob=args.pure_prob,
-        line_inject_prob=args.line_inject_prob,
-        prefetch_batches=args.prefetch_batches,
         num_workers=args.num_workers,
     )
     t_cfg = cfg.TrainConfig(
@@ -288,8 +289,9 @@ def main():
             random.seed(i)
             L = random.choice(d_cfg.buckets())
 
-            x, y = make_training_window(train_dsets, L, d_cfg)
-            examples.append((x, y))
+            x, y, meta = make_training_window_with_metadata(train_dsets, L, d_cfg)
+            x = sanitize_tokens(x)
+            examples.append({"tokens": x, "labels": y, "metadata": meta})
 
         out_path = "preview.html"
         build_preview_html(examples, out_path)
@@ -384,6 +386,7 @@ def main():
 
                 data_start = time.time()
                 batch_tokens, batch_labels = data_fetcher.get()
+                batch_tokens = sanitize_tokens(batch_tokens)
                 data_time = time.time() - data_start
 
                 rng, step_rng = jax.random.split(rng)

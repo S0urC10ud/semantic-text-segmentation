@@ -4,24 +4,35 @@ import jax.numpy as jnp
 
 # Language and class mapping
 LANG2ID = {
-    "html": 0, 
-    "css": 1, 
-    "javascript": 2, 
-    "c": 3,
-    "cpp": 4, 
-    "csharp": 5,
-    "csv": 6,
-    "go": 7,
-    "java": 8,
-    "json": 9,
-    "php": 10,
-    "python": 11,
-    "ruby": 12,
-    "rust": 13,
-    "sql": 14,
+    # Real languages (must stay in sync with downloader outputs – see downloader/0_main.py)
+    "php": 0,
+    "csharp": 1,
+    "typescript": 2,
+    "go": 3,
+    "sql": 4,
+    "rust": 5,
+    "yaml": 6,
+    "ruby": 7,
+    "python": 8,
+    "javascript": 9,
+    "java": 10,
+    "c_family": 11,
+    "json": 12,
+    "css": 13,
+    "html": 14,
     "text": 15,
-    "typescript": 16,
-    "yaml": 17
+    "csv": 16,
+    "shell": 17,
+    "powershell": 18,
+    "batchfile": 19,
+    "visual_basic": 20,
+    "dockerfile": 21,
+    # Derived encodings
+    "encoding_hex": 100,
+    "encoding_base64": 101,
+    "encoding_base32": 102,
+    "encoding_base58": 103,
+    "encoding_base85": 104,
 }
 
 # These will be updated dynamically based on available data
@@ -55,14 +66,14 @@ class DataConfig:
     seed: int = 42
 
     # Windowing and batching
-    window_min_bytes: int = 512
-    window_max_bytes: int = 512
+    window_min_bytes: int = 1536
+    window_max_bytes: int = 1536
     bucket_step: int = 128
     batch_size: int = 16
-    mix_prob: float = 0.45
+    mix_prob: float = 0.2
     min_seg_len: int = 64
-    pure_prob: float = 0.05
-    line_inject_prob: float = 0.5
+    pure_prob: float = 0.4
+    line_inject_prob: float = 0.4
     # remaining probability mass is used for mixed windows
 
     # Prefetching
@@ -71,15 +82,17 @@ class DataConfig:
     bucket_hold_steps: int = 10
 
     # Line injection augmentation
-    line_inject_max_injections: int = 12
-    line_inject_exp_rate: float = 0.06  # λ for exponential line count
+    line_inject_max_injections: int = 4
+    line_inject_exp_rate: float = 1  # λ for exponential line count
     line_inject_max_lines: int = 100
     line_inject_min_single_len: int = 4
     line_inject_min_letters: int = 4
+    line_inject_strip_prob: float = 0.5
     allow_same_lang_injection: bool = True
     reindent_prob: float = 0.5
     start_with_newline_prob: float = 0.5
     strip_weights: Tuple[float, float, float, float] = (0.1, 0.2, 0.2, 0.5) # none, l, r, both
+    inject_extra_newlines_max: int = 4
     host_skip_top_min: int = 5
     host_skip_top_max: int = 20
     donor_skip_top_min: int = 5
@@ -105,7 +118,7 @@ class TrainConfig:
     rng_seed: int = 123
     log_every: int = 50
     eval_every: int = 250
-    eval_batches: int = 250
+    eval_batches: int = 50
     ckpt_path: str = "checkpoints/seg-unet1d.msgpack"
     sweep_id: str = ""
     no_jit: bool = False

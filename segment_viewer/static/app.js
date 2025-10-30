@@ -9,6 +9,40 @@ let STATE = []; // per-example state: { lastJson: null }
 let tooltip = null;
 let focusMode = false;
 
+const SANITIZE_REGEX = /[^\x20-\x7E¤\n\r\t]/g;
+
+function sanitizeToCurrencySymbol(text){
+  if (typeof text !== 'string' || text.length === 0){
+    return text;
+  }
+  return text.replace(SANITIZE_REGEX, '¤');
+}
+
+function enforceSanitizedTextarea(textarea){
+  if (!textarea){
+    return;
+  }
+  let start = null;
+  let end = null;
+  try{
+    start = textarea.selectionStart;
+    end = textarea.selectionEnd;
+  }catch(_err){
+    // Accessing selection can throw if element is not focusable yet; ignore.
+  }
+  const sanitized = sanitizeToCurrencySymbol(textarea.value);
+  if (sanitized !== textarea.value){
+    textarea.value = sanitized;
+    if (typeof start === 'number' && typeof end === 'number' && textarea.setSelectionRange){
+      try{
+        textarea.setSelectionRange(start, end);
+      }catch(_err){
+        // Some browsers require focus; ignore.
+      }
+    }
+  }
+}
+
 function el(sel){ return document.querySelector(sel) }
 function els(sel, root=document){ return Array.from(root.querySelectorAll(sel)) }
 function esc(s){ return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;') }
@@ -103,6 +137,8 @@ async function runOne(section){
   const stats = section.querySelector('.stats');
   const timeLabel = section.querySelector('.inferenceTime');
 
+  enforceSanitizedTextarea(codeEl);
+
   runBtn.disabled = true;
   const orig = runBtn.textContent;
   runBtn.textContent = 'Running…';
@@ -121,6 +157,10 @@ async function runOne(section){
       })
     });
     const data = await res.json();
+    if (!res.ok){
+      const detail = data && typeof data === 'object' ? (data.detail || data.error) : null;
+      throw new Error(detail || `Request failed (${res.status})`);
+    }
     STATE[idx].lastJson = data;
     render.innerHTML = data.html || '';
     renderStatsInto(stats, data.stats || []);
@@ -250,7 +290,11 @@ function createExampleSection(index, initialText){
     </div>
   `;
 
-  section.querySelector('.code').value = initialText;
+  const codeEl = section.querySelector('.code');
+  codeEl.value = sanitizeToCurrencySymbol(initialText);
+  codeEl.addEventListener('input', ()=> enforceSanitizedTextarea(codeEl));
+  codeEl.addEventListener('blur', ()=> enforceSanitizedTextarea(codeEl));
+
   section.querySelector('.runBtn').addEventListener('click', ()=> runOne(section));
   section.querySelector('.copyHtml').addEventListener('click', ()=> copyHTML(section));
   section.querySelector('.downloadJson').addEventListener('click', ()=> downloadJSON(section));
@@ -300,7 +344,7 @@ async function bootstrap(){
 
 /* === The "sketchy" examples, each rendered in its own editable card === */
 // 30 language-diverse, slightly tricky examples covering:
-// html, css, javascript, c, cpp, csv, java, json, python, text
+// html, css, javascript, c_family, csv, java, json, python, text
 const EXAMPLES = [
   `<!DOCTYPE html>
 <html>

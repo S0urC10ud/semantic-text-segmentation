@@ -13,6 +13,7 @@ import wandb
 
 import config as cfg
 from window_generator import make_training_window
+from token_utils import sanitize_tokens
 
 if TYPE_CHECKING:
     from config import DataConfig
@@ -47,6 +48,7 @@ def _make_eval_batch(
         x, y = make_training_window(dsets_by_lang, L, data_cfg)
         xb[i] = x
         yb[i] = y
+    xb = sanitize_tokens(xb)
     return xb, yb
 
 

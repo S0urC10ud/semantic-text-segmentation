@@ -141,8 +141,7 @@ DEFAULT_COLOR_BY_LABEL = {
     "java": "#8e44ad",
     "go": "#16a085",
     "typescript": "#95a5a6",
-    "c": "#9b59b6",
-    "cpp": "#2ecc71",
+    "c_family": "#2ecc71",
     "csharp": "#1abc9c",
     "csv": "#e74c3c",
     "ruby": "#8e44ad",
@@ -362,6 +361,39 @@ BYTE_VOCAB_SIZE = 256
 PAD_BYTE_ID = 256
 NUM_TOKEN_EMBEDDINGS = BYTE_VOCAB_SIZE + 1  # 257
 
+_VISIBLE_ASCII_BYTES = tuple(range(0x20, 0x7F))
+_WHITESPACE_BYTES = (0x09, 0x0A, 0x0D)
+_CURRENCY_BYTE_ID = np.int32(0xA4)
+_ALLOWED_MODEL_BYTE_VALUES = np.array(
+    sorted(set(_VISIBLE_ASCII_BYTES) | set(_WHITESPACE_BYTES) | {int(_CURRENCY_BYTE_ID)}),
+    dtype=np.int32,
+)
+_ALLOWED_MODEL_TOKEN_VALUES = np.array(
+    sorted(set(_ALLOWED_MODEL_BYTE_VALUES.tolist()) | {int(PAD_BYTE_ID)}),
+    dtype=np.int32,
+)
+
+
+def _sanitize_model_bytes(arr: np.ndarray) -> np.ndarray:
+    arr_np = np.asarray(arr, dtype=np.uint8)
+    if arr_np.size == 0:
+        return arr_np
+    invalid = ~np.isin(arr_np.astype(np.int32), _ALLOWED_MODEL_BYTE_VALUES)
+    if np.any(invalid):
+        arr_np = arr_np.copy()
+        arr_np[invalid] = np.uint8(_CURRENCY_BYTE_ID)
+    return arr_np
+
+
+def _sanitize_model_tokens(arr: np.ndarray) -> np.ndarray:
+    arr_np = np.asarray(arr, dtype=np.int32)
+    if arr_np.size == 0:
+        return arr_np
+    invalid = ~np.isin(arr_np, _ALLOWED_MODEL_TOKEN_VALUES)
+    if np.any(invalid):
+        arr_np[invalid] = _CURRENCY_BYTE_ID
+    return arr_np
+
 # ---------------------------
 # Model (must mirror training EXACTLY)
 # ---------------------------
@@ -489,6 +521,7 @@ class Predictor:
             tokens = np.full((len(batch), maxL), PAD_BYTE_ID, dtype=np.int32)
             for j, b in enumerate(batch):
                 tokens[j, :len(b)] = b.astype(np.int32)
+            tokens = _sanitize_model_tokens(tokens)
             logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
             # Convert logits to probabilities using softmax
             probs_batch = np.array(jax.nn.softmax(logits, axis=-1))
@@ -567,7 +600,7 @@ class Predictor:
         return arr
 
     def segment_text(self, text: str, min_run_chars: int = 6, chunk: int = None):
-        b = np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8)
+        b = _sanitize_model_bytes(np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8))
         byte_labels, byte_probs = self._segment_bytes(b, chunk=chunk)
         char_labels, char_probs = self._byte_labels_to_char_labels(text, byte_labels, byte_probs)
         char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
@@ -684,10 +717,13 @@ def api_segment(req: SegmentRequest):
 
     import time as _time
     t0 = _time.perf_counter()
-    segs, char_labels, char_probs = predictor.segment_text(
-        req.text, min_run_chars=int(req.min_run),
-        chunk=int(req.chunk) if req.chunk else args.chunk
-    )
+    try:
+        segs, char_labels, char_probs = predictor.segment_text(
+            req.text, min_run_chars=int(req.min_run),
+            chunk=int(req.chunk) if req.chunk else args.chunk
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     elapsed_ms = float((_time.perf_counter() - t0) * 1000.0)
 
     def esc(s: str) -> str:

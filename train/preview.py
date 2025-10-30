@@ -4,7 +4,7 @@ Utilities for generating an HTML preview of augmented data samples.
 import os
 import json
 import colorsys
-from typing import List, Tuple, Dict
+from typing import List, Dict, Any, Optional
 import numpy as np
 
 import config
@@ -57,6 +57,25 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .tok.pad { background:rgba(153,153,153,.20); color:#555; }
   .stats { margin-bottom:8px; }
   .code { font-size: 12.5px; line-height: 1.35; }
+  .meta { margin-bottom:12px; border:1px solid #e3e3e3; background:#fff; padding:10px 12px; border-radius:8px; font-size:12px; line-height:1.4; box-shadow:0 1px 2px rgba(0,0,0,0.03); }
+  .meta-mode { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px; }
+  .badge { display:inline-flex; align-items:center; justify-content:center; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; letter-spacing:0.04em; text-transform:uppercase; background:#444; color:#fff; }
+  .badge.mode-pure { background:#4caf50; }
+  .badge.mode-mixed { background:#3f51b5; }
+  .badge.mode-line_inject { background:#ff9800; }
+  .meta-note { font-size:11.5px; color:#555; }
+  .meta-length { font-weight:600; color:#333; }
+  .meta-segments { font-size:11.5px; color:#555; display:block; }
+  .meta-table { width:100%; border-collapse:collapse; margin-top:6px; }
+  .meta-table th, .meta-table td { padding:4px 6px; border-top:1px solid #f0f0f0; text-align:left; vertical-align:top; }
+  .meta-table th { background:#f6f6f6; font-size:11.5px; font-weight:600; color:#444; }
+  .meta-table td { font-size:11.5px; color:#333; }
+  .meta-table td.meta-source { font-family:inherit; word-break:break-all; }
+  .meta-section { margin-top:6px; }
+  .meta-section summary { cursor:pointer; font-weight:600; color:#333; }
+  .meta-list { margin:6px 0 0 18px; padding:0; list-style:disc; }
+  .meta-list li { margin-bottom:6px; }
+  .meta-preview { margin-top:4px; padding:6px 8px; background:#f0f4ff; border-radius:4px; white-space:pre-wrap; border:1px solid #d9e2ff; }
 </style>
 </head>
 <body>
@@ -133,7 +152,164 @@ def generate_example_colors(labels_u8: np.ndarray) -> dict:
         colors[label] = '#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255))
     return colors
 
-def _render_example_html(tokens_i32: np.ndarray, labels_u8: np.ndarray) -> str:
+
+def _shorten(text: Optional[str], limit: int = 80) -> str:
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def _format_sample_measure(sample: Dict[str, Any]) -> str:
+    if sample.get("final_bytes") is not None:
+        return f"{int(sample['final_bytes'])} B"
+    if sample.get("bytes") is not None:
+        return f"{int(sample['bytes'])} B"
+    if sample.get("chars") is not None:
+        return f"{int(sample['chars'])} chars"
+    return "—"
+
+
+def _render_metadata_summary(metadata: Optional[Dict[str, Any]]) -> str:
+    if not metadata:
+        return ""
+
+    parts: List[str] = ['<div class="meta">']
+    mode_key = metadata.get("mode", "unknown")
+    mode_display = mode_key.replace("_", " ").upper() if isinstance(mode_key, str) else str(mode_key)
+    badge_class = f"badge mode-{mode_key}" if isinstance(mode_key, str) else "badge"
+    parts.append('<div class="meta-mode">')
+    parts.append(f'<span class="{badge_class}">{_escape_html(mode_display)}</span>')
+    length = metadata.get("length")
+    if length:
+        parts.append(f'<span class="meta-note">window {int(length)} bytes</span>')
+    requested_key = metadata.get("requested_mode")
+    if requested_key and requested_key != mode_key:
+        requested_display = requested_key.replace("_", " ").upper() if isinstance(requested_key, str) else str(requested_key)
+        parts.append(f'<span class="meta-note">requested {_escape_html(requested_display)}</span>')
+
+    final_segments = metadata.get("final_segments") or []
+    if final_segments:
+        seg_bits = []
+        for seg in final_segments:
+            lang = seg.get("language") or config.ID2LANG.get(int(seg.get("language_id", -1)), "?")
+            length_b = seg.get("length")
+            seg_bits.append(f'{_escape_html(str(lang).upper())} <span class="meta-length">({int(length_b)} B)</span>')
+        parts.append(f'<span class="meta-segments">segments: {" → ".join(seg_bits)}</span>')
+    parts.append('</div>')
+
+    samples = metadata.get("samples") or []
+    if samples:
+        parts.append('<details class="meta-section" open>')
+        parts.append('<summary>Source Contributions</summary>')
+        parts.append('<table class="meta-table"><thead><tr><th>Origin</th><th>Language</th><th>Span</th><th>Source</th><th>Notes</th></tr></thead><tbody>')
+        for sample in samples:
+            origin = _escape_html(str(sample.get("origin", "base")).replace("_", " ").title())
+            lang = sample.get("language")
+            if not lang and sample.get("language_id") is not None:
+                lang = config.ID2LANG.get(int(sample["language_id"]), str(sample["language_id"]))
+            lang_display = _escape_html(str(lang).upper()) if lang else "?"
+            span_parts = []
+            final_spans = sample.get("final_spans") or []
+            if final_spans:
+                first_span = final_spans[0]
+                if first_span.get("end", 0) > first_span.get("start", 0):
+                    span_parts.append(f"{int(first_span['start'])}-{int(first_span['end'])}")
+                if len(final_spans) > 1:
+                    span_parts.append(f"+{len(final_spans) - 1} more")
+            elif sample.get("start") is not None and sample.get("end") is not None and sample.get("end") > sample.get("start"):
+                span_parts.append(f"{int(sample['start'])}-{int(sample['end'])}")
+            measure = _format_sample_measure(sample)
+            if measure != "—":
+                span_parts.append(measure)
+            span = "<br>".join(span_parts) if span_parts else measure
+            source = _escape_html(_shorten(sample.get("source"), 100))
+            notes_parts = []
+            if sample.get("requested_bytes") is not None:
+                notes_parts.append(f"requested {int(sample['requested_bytes'])} B")
+            if sample.get("requested_chars") is not None:
+                notes_parts.append(f"requested {int(sample['requested_chars'])} chars")
+            if sample.get("status"):
+                notes_parts.append(str(sample["status"]))
+            parts.append(
+                "<tr>"
+                f"<td>{origin}</td>"
+                f"<td>{lang_display}</td>"
+                f"<td>{span}</td>"
+                f"<td class=\"meta-source\">{source}</td>"
+                f"<td>{_escape_html(', '.join(notes_parts)) if notes_parts else ''}</td>"
+                "</tr>"
+            )
+        parts.append("</tbody></table></details>")
+
+    injections = metadata.get("line_injections") or []
+    if injections:
+        parts.append(f'<details class="meta-section" open><summary>Line Injections ({len(injections)})</summary>')
+        parts.append('<ul class="meta-list">')
+        for inj in injections:
+            lang = inj.get("language")
+            if not lang and inj.get("language_id") is not None:
+                lang = config.ID2LANG.get(int(inj["language_id"]), str(inj["language_id"]))
+            lang_display = _escape_html(str(lang).upper())
+            source = _escape_html(_shorten(inj.get("source"), 100))
+            char_idx = inj.get("insert_char_index")
+            chars_inserted = inj.get("chars_inserted")
+            pre_nl = inj.get("newlines_before", 0)
+            post_nl = inj.get("newlines_after", 0)
+            preview = inj.get("preview")
+            final_bytes = inj.get("final_bytes")
+            final_spans = inj.get("final_spans") or []
+            span_desc = ""
+            if final_spans:
+                first = final_spans[0]
+                if first.get("end", 0) > first.get("start", 0):
+                    span_desc = f" span {int(first['start'])}-{int(first['end'])}"
+                if len(final_spans) > 1:
+                    span_desc += f" (+{len(final_spans)-1} more)"
+            metrics = []
+            if final_bytes is not None:
+                metrics.append(f"{int(final_bytes)} B in window")
+            if chars_inserted is not None:
+                metrics.append(f"{int(chars_inserted)} chars inserted")
+            metrics.append(f"pre {pre_nl} / post {post_nl} newlines")
+            parts.append(
+                "<li>"
+                f"<strong>{lang_display}</strong> @ char {int(char_idx) if char_idx is not None else '?'}"
+                f"{' ' + span_desc if span_desc else ''}"
+                f" ({', '.join(metrics)}) from {source}"
+            )
+            if preview:
+                parts.append(f'<div class="meta-preview">{_escape_html(_shorten(preview, 240))}</div>')
+            parts.append("</li>")
+        parts.append("</ul></details>")
+
+    overlays = metadata.get("overlays") or []
+    if overlays:
+        parts.append(f'<details class="meta-section"><summary>Overlays ({len(overlays)})</summary>')
+        parts.append('<ul class="meta-list">')
+        for idx, overlay in enumerate(overlays, start=1):
+            start = overlay.get("start")
+            end = overlay.get("end")
+            seg_desc = []
+            for seg in overlay.get("segments", []):
+                lang = seg.get("language") or config.ID2LANG.get(int(seg.get("language_id", -1)), "?")
+                bytes_len = seg.get("bytes") or seg.get("end", 0) - seg.get("start", 0)
+                src = _escape_html(_shorten(seg.get("source"), 80))
+                seg_desc.append(f"{_escape_html(str(lang).upper())} {int(bytes_len)}B ({src})")
+            segment_text = "; ".join(seg_desc) if seg_desc else "mixed slice"
+            parts.append(
+                "<li>"
+                f"<strong>Overlay {idx}</strong> [{int(start) if start is not None else '?'} - {int(end) if end is not None else '?'}): "
+                f"{segment_text}"
+                "</li>"
+            )
+        parts.append("</ul></details>")
+
+    parts.append("</div>")
+    return "".join(parts)
+
+def _render_example_html(tokens_i32: np.ndarray, labels_u8: np.ndarray, metadata: Optional[Dict[str, Any]]) -> str:
     """Render a single example (window) into an HTML snippet with spans colored by label."""
     L = int(tokens_i32.shape[0])
     pad_id = config.PAD_ID
@@ -164,6 +340,10 @@ def _render_example_html(tokens_i32: np.ndarray, labels_u8: np.ndarray) -> str:
     else:
         dist = "empty"
     html_parts.append(f'<div class="stats muted">valid_len={last_valid}, class_dist=[{_escape_html(dist)}]</div>')
+
+    meta_block = _render_metadata_summary(metadata)
+    if meta_block:
+        html_parts.append(meta_block)
     html_parts.append(legend_html)
 
     i = 0
@@ -192,8 +372,13 @@ def _render_example_html(tokens_i32: np.ndarray, labels_u8: np.ndarray) -> str:
         
     return "".join(html_parts)
 
-def build_preview_html(examples: List[Tuple[np.ndarray, np.ndarray]], out_path: str):
-    html_snippets = [_render_example_html(x, y) for (x, y) in examples]
+def build_preview_html(examples: List[Dict[str, Any]], out_path: str):
+    html_snippets = []
+    for ex in examples:
+        tokens = ex.get("tokens")
+        labels = ex.get("labels")
+        meta = ex.get("metadata")
+        html_snippets.append(_render_example_html(tokens, labels, meta))
     
     def _js_quote(s: str) -> str:
         return json.dumps(s)

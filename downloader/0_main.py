@@ -36,7 +36,7 @@ Also supported (derived transforms):
 Example:
   python build_stack_windows_arrow_splits.py \
       --out-root arrow_out \
-      --langs html,css,javascript,typescript,c,cpp,csharp,go,rust,csv,java,json,python,ruby,text,shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85 \
+      --langs html,css,javascript,typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85 \
       --max-windows-per-label 200000 \
       --window-bytes 1536 --magika-batch 1024 --threshold 0.82 \
       --shard-count 64 --shard-index 17 \
@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set
 from bisect import bisect_left
+import html
 
 # Keep native threadpools from over-subscribing
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -80,11 +81,12 @@ import numpy as np
 
 def safe_filename(name: str) -> str:
     s = (name or "")
-    if s.lower() == "c++":
-        return "cpp"
-    if s.lower() in ("c#", "c-sharp", "csharp", "cs"):  # accept cs
+    lower = s.lower()
+    if lower in ("c", "c++", "cpp", "c-family", "cfamily"):
+        return "c_family"
+    if lower in ("c#", "c-sharp", "csharp", "cs"):  # accept cs
         return "csharp"
-    if s.lower() in ("yml",):
+    if lower in ("yml",):
         return "yaml"
     s = s.replace(" ", "_")
     return re.sub(r"[^a-zA-Z0-9._-]", "_", s)
@@ -92,8 +94,8 @@ def safe_filename(name: str) -> str:
 
 def canonical_label(name: str) -> str:
     s = (name or "").strip().lower().replace(" ", "_")
-    if s in {"c++", "cpp"}:
-        return "cpp"
+    if s in {"c++", "cpp", "c", "c_family", "c-family", "cfamily"}:
+        return "c_family"
     if s in {"c#", "c-sharp", "csharp", "cs"}:
         return "csharp"
     if s in {"js", "javascript"}:
@@ -116,7 +118,7 @@ def canonical_label(name: str) -> str:
 # Magika may return different but equivalent labels; accept these as matches.
 LABEL_ACCEPTS: Dict[str, set] = {
     "text": {"txt", "text"},
-    "cpp": {"cpp", "c++"},
+    "c_family": {"c", "cpp", "c++", "c_family"},
     "csv": {"csv"},
     "csharp": {"c#", "csharp", "c-sharp", "cs"},
     "javascript": {"javascript", "js"},
@@ -129,7 +131,6 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "ruby": {"ruby"},
     "python": {"python"},
     "java": {"java"},
-    "c": {"c"},
     "json": {"json"},
     "css": {"css"},
     "html": {"html", "xhtml"},
@@ -148,6 +149,271 @@ def label_matches_target(target: str, magika_label: Optional[str], mime: Optiona
     ml = canonical_label(magika_label)
     accepts = LABEL_ACCEPTS.get(tgt, {tgt})
     return ml in accepts
+
+MADLAD_REPO_ID = "allenai/MADLAD-400"
+MADLAD_DATA_GLOB = "hf://datasets/allenai/MADLAD-400/data/{lang}/*_clean_*.jsonl.gz"
+MADLAD_MIN_CHARS = 50
+_MADLAD_TAG_RE = re.compile(r"<[^>]+>")
+_MADLAD_WS_RE = re.compile(r"\s+")
+_MADLAD_LANG_CACHE: Optional[List[str]] = None
+def resolve_hf_token_pair(use_auth_token: bool) -> Tuple[Optional[str], Optional[Any]]:
+    token_str: Optional[str] = None
+    token_arg: Optional[Any] = None
+    if not use_auth_token:
+        return token_str, token_arg
+    try:
+        from huggingface_hub import get_token  # type: ignore
+        tok = get_token()
+        if tok:
+            token_str = tok
+            token_arg = tok
+        else:
+            token_arg = True
+    except Exception:
+        token_arg = True
+    if token_str is None:
+        for env_key in ("HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN", "HF_API_TOKEN"):
+            val = os.getenv(env_key)
+            if val:
+                token_str = val
+                if token_arg in (None, True):
+                    token_arg = val
+                break
+    return token_str, token_arg
+
+def normalize_madlad_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    t = html.unescape(text)
+    t = t.replace("\\n", "\n")
+    t = _MADLAD_TAG_RE.sub("", t)
+    t = _MADLAD_WS_RE.sub(" ", t).strip()
+    return t
+
+def madlad_window_chunks(
+    text: str,
+    window_chars: int,
+    stride_chars: int,
+    min_chars: int,
+) -> Iterator[Tuple[int, str]]:
+    if not text:
+        return
+    n = len(text)
+    if n < min_chars:
+        return
+    stride = stride_chars if stride_chars > 0 else window_chars
+    idx = 0
+    start = 0
+    while start < n:
+        chunk = text[start:start + window_chars]
+        if len(chunk) < min_chars:
+            break
+        if len(chunk) == window_chars:
+            last_ws = chunk.rfind(" ")
+            if last_ws >= window_chars // 2:
+                chunk = chunk[:last_ws]
+        if len(chunk) < min_chars:
+            break
+        yield idx, chunk
+        idx += 1
+        start += stride
+
+def madlad_list_languages(token: Optional[str]) -> List[str]:
+    global _MADLAD_LANG_CACHE
+    if _MADLAD_LANG_CACHE is not None:
+        return list(_MADLAD_LANG_CACHE)
+    try:
+        from huggingface_hub import HfFileSystem  # type: ignore
+    except Exception as e:
+        raise RuntimeError("huggingface_hub is required to enumerate MADLAD languages") from e
+    fs = HfFileSystem(token=token)
+    try:
+        entries = fs.ls(f"datasets/{MADLAD_REPO_ID}/data", detail=True)
+    except Exception as e:
+        raise RuntimeError(f"Failed to list MADLAD languages: {e}") from e
+    langs = sorted(
+        entry["name"].split("/")[-1]
+        for entry in entries
+        if entry.get("type") == "directory"
+    )
+    if not langs:
+        raise RuntimeError("No language directories found in MADLAD-400 /data.")
+    _MADLAD_LANG_CACHE = list(langs)
+    return list(langs)
+
+def madlad_lang_window_iter(
+    lang: str,
+    *,
+    window_chars: int,
+    stride_chars: int,
+    min_chars: int,
+    token: Optional[Any],
+) -> Iterator[Tuple[int, str]]:
+    data_glob = MADLAD_DATA_GLOB.format(lang=lang)
+    load_kwargs = dict(
+        path="json",
+        data_files=data_glob,
+        split="train",
+        streaming=True,
+    )
+    if token is not None:
+        load_kwargs["token"] = token
+    try:
+        ds = load_dataset(**load_kwargs)
+    except TypeError:
+        load_kwargs.pop("token", None)
+        ds = load_dataset(**load_kwargs)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"No MADLAD clean files for language '{lang}': {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Failed to open MADLAD language '{lang}': {e}") from e
+
+    for ex in ds:
+        raw = (
+            ex.get("text")
+            or ex.get("document")
+            or ex.get("content")
+            or ex.get("body")
+            or ""
+        )
+        norm = normalize_madlad_text(raw)
+        if not norm:
+            continue
+        for idx, chunk in madlad_window_chunks(
+            norm,
+            window_chars=window_chars,
+            stride_chars=stride_chars,
+            min_chars=min_chars,
+        ):
+            yield idx, chunk
+
+def gen_text_windows_from_madlad(
+    *,
+    window_bytes: int,
+    add_meta: bool,
+    progress_mode: str,
+    budget_per_split: Dict[str, int],
+    seen_uids: Optional[Set[str]],
+    use_auth_token: bool,
+    base_seed: int,
+) -> Iterator[dict]:
+    window_chars = max(1, int(window_bytes))
+    stride_chars = window_chars
+    min_chars = window_chars if window_chars < MADLAD_MIN_CHARS else MADLAD_MIN_CHARS
+    total_budget = sum(max(0, b) for b in budget_per_split.values())
+    is_tty = sys.stderr.isatty()
+    show_progress = ((progress_mode == "always") or (progress_mode == "auto" and is_tty))
+    pbar = tqdm(total=total_budget if total_budget > 0 else None,
+                unit="win",
+                desc="text (madlad)",
+                disable=not show_progress)
+
+    token_str, token_arg = resolve_hf_token_pair(use_auth_token)
+    try:
+        langs = madlad_list_languages(token=token_str)
+    except Exception as e:
+        pbar.close()
+        raise
+    rng = random.Random(base_seed)
+    rng.shuffle(langs)
+
+    kept_total = 0
+    kept_per_split = {"train": 0, "val": 0, "test": 0}
+    rejected = 0
+    lang_id = np.int16(LANG2ID.get("text", -1)).item()
+    last_postfix = time.time()
+
+    remaining_total = sum(budget_per_split.values())
+    remaining_langs = len(langs)
+
+    for lang in langs:
+        if (total_budget > 0 and kept_total >= total_budget) or remaining_total <= 0 or remaining_langs <= 0:
+            break
+        target_for_lang = (remaining_total + remaining_langs - 1) // remaining_langs
+        got_for_lang = 0
+        try:
+            iterator = madlad_lang_window_iter(
+                lang,
+                window_chars=window_chars,
+                stride_chars=stride_chars,
+                min_chars=min_chars,
+                token=token_arg,
+            )
+            for win_idx, chunk in iterator:
+                if total_budget > 0 and kept_total >= total_budget:
+                    break
+                if got_for_lang >= target_for_lang:
+                    break
+
+                ascii_text = map_text_to_ascii(chunk)
+                if not ascii_text:
+                    rejected += 1
+                    continue
+                ascii_bytes = ascii_text.encode("utf-8", errors="ignore")
+                if not ascii_bytes:
+                    rejected += 1
+                    continue
+
+                uid = stable_uid_for_window(ascii_bytes)
+                if seen_uids is not None and uid in seen_uids:
+                    rejected += 1
+                    continue
+
+                split = split_for_uid(uid)
+                if budget_per_split.get(split, 0) <= 0:
+                    rejected += 1
+                    continue
+
+                payload = {
+                    "content": ascii_text,
+                    "lang_id": lang_id,
+                    "uid": uid,
+                    "split": split,
+                }
+                if add_meta:
+                    payload.update({
+                        "win_idx": np.int64(win_idx).item(),
+                        "source_ext": "",
+                        "source_hexsha": "",
+                        "source_repo": MADLAD_REPO_ID,
+                        "source_repo_path": lang,
+                        "license": "unknown",
+                    })
+
+                budget_per_split[split] = max(0, budget_per_split[split] - 1)
+                kept_per_split[split] += 1
+                kept_total += 1
+                got_for_lang += 1
+                if seen_uids is not None:
+                    seen_uids.add(uid)
+
+                yield payload
+                pbar.update(1)
+
+                now = time.time()
+                if (now - last_postfix) >= 0.3:
+                    pbar.set_postfix(
+                        kept_total=kept_total,
+                        rej=rejected,
+                        k_train=kept_per_split["train"],
+                        k_val=kept_per_split["val"],
+                        k_test=kept_per_split["test"],
+                    )
+                    last_postfix = now
+        except Exception as e:
+            sys.stderr.write(f"[warn] MADLAD '{lang}' iteration failed: {e}\n")
+
+        remaining_langs -= 1
+        remaining_total = sum(budget_per_split.values())
+
+    pbar.set_postfix(
+        kept_total=kept_total,
+        rej=rejected,
+        k_train=kept_per_split["train"],
+        k_val=kept_per_split["val"],
+        k_test=kept_per_split["test"],
+    )
+    pbar.close()
 
 # Placeholder for any character outside ASCII range (0–127).
 NON_ASCII_PLACEHOLDER = "\u00A4"  # generic currency sign as replacement sentinel
@@ -351,8 +617,7 @@ LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     "python": ["python"],
     "javascript": ["javascript", "js"],
     "java": ["java"],
-    "c": ["c"],
-    "cpp": ["c++", "cpp"],
+    "c_family": ["c", "c++", "cpp"],
     "json": ["json"],
     "css": ["css"],
     "html": ["html", "xhtml", "xml", "svg"],
@@ -370,10 +635,19 @@ def stream_madlad_iterable(*, shuffle_buffer: int) -> Optional[Any]:
     """
     Streaming loader for allenai/MADLAD-400 (clean split) backing the 'text' label.
     """
-    try:
-        ds = load_dataset("allenai/MADLAD-400", split="clean", streaming=True)
-    except Exception as e:
-        sys.stderr.write(f"[warn] failed to open MADLAD-400 (clean split): {e}\n")
+    load_attempts: List[Dict[str, Any]] = [
+        {"path": "allenai/MADLAD-400", "name": "clean", "split": "train"},
+        {"path": "allenai/MADLAD-400", "split": "clean"},
+    ]
+    last_exc: Optional[BaseException] = None
+    for kwargs in load_attempts:
+        try:
+            ds = load_dataset(streaming=True, **kwargs)
+            break
+        except Exception as e:  # log only if all attempts fail
+            last_exc = e
+    else:
+        sys.stderr.write(f"[warn] failed to open MADLAD-400 (clean split): {last_exc}\n")
         return None
     if shuffle_buffer > 0:
         try:
@@ -897,6 +1171,18 @@ def gen_windows_for_label(
         )
         return
 
+    if label_c == "text":
+        yield from gen_text_windows_from_madlad(
+            window_bytes=window_bytes,
+            add_meta=add_meta,
+            progress_mode=progress_mode,
+            budget_per_split=budget_per_split,
+            seen_uids=seen_uids,
+            use_auth_token=use_auth_token,
+            base_seed=base_seed,
+        )
+        return
+
     # Real languages: stream from The Stack and filter via Magika
     is_tty = sys.stderr.isatty()
     show_progress = ((progress_mode == "always") or (progress_mode == "auto" and is_tty))
@@ -1094,18 +1380,17 @@ LANG2ID: Dict[str, int] = {
     "python": 8,
     "javascript": 9,
     "java": 10,
-    "c": 11,
-    "cpp": 12,
-    "json": 13,
-    "css": 14,
-    "html": 15,
-    "text": 16,
-    "csv": 17,
-    "shell": 18,
-    "powershell": 19,
-    "batchfile": 20,
-    "visual_basic": 21,
-    "dockerfile": 22,
+    "c_family": 11,
+    "json": 12,
+    "css": 13,
+    "html": 14,
+    "text": 15,
+    "csv": 16,
+    "shell": 17,
+    "powershell": 18,
+    "batchfile": 19,
+    "visual_basic": 20,
+    "dockerfile": 21,
     # derived encodings
     "encoding_hex": 100,
     "encoding_base64": 101,
@@ -1409,7 +1694,7 @@ def parse_args() -> argparse.Namespace:
     # NEW default labels per request
     ap.add_argument("--langs", type=str,
                     default=(
-                        "html,css,javascript,typescript,c,cpp,csharp,go,rust,csv,java,json,python,ruby,text,"
+                        "html,css,javascript,typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,"
                         "shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,"
                         "encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85"
                     ),
@@ -1461,7 +1746,13 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    labels = [canonical_label(s) for s in args.langs.split(",") if s.strip()]
+    raw_labels = [canonical_label(s) for s in args.langs.split(",") if s.strip()]
+    labels: List[str] = []
+    seen_labels: Set[str] = set()
+    for label in raw_labels:
+        if label not in seen_labels:
+            labels.append(label)
+            seen_labels.add(label)
     if not labels:
         raise SystemExit("[fatal] No labels provided via --langs")
 

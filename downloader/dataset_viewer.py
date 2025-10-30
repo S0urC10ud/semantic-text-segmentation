@@ -3,7 +3,7 @@
 Interactive viewer for Arrow datasets produced by downloader/0_main.py.
 
 Run:
-    python downloader/dataset_viewer.py --data-root downloader/arrow_out
+    python dataset_viewer.py --data-root arrow_out
 
 Then open http://127.0.0.1:8501 (or the host/port you choose).
 """
@@ -811,8 +811,8 @@ def main() -> None:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("downloader/arrow_out"),
-        help="Root directory containing split/label/dataset outputs from downloader/0_main.py.",
+        default=Path("arrow_out"),
+        help="Root directory containing split/label/dataset outputs from 0_main.py.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host interface for the web server.")
     parser.add_argument("--port", type=int, default=8501, help="Port for the web server.")
