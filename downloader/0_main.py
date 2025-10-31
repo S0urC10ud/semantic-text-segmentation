@@ -1707,7 +1707,7 @@ def parse_args() -> argparse.Namespace:
     # Windowing / filtering
     ap.add_argument("--window-bytes", type=int, default=1536,
                     help="Window size in BYTES (default: 1536)")
-    ap.add_argument("--threshold", type=float, default=0.80,
+    ap.add_argument("--threshold", type=float, default=0.90,
                     help="Magika confidence threshold (keep if score >= threshold)")
     ap.add_argument("--magika-batch", type=int, default=1024,
                     help="How many windows to run through Magika per batch")
