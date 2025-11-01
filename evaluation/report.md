@@ -43,17 +43,17 @@ Markdown-like text/code interleavings with optional fences.
 | css | 256422 | 0.9584 |
 | html | 249229 | 0.9204 |
 | rust | 248532 | 0.9341 |
-| go | 246803 | 0.9491 |
+| go | 246803 | 0.9492 |
 | visual_basic | 241358 | 0.9536 |
 | javascript | 240030 | 0.8492 |
 | encoding_base85 | 237830 | 0.9631 |
-| csv | 222579 | 0.9436 |
+| csv | 222579 | 0.9435 |
 | c_family | 209499 | 0.9011 |
 | typescript | 205114 | 0.8474 |
 | ruby | 203769 | 0.9372 |
 | powershell | 198249 | 0.9491 |
 | python | 194967 | 0.9229 |
-| yaml | 194460 | 0.9256 |
+| yaml | 194460 | 0.9257 |
 | json | 192523 | 0.9412 |
 | csharp | 191496 | 0.9121 |
 | java | 179702 | 0.9195 |
@@ -82,14 +82,14 @@ Host fragments with a foreign-language needle injection sized 16-31 bytes.
 | css | 126444 | 0.9720 |
 | csv | 125895 | 0.9785 |
 | encoding_base58 | 119756 | 0.9449 |
-| html | 113715 | 0.9502 |
-| rust | 112432 | 0.9636 |
+| html | 113715 | 0.9503 |
+| rust | 112432 | 0.9635 |
 | javascript | 111762 | 0.8457 |
 | c_family | 110542 | 0.9512 |
 | go | 108283 | 0.9782 |
 | visual_basic | 107508 | 0.9360 |
 | typescript | 102959 | 0.8657 |
-| python | 102921 | 0.9541 |
+| python | 102921 | 0.9540 |
 | sql | 100073 | 0.8929 |
 | shell | 95423 | 0.9178 |
 | text | 92652 | 0.9374 |
@@ -125,7 +125,7 @@ Host fragments with a foreign-language needle injection sized 32-63 bytes.
 | html | 118286 | 0.9045 |
 | csharp | 115994 | 0.9125 |
 | visual_basic | 107480 | 0.9369 |
-| c_family | 106838 | 0.9118 |
+| c_family | 106838 | 0.9119 |
 | csv | 105648 | 0.9521 |
 | ruby | 104275 | 0.9348 |
 | yaml | 102560 | 0.9206 |
@@ -139,7 +139,7 @@ Host fragments with a foreign-language needle injection sized 32-63 bytes.
 | dockerfile | 78032 | 0.9363 |
 | json | 77728 | 0.9500 |
 | shell | 63323 | 0.9132 |
-| batchfile | 61459 | 0.9324 |
+| batchfile | 61459 | 0.9323 |
 | __unknown__ | 0 | nan |
 
 ### needle_4_15
@@ -214,7 +214,7 @@ Host fragments with a foreign-language needle injection sized 64-∞ bytes.
 | visual_basic | 95329 | 0.9256 |
 | go | 94589 | 0.9220 |
 | javascript | 92894 | 0.8230 |
-| shell | 87405 | 0.9001 |
+| shell | 87405 | 0.9002 |
 | csharp | 77442 | 0.8962 |
 | dockerfile | 73944 | 0.8872 |
 | batchfile | 55779 | 0.9193 |
@@ -227,6 +227,39 @@ Single-label validation fragments (baseline accuracy).
 - Samples: 2000
 - Characters evaluated: 2878826
 - Overall accuracy: 0.9443
+
+### Purity Analysis
+
+| Language | Purity % | Top Misclassifications |
+| --- | ---: | --- |
+| rust | 99.0% | batchfile (0.9%), ruby (0.1%), php (0.0%) |
+| css | 98.9% | batchfile (0.5%), javascript (0.4%), java (0.2%) |
+| csv | 98.8% | batchfile (0.7%), text (0.4%), sql (0.0%) |
+| encoding_base64 | 98.3% | batchfile (1.7%) |
+| powershell | 98.1% | batchfile (1.8%), ruby (0.0%), java (0.0%) |
+| encoding_hex | 98.1% | batchfile (1.9%) |
+| go | 98.0% | batchfile (1.5%), json (0.2%), yaml (0.1%) |
+| ruby | 97.3% | batchfile (2.5%), shell (0.2%), python (0.0%) |
+| visual_basic | 97.2% | batchfile (1.8%), encoding_base85 (0.3%), csharp (0.2%) |
+| python | 97.1% | batchfile (1.5%), ruby (1.0%), yaml (0.2%) |
+| dockerfile | 96.6% | batchfile (2.3%), shell (1.0%), sql (0.0%) |
+| encoding_base58 | 96.4% | batchfile (3.6%) |
+| yaml | 95.5% | shell (2.0%), batchfile (2.0%), csv (0.3%) |
+| c_family | 95.1% | java (1.7%), javascript (1.0%), sql (0.8%) |
+| typescript | 94.5% | batchfile (1.8%), javascript (0.9%), java (0.8%) |
+| java | 94.5% | batchfile (2.7%), javascript (2.2%), typescript (0.3%) |
+| php | 94.3% | batchfile (4.2%), javascript (0.9%), c_family (0.5%) |
+| json | 93.5% | batchfile (3.9%), javascript (1.9%), text (0.4%) |
+| batchfile | 93.5% | shell (4.9%), powershell (1.1%), text (0.2%) |
+| html | 93.3% | batchfile (4.3%), encoding_base58 (0.7%), javascript (0.7%) |
+| shell | 92.6% | batchfile (5.7%), yaml (0.6%), ruby (0.3%) |
+| javascript | 91.8% | html (1.9%), batchfile (1.5%), java (1.2%) |
+| sql | 91.6% | batchfile (5.5%), python (1.5%), c_family (0.6%) |
+| csharp | 90.0% | batchfile (7.6%), java (1.7%), c_family (0.4%) |
+| text | 89.4% | batchfile (10.6%) |
+| encoding_base32 | 84.0% | batchfile (16.0%) |
+| encoding_base85 | 81.2% | batchfile (18.8%), shell (0.0%), encoding_base32 (0.0%) |
+
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
@@ -294,7 +327,7 @@ Two-language back-to-back sequences <A><B>.
 | powershell | 179467 | 0.9092 |
 | typescript | 178374 | 0.8151 |
 | shell | 135934 | 0.8730 |
-| batchfile | 135558 | 0.9351 |
+| batchfile | 135558 | 0.9350 |
 | dockerfile | 131676 | 0.8897 |
 | __unknown__ | 0 | nan |
 
@@ -317,11 +350,11 @@ Three-language back-to-back sequences <A><B><C>.
 | encoding_base85 | 327612 | 0.9344 |
 | css | 323543 | 0.9425 |
 | go | 317397 | 0.9255 |
-| rust | 316933 | 0.9340 |
+| rust | 316933 | 0.9341 |
 | powershell | 312140 | 0.9116 |
-| html | 310872 | 0.9182 |
+| html | 310872 | 0.9181 |
 | c_family | 309513 | 0.8749 |
-| sql | 309030 | 0.8958 |
+| sql | 309030 | 0.8959 |
 | php | 306059 | 0.8923 |
 | typescript | 304250 | 0.8027 |
 | python | 303841 | 0.9051 |
@@ -341,9 +374,9 @@ Three-language back-to-back sequences <A><B><C>.
 
 | Task | Device | Samples | Total Bytes | Throughput | Latency (s) | RSS Δ (MB) | Device Δ (MB) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| throughput_1024 | cuda | 8 | 8192 | 30.51 KB/s | 0.26 | n/a | n/a |
-| throughput_10240 | cuda | 8 | 81920 | 78.16 KB/s | 1.02 | n/a | n/a |
-| throughput_102400 | cuda | 8 | 819200 | 100.18 KB/s | 7.99 | n/a | n/a |
-| throughput_1048576 | cuda | 8 | 8388608 | 101.19 KB/s | 80.95 | n/a | n/a |
+| throughput_1024 | cuda | 8 | 8192 | 28.42 KB/s | 0.28 | n/a | n/a |
+| throughput_10240 | cuda | 8 | 81920 | 7.99 KB/s | 10.01 | n/a | n/a |
+| throughput_102400 | cuda | 8 | 819200 | 21.49 KB/s | 37.23 | n/a | n/a |
+| throughput_1048576 | cuda | 8 | 8388608 | 81.20 KB/s | 100.89 | n/a | n/a |
 
-Report generated at 2025-10-31 08:31:37
+Report generated at 2025-10-31 09:43:38

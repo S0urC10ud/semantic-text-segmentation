@@ -484,7 +484,16 @@ class SegmenterRunner:
         spans: List[Tuple[int, int]] = []
         stride = max(1, self.chunk // 2)
         win = self.chunk
-        for start in range(0, max(1, total - win + 1), stride):
+        start_positions = list(range(0, max(1, total - win + 1), stride))
+        if not start_positions:
+            start_positions = [0]
+        if start_positions[-1] + win < total:
+            start_positions.append(max(0, total - win))
+        seen = set()
+        for start in start_positions:
+            if start in seen:
+                continue
+            seen.add(start)
             end = min(total, start + win)
             windows.append(byte_arr[start:end])
             spans.append((start, end))
@@ -961,17 +970,19 @@ _INDEX_HTML = """<!DOCTYPE html>
     function positionTooltip(event) {
       if (!event) return;
       const padding = 12;
-      let x = event.pageX + 14;
-      let y = event.pageY + 14;
       const rect = tooltip.getBoundingClientRect();
       const vw = window.innerWidth;
       const vh = window.innerHeight;
+      let x = event.clientX + 14;
+      let y = event.clientY + 14;
       if (x + rect.width + padding > vw) {
         x = vw - rect.width - padding;
       }
       if (y + rect.height + padding > vh) {
         y = vh - rect.height - padding;
       }
+      if (x < padding) x = padding;
+      if (y < padding) y = padding;
       tooltip.style.left = `${x}px`;
       tooltip.style.top = `${y}px`;
     }

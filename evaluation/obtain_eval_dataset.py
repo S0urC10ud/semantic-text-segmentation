@@ -680,7 +680,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument(
         "--per-label",
         type=int,
-        default=1000,
+        default=100,
         help="Examples per label for most benchmarks (pure, injection, sequences, markdown).",
     )
     parser.add_argument(

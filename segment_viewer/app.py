@@ -13,7 +13,7 @@ Then open http://127.0.0.1:8000
 import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-from typing import List, Tuple, Optional, Any, Dict
+from typing import List, Tuple, Optional, Any, Dict, Sequence
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +32,7 @@ from collections.abc import Mapping
 import dataclasses
 from pathlib import Path
 import re
+import json
 import importlib.util
 import orbax.checkpoint as ocp
 import flax.serialization as serialization
@@ -61,13 +62,32 @@ try:
 except ImportError:
     TRAIN_CONFIG = None
 
+DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
+
+
+def _apply_label_mapping(label_names: Sequence[str]) -> None:
+    if not label_names or TRAIN_CONFIG is None:
+        return
+    LANG2ID = getattr(TRAIN_CONFIG, "LANG2ID", None)
+    update_fn = getattr(TRAIN_CONFIG, "update_lang_mappings", None)
+    if not isinstance(LANG2ID, dict):
+        return
+    LANG2ID.clear()
+    for idx, name in enumerate(label_names):
+        LANG2ID[name] = idx
+    if callable(update_fn):
+        update_fn()
+
 
 def _configured_languages() -> List[str]:
     if TRAIN_CONFIG is None:
         raise RuntimeError(
             "train/config.py could not be loaded; unable to resolve label ordering automatically."
         )
-    return sorted(TRAIN_CONFIG.LANG2ID.keys())
+    mapping = getattr(TRAIN_CONFIG, "LANG2ID", None)
+    if not isinstance(mapping, dict):
+        raise RuntimeError("train/config.py does not define LANG2ID mapping")
+    return [name for name, _ in sorted(mapping.items(), key=lambda kv: kv[1])]
 
 
 def _resolve_langs_and_display(
@@ -119,6 +139,80 @@ def _resolve_langs_and_display(
 
     display_names = [display_map.get(name, name) for name in ordered]
     return ordered, display_names
+
+
+def _extract_run_id_from_checkpoint(path: Path) -> Optional[str]:
+    name = path.name.lower()
+    match = re.search(r"([a-z0-9]{8})", name)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
+    run_id = _extract_run_id_from_checkpoint(ckpt_path)
+    if not run_id:
+        return {}
+    wandb_root = REPO_ROOT / "train" / "wandb"
+    if not wandb_root.exists():
+        return {}
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return {}
+    pattern = f"run-*-{run_id}"
+    for run_dir in wandb_root.glob(pattern):
+        config_path = run_dir / "files" / "config.yaml"
+        if not config_path.exists():
+            continue
+        try:
+            config_data = yaml.safe_load(config_path.read_text())
+        except Exception:
+            config_data = None
+        if not isinstance(config_data, dict):
+            config_data = {}
+        result: Dict[str, Any] = {}
+        channels_val = config_data.get("channels", {}).get("value")
+        if isinstance(channels_val, (list, tuple)):
+            try:
+                result["channels"] = [int(x) for x in channels_val]
+            except (TypeError, ValueError):
+                pass
+        model_dim_val = config_data.get("model_dim", {}).get("value")
+        if isinstance(model_dim_val, (int, float)):
+            result["model_dim"] = int(model_dim_val)
+        dtype_val = config_data.get("dtype", {}).get("value")
+        if isinstance(dtype_val, str):
+            result["dtype"] = dtype_val.rsplit(".", 1)[-1]
+
+        summary_path = run_dir / "files" / "wandb-summary.json"
+        if summary_path.exists():
+            try:
+                summary_data = json.loads(summary_path.read_text())
+            except Exception:
+                summary_data = None
+            if isinstance(summary_data, dict):
+                label_names: Dict[int, str] = {}
+                prefix = "val/per_class/"
+                for key in summary_data.keys():
+                    if not key.startswith(prefix):
+                        continue
+                    remainder = key[len(prefix):]
+                    head = remainder.split("/", 1)[0]
+                    if "_" not in head:
+                        continue
+                    idx_str, label = head.split("_", 1)
+                    try:
+                        idx = int(idx_str)
+                    except ValueError:
+                        continue
+                    label_names[idx] = label
+                if label_names:
+                    ordered = [label_names[i] for i in sorted(label_names)]
+                    result["label_names"] = ordered
+        if result:
+            return result
+    return {}
 
 
 def auto_color(k: int, n: int) -> str:
@@ -627,9 +721,9 @@ parser.add_argument(
     required=True,
     help="Path to a .msgpack file OR an Orbax checkpoint dir/root"
 )
-parser.add_argument("--model-dim", type=int, default=256)
-parser.add_argument("--channels", type=str, default="96,128,192,256")
-parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16","float32","float16"])
+parser.add_argument("--model-dim", type=int, default=None, help="Model embedding dimension (auto if omitted).")
+parser.add_argument("--channels", type=str, default=None, help="Comma-separated channel sizes (auto if omitted).")
+parser.add_argument("--dtype", type=str, default=None, help="Model dtype name (auto if omitted).")
 parser.add_argument("--chunk", type=int, default=1024, help="Inference window")
 parser.add_argument(
     "--lang",
@@ -651,7 +745,34 @@ parser.add_argument("--port", type=int, default=8000)
 parser.add_argument("--openapi", action="store_true")
 args, _ = parser.parse_known_args()
 
-channels = tuple(int(x) for x in args.channels.split(",") if x.strip())
+ckpt_path = Path(args.ckpt).resolve()
+auto_hparams = _load_checkpoint_hparams(ckpt_path)
+
+label_names = auto_hparams.get("label_names")
+if label_names:
+    _apply_label_mapping(label_names)
+
+model_dim = args.model_dim if args.model_dim is not None else auto_hparams.get("model_dim", 256)
+dtype = args.dtype if args.dtype is not None else auto_hparams.get("dtype", "bfloat16")
+if isinstance(dtype, str):
+    dtype = dtype.rsplit(".", 1)[-1]
+
+if args.channels:
+    channel_values = [int(x) for x in args.channels.split(",") if x.strip()]
+else:
+    channel_values = [int(x) for x in auto_hparams.get("channels", DEFAULT_CHANNELS)]
+channels = tuple(channel_values)
+
+args.model_dim = model_dim
+args.dtype = dtype
+args.channels = ",".join(str(ch) for ch in channels)
+
+if auto_hparams:
+    extra = f", classes={len(label_names)}" if label_names else ""
+    print(
+        f"ℹ️  Using checkpoint hyperparameters: model_dim={model_dim}, channels={list(channels)}, dtype={dtype}{extra}",
+        flush=True,
+    )
 
 try:
     canonical_label_names, display_label_names = _resolve_langs_and_display(args.lang)
@@ -701,8 +822,8 @@ def index():
 def get_labels():
     return {
         "num_classes": num_classes,
-        "labels": [{"id": i, "name": ID2NAME[i], "slug": ID2SLUG[i], "color": ID2COLOR[i]}
-                   for i in range(num_classes)],
+        "labels": [{"id": i, "name": ID2NAME[i], "slug": ID2SLUG[i], "color": ID2COLOR.get(i)}
+                   for i in range(num_classes) if ID2COLOR.get(i)],
         "device": str(jax.devices()),
         "loaded": load_error is None,
         "error": load_error,
@@ -730,7 +851,6 @@ def api_segment(req: SegmentRequest):
         return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 .replace('"', "&quot;").replace("'", "&#39;"))
 
-    import json
     out_html = []
     for (s, e, lbl) in segs:
         raw = req.text[s:e]
@@ -738,15 +858,32 @@ def api_segment(req: SegmentRequest):
         color = ID2COLOR.get(lbl, "#888888")
         bg_color = _hex_to_rgba(color, 0.22)
         border_color = _hex_to_rgba(color, 0.35)
-        # Create character spans with probability data
         chars_html = []
         for i, ch in enumerate(raw):
             char_idx = s + i
             probs = char_probs[char_idx]
-            # Properly format as JSON string
-            probs_attr = esc(json.dumps(probs))
-            chars_html.append(f'<span class="char" data-probs="{probs_attr}">{esc(ch)}</span>')
-        # Add single span that combines coloring and character-level probabilities
+            # Aggregate by canonical label
+            agg: Dict[str, float] = {}
+            for key, value in probs.items():
+                try:
+                    label_idx = int(key)
+                except (TypeError, ValueError):
+                    continue
+                base_label = ID2CANONICAL.get(label_idx)
+                if base_label is None:
+                    continue
+                agg[base_label] = agg.get(base_label, 0.0) + float(value)
+            sorted_items = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
+            top_items = sorted_items[:5]
+            remaining = sum(prob for _, prob in sorted_items[5:])
+            payload = {label: prob for label, prob in top_items}
+            if remaining > 1e-6:
+                payload["others"] = remaining
+            probs_attr = esc(json.dumps(payload))
+            display_label = esc(ID2NAME.get(lbl, str(lbl)))
+            chars_html.append(
+                f'<span class="char" data-probs="{probs_attr}" data-label="{display_label}">{esc(ch)}</span>'
+            )
         out_html.append(
             f'<span class="seg {cls}" '
             f'data-label="{esc(ID2NAME.get(lbl, str(lbl)))}" '
