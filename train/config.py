@@ -7,26 +7,24 @@ LANG2ID = {
     # Real languages (must stay in sync with downloader outputs – see downloader/0_main.py)
     "php": 0,
     "csharp": 1,
-    "typescript": 2,
+    "javascript_typescript": 2,
     "go": 3,
     "sql": 4,
     "rust": 5,
     "yaml": 6,
     "ruby": 7,
     "python": 8,
-    "javascript": 9,
-    "java": 10,
-    "c_family": 11,
-    "json": 12,
-    "css": 13,
-    "html": 14,
-    "text": 15,
-    "csv": 16,
-    "shell": 17,
-    "powershell": 18,
-    "batchfile": 19,
-    "visual_basic": 20,
-    "dockerfile": 21,
+    "java": 9,
+    "c_family": 10,
+    "json": 11,
+    "css": 12,
+    "html": 13,
+    "text": 14,
+    "csv": 15,
+    "shell": 16,
+    "powershell": 17,
+    "visual_basic": 18,
+    "dockerfile": 19,
     # Derived encodings
     "encoding_hex": 100,
     "encoding_base64": 101,
@@ -70,10 +68,13 @@ class DataConfig:
     window_max_bytes: int = 1536
     bucket_step: int = 128
     batch_size: int = 16
-    mix_prob: float = 0.2
     min_seg_len: int = 64
     pure_prob: float = 0.4
-    line_inject_prob: float = 0.4
+    mix_prob: float = 0.25
+    line_inject_prob: float = 0.25
+    markdown_prob: float = 0.1
+    max_mixed_languages: int = 3
+    markdown_inline_code_prob: float = 0.25
     # remaining probability mass is used for mixed windows
 
     # Prefetching
@@ -85,8 +86,8 @@ class DataConfig:
     line_inject_max_injections: int = 4
     line_inject_exp_rate: float = 1  # λ for exponential line count
     line_inject_max_lines: int = 100
-    line_inject_min_single_len: int = 4
-    line_inject_min_letters: int = 4
+    line_inject_min_single_len: int = 6
+    line_inject_min_letters: int = 6
     line_inject_strip_prob: float = 0.5
     allow_same_lang_injection: bool = True
     reindent_prob: float = 0.5
@@ -97,6 +98,7 @@ class DataConfig:
     host_skip_top_max: int = 20
     donor_skip_top_min: int = 5
     donor_skip_top_max: int = 20
+    both_prob: float = 0 # probability to overlay/inject substrings after the window ways built
 
     def buckets(self) -> List[int]:
         """Generate window size buckets from min to max."""
@@ -111,6 +113,7 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup: int = 100
+    accum_steps: int = 1
     dtype: jnp.dtype = jnp.bfloat16
     model_dim: int = 128
     channels: Tuple[int, ...] = (128, 256, 384, 512)

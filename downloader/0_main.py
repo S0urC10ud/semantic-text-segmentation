@@ -13,6 +13,7 @@ What this does (single pass per label, no temp raw files):
   • Windows content to fixed-size byte chunks (default: 1536 bytes).
   • Magika pre-filtering in batches (in-process; no multiprocessing issues).
   • PHP: strips all non-PHP blocks via regex.
+  • HTML: strips <script>/<style> blocks and risky event handlers before windowing.
   • Writes **only** final Arrow datasets to disk (train/val/test per label).
   • Default cap: **1,000,000 kept windows per label** (post-filter). `--demo` → 100 per label (total).
   • Robust streaming controls: shard/offset/skip to jump ahead in huge sorted datasets.
@@ -36,7 +37,7 @@ Also supported (derived transforms):
 Example:
   python build_stack_windows_arrow_splits.py \
       --out-root arrow_out \
-      --langs html,css,javascript,typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85 \
+      --langs html,css,javascript_typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,shell,powershell,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85 \
       --max-windows-per-label 200000 \
       --window-bytes 1536 --magika-batch 1024 --threshold 0.82 \
       --shard-count 64 --shard-index 17 \
@@ -60,6 +61,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Set
 from bisect import bisect_left
 import html
+from html.parser import HTMLParser
 
 # Keep native threadpools from over-subscribing
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -98,6 +100,10 @@ def canonical_label(name: str) -> str:
         return "c_family"
     if s in {"c#", "c-sharp", "csharp", "cs"}:
         return "csharp"
+    if s in {"javascript_typescript", "javascript-typescript", "js_ts", "js-ts"}:
+        return "javascript_typescript"
+    if s in {"shell_batchfile", "shell-batchfile", "shell_batch"}:
+        return "shell"
     if s in {"js", "javascript"}:
         return "javascript"
     if s in {"ts", "typescript"}:
@@ -121,8 +127,7 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "c_family": {"c", "cpp", "c++", "c_family"},
     "csv": {"csv"},
     "csharp": {"c#", "csharp", "c-sharp", "cs"},
-    "javascript": {"javascript", "js"},
-    "typescript": {"typescript", "ts"},
+    "javascript_typescript": {"javascript", "typescript", "js", "ts"},
     "yaml": {"yaml", "yml"},
     "php": {"php"},
     "go": {"go"},
@@ -134,9 +139,8 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "json": {"json"},
     "css": {"css"},
     "html": {"html", "xhtml"},
-    "shell": {"shell", "bash", "sh", "zsh"},
+    "shell": {"shell", "bash", "sh", "zsh", "fish", "batchfile", "bat", "cmd", "shell_batchfile"},
     "powershell": {"powershell", "ps1"},
-    "batchfile": {"batchfile", "bat", "cmd"},
     "visual_basic": {"visual_basic", "visual-basic", "vb", "vba", "vb.net", "visualbasic"},
     "dockerfile": {"dockerfile", "docker"},
     # derived labels are handled separately (no Magika check)
@@ -156,6 +160,46 @@ MADLAD_MIN_CHARS = 50
 _MADLAD_TAG_RE = re.compile(r"<[^>]+>")
 _MADLAD_WS_RE = re.compile(r"\s+")
 _MADLAD_LANG_CACHE: Optional[List[str]] = None
+
+W3TECHS_PRIOR = {
+    "en": 0.493,
+    "es": 0.060,
+    "de": 0.059,
+    "ja": 0.051,
+    "fr": 0.045,
+    "pt": 0.040,
+    "ru": 0.037,
+    "it": 0.028,
+    "nl": 0.022,
+    "pl": 0.018,
+    "tr": 0.016,
+    "fa": 0.011,
+    "zh": 0.011,
+    "vi": 0.010,
+    "cs": 0.010,
+    "id": 0.009,
+    "ko": 0.008,
+    "uk": 0.007,
+    "hu": 0.006,
+    "sv": 0.005,
+    "ar": 0.005,
+    "ro": 0.005,
+    "el": 0.005,
+    "da": 0.004,
+    "fi": 0.004,
+    "he": 0.004,
+    "sk": 0.004,
+    "th": 0.003,
+    "bg": 0.003,
+    "hr": 0.002,
+    "no": 0.002,
+    "lt": 0.002,
+    "sr": 0.002,
+    "sl": 0.001,
+    "ca": 0.001,
+    "et": 0.001,
+    "lv": 0.001,
+}
 def resolve_hf_token_pair(use_auth_token: bool) -> Tuple[Optional[str], Optional[Any]]:
     token_str: Optional[str] = None
     token_arg: Optional[Any] = None
@@ -315,7 +359,41 @@ def gen_text_windows_from_madlad(
         pbar.close()
         raise
     rng = random.Random(base_seed)
-    rng.shuffle(langs)
+
+    available_langs = set(langs)
+    prioritized = [(lang, W3TECHS_PRIOR[lang]) for lang in W3TECHS_PRIOR if lang in available_langs]
+    lang_targets: Dict[str, int] = {}
+    if total_budget > 0 and prioritized:
+        total_weight = sum(weight for _, weight in prioritized)
+        if total_weight > 0:
+            assigned = 0
+            fractions: Dict[str, Tuple[float, int]] = {}
+            for idx, (lang, weight) in enumerate(prioritized):
+                share = (weight / total_weight) * total_budget
+                base = int(math.floor(share))
+                lang_targets[lang] = base
+                fractions[lang] = (share - base, idx)
+                assigned += base
+            remainder = total_budget - assigned
+            if remainder > 0:
+                order = sorted(
+                    ((lang, frac[0], frac[1]) for lang, frac in fractions.items()),
+                    key=lambda item: (-item[1], item[2]),
+                )
+                if order:
+                    pos = 0
+                    while remainder > 0:
+                        lang = order[pos % len(order)][0]
+                        lang_targets[lang] += 1
+                        remainder -= 1
+                        pos += 1
+            lang_targets = {lang: count for lang, count in lang_targets.items() if count > 0}
+
+    plan_items = list(lang_targets.items())
+    rng.shuffle(plan_items)
+    prioritized_set = set(lang_targets.keys())
+    fallback_langs = [lang for lang in langs if lang not in prioritized_set]
+    rng.shuffle(fallback_langs)
 
     kept_total = 0
     kept_per_split = {"train": 0, "val": 0, "test": 0}
@@ -323,14 +401,10 @@ def gen_text_windows_from_madlad(
     lang_id = np.int16(LANG2ID.get("text", -1)).item()
     last_postfix = time.time()
 
-    remaining_total = sum(budget_per_split.values())
-    remaining_langs = len(langs)
-
-    for lang in langs:
-        if (total_budget > 0 and kept_total >= total_budget) or remaining_total <= 0 or remaining_langs <= 0:
-            break
-        target_for_lang = (remaining_total + remaining_langs - 1) // remaining_langs
-        got_for_lang = 0
+    def iter_language(lang: str, quota: Optional[int]) -> Iterator[dict]:
+        nonlocal kept_total, rejected, last_postfix
+        if quota is not None and quota <= 0:
+            return
         try:
             iterator = madlad_lang_window_iter(
                 lang,
@@ -339,72 +413,103 @@ def gen_text_windows_from_madlad(
                 min_chars=min_chars,
                 token=token_arg,
             )
-            for win_idx, chunk in iterator:
-                if total_budget > 0 and kept_total >= total_budget:
-                    break
-                if got_for_lang >= target_for_lang:
-                    break
-
-                ascii_text = map_text_to_ascii(chunk)
-                if not ascii_text:
-                    rejected += 1
-                    continue
-                ascii_bytes = ascii_text.encode("utf-8", errors="ignore")
-                if not ascii_bytes:
-                    rejected += 1
-                    continue
-
-                uid = stable_uid_for_window(ascii_bytes)
-                if seen_uids is not None and uid in seen_uids:
-                    rejected += 1
-                    continue
-
-                split = split_for_uid(uid)
-                if budget_per_split.get(split, 0) <= 0:
-                    rejected += 1
-                    continue
-
-                payload = {
-                    "content": ascii_text,
-                    "lang_id": lang_id,
-                    "uid": uid,
-                    "split": split,
-                }
-                if add_meta:
-                    payload.update({
-                        "win_idx": np.int64(win_idx).item(),
-                        "source_ext": "",
-                        "source_hexsha": "",
-                        "source_repo": MADLAD_REPO_ID,
-                        "source_repo_path": lang,
-                        "license": "unknown",
-                    })
-
-                budget_per_split[split] = max(0, budget_per_split[split] - 1)
-                kept_per_split[split] += 1
-                kept_total += 1
-                got_for_lang += 1
-                if seen_uids is not None:
-                    seen_uids.add(uid)
-
-                yield payload
-                pbar.update(1)
-
-                now = time.time()
-                if (now - last_postfix) >= 0.3:
-                    pbar.set_postfix(
-                        kept_total=kept_total,
-                        rej=rejected,
-                        k_train=kept_per_split["train"],
-                        k_val=kept_per_split["val"],
-                        k_test=kept_per_split["test"],
-                    )
-                    last_postfix = now
         except Exception as e:
             sys.stderr.write(f"[warn] MADLAD '{lang}' iteration failed: {e}\n")
+            return
 
-        remaining_langs -= 1
-        remaining_total = sum(budget_per_split.values())
+        got_for_lang = 0
+        for win_idx, chunk in iterator:
+            if total_budget > 0 and kept_total >= total_budget:
+                break
+            if quota is not None and got_for_lang >= quota:
+                break
+
+            ascii_text = map_text_to_ascii(chunk)
+            if not ascii_text:
+                rejected += 1
+                continue
+            ascii_text, ascii_bytes = clamp_utf8_bytes(ascii_text, window_bytes)
+            if not ascii_text or not ascii_bytes:
+                rejected += 1
+                continue
+
+            uid = stable_uid_for_window(ascii_bytes)
+            if seen_uids is not None and uid in seen_uids:
+                rejected += 1
+                continue
+
+            split = split_for_uid(uid)
+            if budget_per_split.get(split, 0) <= 0:
+                rejected += 1
+                continue
+
+            payload = {
+                "content": ascii_text,
+                "lang_id": lang_id,
+                "uid": uid,
+                "split": split,
+            }
+            if add_meta:
+                payload.update({
+                    "win_idx": np.int64(win_idx).item(),
+                    "source_ext": "",
+                    "source_hexsha": "",
+                    "source_repo": MADLAD_REPO_ID,
+                    "source_repo_path": lang,
+                    "license": "unknown",
+                })
+
+            budget_per_split[split] = max(0, budget_per_split[split] - 1)
+            kept_per_split[split] += 1
+            kept_total += 1
+            got_for_lang += 1
+            if seen_uids is not None:
+                seen_uids.add(uid)
+
+            yield payload
+            pbar.update(1)
+
+            now = time.time()
+            if (now - last_postfix) >= 0.3:
+                pbar.set_postfix(
+                    kept_total=kept_total,
+                    rej=rejected,
+                    k_train=kept_per_split["train"],
+                    k_val=kept_per_split["val"],
+                    k_test=kept_per_split["test"],
+                )
+                last_postfix = now
+
+    def process_languages(sequence: Sequence[Tuple[str, Optional[int]]]) -> Iterator[dict]:
+        nonlocal kept_total
+        for lang, quota in sequence:
+            if total_budget > 0 and kept_total >= total_budget:
+                break
+            remaining = sum(budget_per_split.values())
+            if remaining <= 0:
+                break
+            for payload in iter_language(lang, quota):
+                yield payload
+
+    # First pass: enforce W3Techs quotas for prioritized languages.
+    for item in process_languages(plan_items):
+        yield item
+
+    # Second pass: fill any remaining budget with fallback languages (or retry prioritized ones).
+    pending = sum(budget_per_split.values())
+    if pending > 0:
+        if not fallback_langs:
+            fallback_langs = [lang for lang, _ in plan_items]
+            rng.shuffle(fallback_langs)
+        remaining_langs = len(fallback_langs)
+        for lang in fallback_langs:
+            if pending <= 0 or (total_budget > 0 and kept_total >= total_budget):
+                break
+            quota = (pending + remaining_langs - 1) // remaining_langs if remaining_langs > 0 else None
+            for payload in iter_language(lang, quota):
+                yield payload
+            remaining_langs -= 1
+            pending = sum(budget_per_split.values())
 
     pbar.set_postfix(
         kept_total=kept_total,
@@ -415,17 +520,219 @@ def gen_text_windows_from_madlad(
     )
     pbar.close()
 
-# Placeholder for any character outside ASCII range (0–127).
-NON_ASCII_PLACEHOLDER = "\u00A4"  # generic currency sign as replacement sentinel
+_SCRIPT_STYLE_TAGS = {"script", "style"}
+_SCRIPT_STYLE_BLOCK_RE = re.compile(r"(?is)<\s*(script|style)\b[^>]*>.*?</\s*\1\s*>")
+_SCRIPT_STYLE_SELF_CLOSE_RE = re.compile(r"(?is)<\s*(script|style)\b[^>]*/>")
+_SCRIPT_STYLE_OPEN_RE = re.compile(r"(?is)<\s*(script|style)\b[^>]*>")
+_SCRIPT_STYLE_CLOSE_RE = re.compile(r"(?is)</\s*(script|style)\s*>")
+_FRAMEWORK_KEYWORDS_RE = re.compile(r"(?i)\b(angular|react|svelte|vue)\b")
 
-def map_text_to_ascii(text: str, placeholder: str = NON_ASCII_PLACEHOLDER) -> str:
+_DANGEROUS_URI_ATTRS = {"href", "src", "xlink:href", "formaction", "action", "data", "poster"}
+
+
+def _is_event_attribute(name: str) -> bool:
+    if not name:
+        return False
+    lower = name.lower()
+    if lower.startswith("on"):
+        return True
+    if ":on" in lower:
+        return True
+    if lower.startswith("@"):
+        return True
+    if lower.startswith("x-on") or lower.startswith("hx-on"):
+        return True
+    return False
+
+
+def _has_javascript_scheme(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    val = html.unescape(value).strip().lower()
+    return val.startswith("javascript:")
+
+
+def _sanitize_attrs(attrs: List[Tuple[str, Optional[str]]]) -> List[Tuple[str, Optional[str]]]:
+    sanitized: List[Tuple[str, Optional[str]]] = []
+    for name, val in attrs:
+        if not name:
+            continue
+        if _is_event_attribute(name):
+            continue
+        if name.lower() in _DANGEROUS_URI_ATTRS and _has_javascript_scheme(val):
+            continue
+        sanitized.append((name, val))
+    return sanitized
+
+
+def _serialize_attrs(attrs: List[Tuple[str, Optional[str]]]) -> str:
+    if not attrs:
+        return ""
+    parts: List[str] = []
+    for name, val in attrs:
+        if val is None:
+            parts.append(name)
+        else:
+            escaped = html.escape(val, quote=True)
+            parts.append(f'{name}="{escaped}"')
+    return " " + " ".join(parts)
+
+
+class _ScriptStyleStripper(HTMLParser):
+    __slots__ = ("_parts", "_skip_depth")
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self._parts: List[str] = []
+        self._skip_depth = 0
+
+    def _handle_start_like(self, tag: str) -> bool:
+        lower = tag.lower()
+        if lower in _SCRIPT_STYLE_TAGS:
+            self._skip_depth += 1
+            return True
+        return False
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if self._handle_start_like(tag):
+            return
+        if self._skip_depth:
+            return
+        cleaned_attrs = _sanitize_attrs(attrs)
+        self._parts.append(f"<{tag}{_serialize_attrs(cleaned_attrs)}>")
+
+    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag.lower() in _SCRIPT_STYLE_TAGS:
+            return
+        if self._skip_depth:
+            return
+        cleaned_attrs = _sanitize_attrs(attrs)
+        self._parts.append(f"<{tag}{_serialize_attrs(cleaned_attrs)}/>")
+
+    def handle_endtag(self, tag: str) -> None:
+        lower = tag.lower()
+        if lower in _SCRIPT_STYLE_TAGS:
+            if self._skip_depth:
+                self._skip_depth -= 1
+            return
+        if self._skip_depth:
+            return
+        self._parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(data)
+
+    def handle_comment(self, data: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"<!--{data}-->")
+
+    def handle_entityref(self, name: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"&#{name};")
+
+    def handle_decl(self, decl: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"<?{data}>")
+
+    def unknown_decl(self, data: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(f"<![{data}]>")
+
+    def get_output(self) -> str:
+        return "".join(self._parts)
+
+
+def strip_html_script_and_style(text: str) -> str:
     """
-    Ensure the returned string only contains ASCII codepoints, except for the
-    dedicated placeholder used wherever a character falls outside ASCII.
+    Remove script/style blocks from HTML content while preserving other markup.
     """
     if not text:
         return ""
-    return "".join(ch if ord(ch) < 128 else placeholder for ch in text)
+
+    current = text
+    prev = None
+    while prev != current:
+        prev = current
+        current = _SCRIPT_STYLE_BLOCK_RE.sub("", current)
+    current = _SCRIPT_STYLE_SELF_CLOSE_RE.sub("", current)
+
+    parser = _ScriptStyleStripper()
+    try:
+        parser.feed(current)
+        parser.close()
+        cleaned = parser.get_output()
+    except Exception:
+        cleaned = current
+
+    cleaned = _SCRIPT_STYLE_OPEN_RE.sub("", cleaned)
+    cleaned = _SCRIPT_STYLE_CLOSE_RE.sub("", cleaned)
+    return cleaned
+
+# Placeholder for any character outside ASCII range (0–127).
+NON_ASCII_PLACEHOLDER = "\u00A4"  # displayed sentinel (¤) for non-ASCII content
+_VISIBLE_ASCII_MIN = 0x20
+_VISIBLE_ASCII_MAX = 0x7E
+_ALLOWED_CTRL = {"\n", "\t"}
+
+def map_text_to_ascii(text: str, placeholder: str = NON_ASCII_PLACEHOLDER) -> str:
+    """
+    Sanitize ``text`` so that it contains only visible ASCII characters plus
+    newline/tab/space. All other bytes collapse to the placeholder (¤), matching
+    the historical behaviour across language pipelines.
+    """
+    if not text:
+        return ""
+    out_chars: List[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch == "\r":
+            ch = "\n"
+            code = 0x0A
+        if ch in _ALLOWED_CTRL:
+            out_chars.append(ch)
+            continue
+        if _VISIBLE_ASCII_MIN <= code <= _VISIBLE_ASCII_MAX:
+            out_chars.append(ch)
+            continue
+        if ch == " ":
+            out_chars.append(ch)
+            continue
+        out_chars.append(placeholder)
+    return "".join(out_chars)
+
+def clamp_utf8_bytes(text: str, max_bytes: int) -> Tuple[str, bytes]:
+    """
+    Clamp ``text`` to at most ``max_bytes`` when encoded as UTF-8. Returns the
+    possibly shortened text along with the corresponding UTF-8 bytes.
+    """
+    if not text or max_bytes <= 0:
+        return "", b""
+
+    encoded = text.encode("utf-8", errors="ignore")
+    if len(encoded) <= max_bytes:
+        return text, encoded
+
+    # Trim to the max byte budget and drop any trailing partial code point.
+    encoded = encoded[:max_bytes]
+    trimmed = encoded.decode("utf-8", errors="ignore")
+    if not trimmed:
+        return "", b""
+
+    trimmed_bytes = trimmed.encode("utf-8", errors="ignore")
+    # Extremely defensive: if re-encoding still exceeds the budget, shave chars.
+    while trimmed and len(trimmed_bytes) > max_bytes:
+        trimmed = trimmed[:-1]
+        trimmed_bytes = trimmed.encode("utf-8", errors="ignore")
+    return trimmed, trimmed_bytes
 
 def extract_primary_text(ex: Dict[str, Any]) -> Optional[str]:
     """
@@ -677,7 +984,12 @@ def try_load_streaming_dir(lang_dir: str, *, shuffle_buffer: int, token: Optiona
         ds = ds.shuffle(seed=42, buffer_size=shuffle_buffer)
     return ds
 
-def stream_language_iterable(
+COMBINED_LABEL_SOURCES: Dict[str, List[str]] = {
+    "javascript_typescript": ["javascript", "typescript"],
+    "shell": ["shell", "batchfile"],
+}
+
+def _stream_single_language_iterable(
     logical_label: str,
     *,
     shuffle_buffer: int,
@@ -686,11 +998,11 @@ def stream_language_iterable(
     shard_index: int,
     skip_first_n: int,
 ) -> Optional[Any]:
-    logical_label = canonical_label(logical_label)
-    if logical_label == "text":
+    label = canonical_label(logical_label)
+    if label == "text":
         ds = stream_madlad_iterable(shuffle_buffer=shuffle_buffer)
     else:
-        cands = LANG_CANDIDATE_DIRS.get(logical_label, [logical_label])
+        cands = LANG_CANDIDATE_DIRS.get(label, [label])
         token_val: Optional[bool] = None
         if use_auth_token:
             try:
@@ -711,7 +1023,7 @@ def stream_language_iterable(
         try:
             ds = ds.shard(num_shards=shard_count, index=shard_index)
         except Exception as e:
-            sys.stderr.write(f"[warn] shard() failed for {logical_label}: {e}\n")
+            sys.stderr.write(f"[warn] shard() failed for {label}: {e}\n")
 
     if skip_first_n > 0:
         try:
@@ -727,6 +1039,79 @@ def stream_language_iterable(
             ds = _drop(ds)
 
     return ds
+
+def stream_language_iterable(
+    logical_label: str,
+    *,
+    shuffle_buffer: int,
+    use_auth_token: bool,
+    shard_count: int,
+    shard_index: int,
+    skip_first_n: int,
+) -> Optional[Any]:
+    label = canonical_label(logical_label)
+
+    if label in COMBINED_LABEL_SOURCES:
+        sources = COMBINED_LABEL_SOURCES[label]
+        count = len(sources)
+        if count == 0:
+            return None
+
+        def _distribute_skip(total: int, parts: int) -> List[int]:
+            if parts <= 0:
+                return []
+            base = total // parts
+            remainder = total % parts
+            return [base + (1 if i < remainder else 0) for i in range(parts)]
+
+        skip_alloc = _distribute_skip(max(0, skip_first_n), count)
+
+        datasets: List[Iterator[Any]] = []
+        missing: List[str] = []
+        for idx, src in enumerate(sources):
+            ds = _stream_single_language_iterable(
+                src,
+                shuffle_buffer=shuffle_buffer,
+                use_auth_token=use_auth_token,
+                shard_count=shard_count,
+                shard_index=shard_index,
+                skip_first_n=skip_alloc[idx] if idx < len(skip_alloc) else 0,
+            )
+            if ds is None:
+                missing.append(src)
+            else:
+                datasets.append(iter(ds))
+
+        if missing:
+            raise RuntimeError(
+                f"Combined label '{label}' is missing source datasets: {', '.join(missing)}"
+            )
+        if not datasets:
+            return None
+
+        def _round_robin():
+            active = list(datasets)
+            idx = 0
+            while active:
+                pos = idx % len(active)
+                it = active[pos]
+                try:
+                    yield next(it)
+                    idx += 1
+                except StopIteration:
+                    active.pop(pos)
+            return
+
+        return _round_robin()
+
+    return _stream_single_language_iterable(
+        label,
+        shuffle_buffer=shuffle_buffer,
+        use_auth_token=use_auth_token,
+        shard_count=shard_count,
+        shard_index=shard_index,
+        skip_first_n=skip_first_n,
+    )
 
 
 # ============================================================
@@ -907,6 +1292,8 @@ class PlaintextSampler:
 
 # Base58 (Bitcoin alphabet) encoder (no checksum)
 _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+# Cache for maximum raw byte calculations per window size
+_BASE58_RAW_LIMIT_CACHE: Dict[int, int] = {}
 def b58encode(b: bytes) -> str:
     # Convert big-endian bytes to integer
     n = int.from_bytes(b, "big")
@@ -928,6 +1315,23 @@ def b58encode(b: bytes) -> str:
             break
     return ("1" * pad) + "".join(chars)
 
+
+def _max_base58_raw_bytes(window_bytes: int) -> int:
+    if window_bytes <= 0:
+        return 0
+    cached = _BASE58_RAW_LIMIT_CACHE.get(window_bytes)
+    if cached is not None:
+        return cached
+    factor = math.log(256, 58)
+    estimate = max(0, int(window_bytes / factor))
+    test_len = estimate or 1
+    while len(b58encode(b"\xff" * test_len)) > window_bytes and test_len > 0:
+        test_len -= 1
+    while len(b58encode(b"\xff" * (test_len + 1))) <= window_bytes:
+        test_len += 1
+    _BASE58_RAW_LIMIT_CACHE[window_bytes] = test_len
+    return test_len
+
 def encode_bytes(method: str, raw: bytes) -> str:
     m = method.lower()
     if m == "hex":
@@ -941,6 +1345,23 @@ def encode_bytes(method: str, raw: bytes) -> str:
         return base64.a85encode(raw).decode("ascii")
     if m == "base58":
         return b58encode(raw)
+    raise ValueError(f"Unknown encoding method: {method}")
+
+
+def max_input_bytes_for_encoding(method: str, window_bytes: int) -> int:
+    if window_bytes <= 0:
+        return 0
+    m = method.lower()
+    if m == "hex":
+        return max(0, window_bytes // 2)
+    if m == "base64":
+        return max(0, (window_bytes // 4) * 3)
+    if m == "base32":
+        return max(0, (window_bytes // 8) * 5)
+    if m == "base85":
+        return max(0, (window_bytes // 5) * 4)
+    if m == "base58":
+        return _max_base58_raw_bytes(window_bytes)
     raise ValueError(f"Unknown encoding method: {method}")
 
 def encrypt_bytes(method: str, base_seed: int, split: str, idx: int, raw: bytes) -> bytes:
@@ -1016,9 +1437,11 @@ def gen_transformed_for_label(
                 desc=progress_desc,
                 disable=not show_progress)
 
+    encoding_input_limit: Optional[int] = None
     if label_c.startswith("encoding_"):
         family = "encoding"
         method = label_c.split("encoding_", 1)[1]
+        encoding_input_limit = max_input_bytes_for_encoding(method, window_bytes)
     else:
         family = "encryption"
         method = label_c.split("encryption_", 1)[1]
@@ -1086,10 +1509,19 @@ def gen_transformed_for_label(
             for pos in positions:
                 raw_plain, base_label = plaintext_by_position.get(pos, (b"", ""))
                 if family == "encoding":
+                    raw_for_encoding = raw_plain
+                    if encoding_input_limit is not None and len(raw_for_encoding) > encoding_input_limit:
+                        raw_for_encoding = raw_for_encoding[:encoding_input_limit]
                     try:
-                        content_str = encode_bytes(method, raw_plain)
+                        content_str = encode_bytes(method, raw_for_encoding)
                     except Exception as e:
                         raise RuntimeError(f"Encoding failed for method '{method}'") from e
+                    if len(content_str) > window_bytes:
+                        trim_len = len(raw_for_encoding)
+                        while trim_len > 0 and len(content_str) > window_bytes:
+                            trim_len -= 1
+                            raw_for_encoding = raw_for_encoding[:trim_len]
+                            content_str = encode_bytes(method, raw_for_encoding)
                 else:
                     try:
                         ct = encrypt_bytes(method, base_seed, split, pos, raw_plain)
@@ -1285,6 +1717,14 @@ def gen_windows_for_label(
             content_filtered = extract_php_code_only(raw_text, path=repo_path)
             if not content_filtered:
                 continue
+        elif lbl_canon == "html":
+            if _FRAMEWORK_KEYWORDS_RE.search(raw_text):
+                continue
+            content_filtered = strip_html_script_and_style(raw_text)
+            if _FRAMEWORK_KEYWORDS_RE.search(content_filtered):
+                continue
+            if not content_filtered.strip():
+                continue
         else:
             content_filtered = raw_text
 
@@ -1315,8 +1755,8 @@ def gen_windows_for_label(
                 rejected += 1
                 continue
 
-            ascii_bytes = ascii_text.encode("utf-8", errors="ignore")
-            if not ascii_bytes:
+            ascii_text, ascii_bytes = clamp_utf8_bytes(ascii_text, window_bytes)
+            if not ascii_text or not ascii_bytes:
                 rejected += 1
                 continue
 
@@ -1371,26 +1811,24 @@ LANG2ID: Dict[str, int] = {
     # real languages
     "php": 0,
     "csharp": 1,
-    "typescript": 2,
+    "javascript_typescript": 2,
     "go": 3,
     "sql": 4,
     "rust": 5,
     "yaml": 6,
     "ruby": 7,
     "python": 8,
-    "javascript": 9,
-    "java": 10,
-    "c_family": 11,
-    "json": 12,
-    "css": 13,
-    "html": 14,
-    "text": 15,
-    "csv": 16,
-    "shell": 17,
-    "powershell": 18,
-    "batchfile": 19,
-    "visual_basic": 20,
-    "dockerfile": 21,
+    "java": 9,
+    "c_family": 10,
+    "json": 11,
+    "css": 12,
+    "html": 13,
+    "text": 14,
+    "csv": 15,
+    "shell": 16,
+    "powershell": 17,
+    "visual_basic": 18,
+    "dockerfile": 19,
     # derived encodings
     "encoding_hex": 100,
     "encoding_base64": 101,
@@ -1683,6 +2121,7 @@ def parse_args() -> argparse.Namespace:
             "• Writes to <out-root>/<split>/<label>/dataset\n"
             "• Filters licenses (permissive only)\n"
             "• PHP: strips foreign (HTML/etc.) content via regex\n"
+            "• HTML: strips <script>/<style> blocks, event handlers, and drops framework-heavy samples\n"
             "• In-process Magika prefilter (no temp files)\n"
             "• Resume-safe, duplicate-proof with per-window uid and deterministic splits (70/20/10)\n"
             "• Derived families: encoding_*/encryption_* reuse existing splits and apply deterministic transforms"
@@ -1694,8 +2133,8 @@ def parse_args() -> argparse.Namespace:
     # NEW default labels per request
     ap.add_argument("--langs", type=str,
                     default=(
-                        "html,css,javascript,typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,"
-                        "shell,powershell,batchfile,visual_basic,php,sql,yaml,dockerfile,"
+                        "html,css,javascript_typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,"
+                        "shell,powershell,visual_basic,php,sql,yaml,dockerfile,"
                         "encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85"
                     ),
                     help="Comma-separated labels to process (logical names).")

@@ -60,14 +60,13 @@ from train.model import UNet1D  # noqa: E402
 DEFAULT_COLOR_BY_LABEL: Dict[str, str] = {
     "html": "#f2994a",
     "css": "#3498db",
-    "javascript": "#f1c40f",
+    "javascript_typescript": "#f1c40f",
     "php": "#9b59b6",
     "python": "#2ecc71",
     "json": "#1abc9c",
     "sql": "#e74c3c",
     "java": "#8e44ad",
     "go": "#16a085",
-    "typescript": "#95a5a6",
     "c_family": "#2ecc71",
     "csharp": "#1abc9c",
     "csv": "#e74c3c",
@@ -76,7 +75,7 @@ DEFAULT_COLOR_BY_LABEL: Dict[str, str] = {
     "text": "#95a5a6",
     "yaml": "#d35400",
     "powershell": "#8e44ad",
-    "batchfile": "#636e72",
+    "shell": "#636e72",
     "markdown": "#00cec9",
     "encoding_base64": "#fdcb6e",
     "encoding_hex": "#6c5ce7",
@@ -86,6 +85,10 @@ DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
 PREDICTION_LABEL_ALIASES: Dict[str, str] = {
     "c": "c_family",
     "cpp": "c_family",
+    "javascript": "javascript_typescript",
+    "typescript": "javascript_typescript",
+    "shell_batchfile": "shell",
+    "batchfile": "shell",
 }
 
 

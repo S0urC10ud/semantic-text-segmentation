@@ -21,7 +21,7 @@
   /* Named label colors (default classes) */
   --color-html: #f2994a;       /* orange */
   --color-css: #3498db;        /* blue */
-  --color-javascript: #f1c40f; /* yellow */
+  --color-javascript_typescript: #f1c40f; /* yellow */
 
   /* Tint strengths for segment backgrounds */
   --seg-alpha: 0.22;       /* resting background opacity */
@@ -281,14 +281,14 @@ textarea.code{
   outline-offset: 1px;
 }
 
-/* JavaScript (yellow) */
-.seg.javascript{
-  background-color: color-mix(in srgb, var(--color-javascript) calc(var(--seg-alpha)*100%), #ffffff) !important;
-  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--color-javascript) calc(var(--seg-border-alpha)*100%), transparent);
+/* JavaScript+TypeScript (yellow) */
+.seg.javascript_typescript{
+  background-color: color-mix(in srgb, var(--color-javascript_typescript) calc(var(--seg-alpha)*100%), #ffffff) !important;
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--color-javascript_typescript) calc(var(--seg-border-alpha)*100%), transparent);
 }
-.seg.javascript:hover, .seg.javascript:focus{
-  background-color: color-mix(in srgb, var(--color-javascript) calc(var(--seg-alpha-hover)*100%), #ffffff) !important;
-  outline: 2px solid color-mix(in srgb, var(--color-javascript) 38%, transparent);
+.seg.javascript_typescript:hover, .seg.javascript_typescript:focus{
+  background-color: color-mix(in srgb, var(--color-javascript_typescript) calc(var(--seg-alpha-hover)*100%), #ffffff) !important;
+  outline: 2px solid color-mix(in srgb, var(--color-javascript_typescript) 38%, transparent);
   outline-offset: 1px;
 }
 
@@ -390,11 +390,11 @@ body.focus-mode .panel.example.primary-example .stat{
     background-color: rgba(52, 152, 219, var(--seg-alpha-hover)) !important;
   }
 
-  .seg.javascript{
+  .seg.javascript_typescript{
     background-color: rgba(241, 196, 15, var(--seg-alpha)) !important; /* #f1c40f */
     box-shadow: inset 0 -1px 0 rgba(241, 196, 15, var(--seg-border-alpha));
   }
-  .seg.javascript:hover, .seg.javascript:focus{
+  .seg.javascript_typescript:hover, .seg.javascript_typescript:focus{
     background-color: rgba(241, 196, 15, var(--seg-alpha-hover)) !important;
   }
 }

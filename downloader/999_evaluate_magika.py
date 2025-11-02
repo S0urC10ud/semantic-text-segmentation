@@ -1,21 +1,4 @@
-#!/usr/bin/env python3
-"""
-magika_eval_windows.py
 
-Evaluate Magika on random 1536-byte windows from files in language-named folders.
-
-Constraints (matches your usage style):
-- Create ONE Magika() instance and run entirely in the main thread.
-- "Batching" is done at the application level (we collect windows into chunks,
-  then iterate and call identify_bytes() on each entry in that chunk).
-  This is compatible with Magika versions that only expose identify_bytes.
-- Reports per-label accuracy + an ASCII bar chart and overall accuracy.
-- For each class, also lists the top-K misclassification classes with percentages
-       (relative to total windows for that class).
-
-Example:
-    python magika_eval_windows.py --root /path/to/root
-"""
 
 from __future__ import annotations
 
@@ -32,14 +15,14 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-from magika import Magika                 # e.g., magika==0.6.2
+from magika import Magika
 from tqdm import tqdm
 
 # -------------------- Defaults --------------------
 
 DEFAULT_DIRS = [
-    "c", "cpp", "csharp", "css", "csv", "go", "html", "java", "javascript",
-    "json", "php", "python", "ruby", "rust", "sql", "text", "typescript", "yaml"
+    "c", "cpp", "csharp", "css", "csv", "go", "html", "java", "javascript", "typescript",
+    "json", "php", "python", "ruby", "rust", "sql", "text", "shell", "yaml"
 ]
 WINDOW_SIZE = 1536
 SAMPLES_PER_DIR = 1000
@@ -56,7 +39,8 @@ SYNONYMS: Dict[str, Sequence[str]] = {
     "go":           ("go", "golang", "text/x-go"),
     "html":         ("html", "text/html"),
     "java":         ("java", "text/x-java"),
-    "javascript":   ("javascript", "js", "application/javascript", "text/javascript"),
+    "javascript": ("javascript", "js", "application/javascript", "text/javascript"),
+    "typescript":   ("typescript", "ts", "text/typescript"),
     "json":         ("json", "application/json"),
     "php":          ("php", "text/x-php", "application/x-php"),
     "python":       ("python", "py", "text/x-python"),
@@ -64,7 +48,7 @@ SYNONYMS: Dict[str, Sequence[str]] = {
     "rust":         ("rust", "rs", "text/x-rust"),
     "sql":          ("sql", "text/x-sql"),
     "text":         ("text", "plain", "plain-text", "text/plain", "txt"),  # Magika often emits "txt"
-    "typescript":   ("typescript", "ts", "text/typescript"),
+    "shell":        ("shell", "bash", "sh", "zsh", "fish", "batchfile", "bat", "cmd", "shell_batchfile"),
     "yaml":         ("yaml", "yml", "text/yaml", "application/x-yaml"),
 }
 
@@ -193,6 +177,42 @@ def canonicalize_label(pred_label: Optional[str], targets: Sequence[str]) -> str
 
     return p  # off-manifold prediction bucket
 
+
+def iter_windows_cover_all_bytes(fp: Path, window_size: int):
+    """
+    Yield 1536-byte windows that *cover all bytes* of the file.
+    Uses non-overlapping windows from 0, window_size, ... and, if there is
+    a tail shorter than window_size, adds ONE final (overlapping) window
+    starting at size - window_size so the tail bytes are covered.
+    """
+    size = fp.stat().st_size
+    if size < window_size:
+        return  # nothing to yield
+    try:
+        with fp.open("rb") as f:
+            # Non-overlapping full windows
+            pos = 0
+            while pos + window_size <= size:
+                f.seek(pos)
+                buf = f.read(window_size)
+                if not buf or len(buf) < window_size:
+                    break
+                yield buf
+                pos += window_size
+
+            # If there is a remainder, add one more window covering the tail.
+            if size % window_size != 0:
+                start = max(0, size - window_size)
+                # Avoid duplicating if the last non-overlapping step already hit 'start'
+                if start != pos - window_size:
+                    f.seek(start)
+                    buf = f.read(window_size)
+                    if buf and len(buf) == window_size:
+                        yield buf
+    except Exception:
+        return  # silently ignore unreadable files
+
+
 # -------------------- Core evaluation (main-thread, app-level batching) --------------------
 
 def eval_label(
@@ -208,6 +228,7 @@ def eval_label(
     threshold: float,
 ) -> Tuple[int, int, int, Dict[str, int]]:
     """
+    Per-window evaluation (existing behavior).
     Returns (total_evaluated, correct, skipped_small, misclass_counts)
     where misclass_counts maps predicted label -> count (only incorrect predictions).
     """
@@ -232,7 +253,7 @@ def eval_label(
 
     indices = range(0, total, batch_size)
     iterator = indices if not show_progress else tqdm(
-        indices, total=math.ceil(total / batch_size), desc=label, unit="batch", leave=False
+        indices, total=math.ceil(total / batch_size), desc=f"{label} (windows)", unit="batch", leave=False
     )
 
     # Application-level batching: process windows in chunks while calling identify_bytes() per window.
@@ -262,11 +283,122 @@ def eval_label(
 
     return total, correct, skipped_small, miscls
 
+
+def eval_label_filewise(
+    *,
+    m: Magika,
+    label: str,
+    dir_path: Path,
+    samples: int,
+    window_size: int,
+    batch_size: int,
+    show_progress: bool,
+    all_labels: Sequence[str],
+    threshold: float,
+) -> Tuple[int, int, int, Dict[str, int]]:
+    """
+    Per-file evaluation.
+
+    For each sampled file, we create windows that *cover all bytes* of the file
+    (1536-byte windows as above), and we count the file as 'correct' only if
+    **every** window:
+        - canonicalizes to the target label, and
+        - satisfies score > threshold (if a score is available).
+
+    Returns (files_total, files_correct, skipped_small, per_file_failure_modes)
+    where per_file_failure_modes aggregates *file-level* failures by the most
+    frequent failing prediction within each failed file.
+    """
+    files = choose_files(dir_path, samples, window_size)
+    skipped_small = 0
+    total_files = 0
+    correct_files = 0
+    file_fail_modes: Dict[str, int] = {}
+
+    iterator = files if not show_progress else tqdm(
+        files, total=len(files), desc=f"{label} (files)", unit="file", leave=False
+    )
+
+    for fp in iterator:
+        try:
+            size = fp.stat().st_size
+        except Exception:
+            # If we can't stat, skip as "small/unreadable"
+            skipped_small += 1
+            continue
+
+        if size < window_size:
+            skipped_small += 1
+            continue
+
+        total_files += 1
+        fail_counts: Dict[str, int] = {}
+        batch_bufs: List[bytes] = []
+
+        # Stream windows, batching at the application level.
+        for w in iter_windows_cover_all_bytes(fp, window_size):
+            if not w:
+                continue
+            batch_bufs.append(w)
+            if len(batch_bufs) >= batch_size:
+                # Process batch
+                for wb in batch_bufs:
+                    res = m.identify_bytes(wb)
+                    pred_label = extract_label_from_result(res)
+                    pred_str = str(pred_label).strip().lower() if pred_label else "(none)"
+
+                    ok = bool(getattr(res, "ok", False))
+                    score = float(getattr(res, "score", 0.0)) if ok else 0.0
+
+                    canon = canonicalize_label(pred_label, all_labels)
+                    matches_label = canon == label
+                    meets_threshold = score > threshold
+
+                    if not (matches_label and meets_threshold):
+                        if matches_label:
+                            key = f"{pred_str} (below-threshold)"
+                        else:
+                            key = canon if canon != "(none)" else pred_str
+                        fail_counts[key] = fail_counts.get(key, 0) + 1
+                batch_bufs = []
+
+        # Flush any remaining windows in the final (possibly small) batch
+        if batch_bufs:
+            for wb in batch_bufs:
+                res = m.identify_bytes(wb)
+                pred_label = extract_label_from_result(res)
+                pred_str = str(pred_label).strip().lower() if pred_label else "(none)"
+
+                ok = bool(getattr(res, "ok", False))
+                score = float(getattr(res, "score", 0.0)) if ok else 0.0
+
+                canon = canonicalize_label(pred_label, all_labels)
+                matches_label = canon == label
+                meets_threshold = score > threshold
+
+                if not (matches_label and meets_threshold):
+                    if matches_label:
+                        key = f"{pred_str} (below-threshold)"
+                    else:
+                        key = canon if canon != "(none)" else pred_str
+                    fail_counts[key] = fail_counts.get(key, 0) + 1
+
+        # If there were no failures across the file's windows, it's a success.
+        if not fail_counts:
+            correct_files += 1
+        else:
+            # Attribute this file's failure to the predominant failing key.
+            top_key = max(fail_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            file_fail_modes[top_key] = file_fail_modes.get(top_key, 0) + 1
+
+    return total_files, correct_files, skipped_small, file_fail_modes
+
+
 # -------------------- CLI --------------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Evaluate Magika accuracy on random windows per label directory.")
-    ap.add_argument("--root", type=Path, default=Path("."), help="Root folder containing label directories.")
+    ap = argparse.ArgumentParser(description="Evaluate Magika accuracy on random windows per label directory, plus per-file (all-windows) accuracy.")
+    ap.add_argument("--root", type=Path, default=Path("stack_super_small"), help="Root folder containing label directories.")
     ap.add_argument("--dirs", type=str, default=",".join(DEFAULT_DIRS), help="Comma-separated label dirs to use.")
     ap.add_argument("--samples-per-dir", type=int, default=SAMPLES_PER_DIR, help="Max files per directory.")
     ap.add_argument("--window-size", type=int, default=WINDOW_SIZE, help="Window size in bytes.")
@@ -275,7 +407,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars.")
     ap.add_argument("--bar-width", type=int, default=BAR_WIDTH, help="ASCII bar width.")
     ap.add_argument("--topk-miscls", type=int, default=3, help="How many top misclassification classes to list per label.")
-    ap.add_argument("--threshold", type=float, default=0.0, help="Min confidence score (0-1) to count a correct prediction.")
+    ap.add_argument("--threshold", type=float, default=0.9, help="Min confidence score (0-1) to count a correct prediction.")
     return ap.parse_args()
 
 # -------------------- Main --------------------
@@ -304,19 +436,27 @@ def main() -> None:
     m = Magika()
 
     per_label_stats: Dict[str, Dict[str, object]] = {}
-    overall_total = 0
-    overall_correct = 0
+    overall_total_windows = 0
+    overall_correct_windows = 0
+
+    # Per-file overall accumulators
+    overall_total_files = 0
+    overall_correct_files = 0
 
     for label in labels:
         d, candidate_count = find_label_dir(root, label, window_size=args.window_size)
         if d and d != (root / label):
             print(f"[info] Using {d} ({candidate_count} files ≥ {args.window_size} bytes) for label '{label}'")
         if not d:
-            per_label_stats[label] = {"total": 0, "correct": 0, "skipped_small": 0, "missing": 1, "miscls": {}}
+            per_label_stats[label] = {
+                "total": 0, "correct": 0, "skipped_small": 0, "missing": 1, "miscls": {},
+                "files_total": 0, "files_correct": 0, "files_skipped_small": 0, "files_miscls": {}
+            }
             print(f"[warn] Missing directory: {root / label}")
             continue
 
-        total, correct, skipped_small, miscls = eval_label(
+        # ----- Per-window evaluation -----
+        total_w, correct_w, skipped_small_w, miscls_w = eval_label(
             m=m,
             label=label,
             dir_path=d,
@@ -327,17 +467,41 @@ def main() -> None:
             all_labels=labels,
             threshold=float(args.threshold),
         )
-        per_label_stats[label] = {
-            "total": total,
-            "correct": correct,
-            "skipped_small": skipped_small,
-            "missing": 0,
-            "miscls": miscls,
-        }
-        overall_total += total
-        overall_correct += correct
 
-    # ---- ASCII bar chart + top misclassifications ----
+        # ----- Per-file evaluation (all bytes must pass) -----
+        total_f, correct_f, skipped_small_f, miscls_f = eval_label_filewise(
+            m=m,
+            label=label,
+            dir_path=d,
+            samples=args.samples_per_dir,
+            window_size=args.window_size,
+            batch_size=args.batch_size,
+            show_progress=not args.no_progress and sys.stderr.isatty(),
+            all_labels=labels,
+            threshold=float(args.threshold),
+        )
+
+        per_label_stats[label] = {
+            # windows
+            "total": total_w,
+            "correct": correct_w,
+            "skipped_small": skipped_small_w,
+            "missing": 0,
+            "miscls": miscls_w,
+            # files
+            "files_total": total_f,
+            "files_correct": correct_f,
+            "files_skipped_small": skipped_small_f,
+            "files_miscls": miscls_f,
+        }
+
+        overall_total_windows += total_w
+        overall_correct_windows += correct_w
+
+        overall_total_files += total_f
+        overall_correct_files += correct_f
+
+    # ---- ASCII bar chart + top misclassifications (per-window) ----
     print("\nAccuracy (Magika correct label on random window).")
     print("Top misclassification percentages are relative to the total windows for that label.\n")
 
@@ -361,10 +525,38 @@ def main() -> None:
             miss = " (missing dir)" if s.get("missing") else ""
             print(f"{label:12} | {'-'*BAR_WIDTH} |   n/a   (0/0, skipped_small={skipped_small}){miss}")
 
-    if overall_total > 0:
-        overall_pct = overall_correct / overall_total
+    if overall_total_windows > 0:
+        overall_pct = overall_correct_windows / overall_total_windows
         print("")
-        print(f"OVERALL       | {ascii_bar(overall_pct)} | {overall_pct*100:5.1f}%  ({overall_correct}/{overall_total})")
+        print(f"OVERALL (windows) | {ascii_bar(overall_pct)} | {overall_pct*100:5.1f}%  ({overall_correct_windows}/{overall_total_windows})")
+
+    # ---- NEW: Per-file bar chart (all windows must pass) ----
+    print("\nPer-file accuracy (all 1536-byte windows across each file must match the label and pass threshold).")
+    print("A file counts as correct only if every covering window passes.\n")
+
+    for label in labels:
+        s = per_label_stats[label]
+        f_total = int(s["files_total"])
+        f_correct = int(s["files_correct"])
+        f_skipped = int(s["files_skipped_small"])
+        f_miscls: Dict[str, int] = s.get("files_miscls", {}) if isinstance(s, dict) else {}
+
+        if f_total > 0:
+            fpct = f_correct / f_total
+            print(f"{label:12} | {ascii_bar(fpct)} | {fpct*100:5.1f}%  ({f_correct}/{f_total}, skipped_small={f_skipped})")
+            if f_miscls:
+                # Provide a brief look at predominant failure modes at the *file* level.
+                topk_f = sorted(f_miscls.items(), key=lambda kv: (-kv[1], kv[0]))[: max(1, args.topk_miscls)]
+                parts_f = [f"{k} {v/f_total*100:4.1f}% ({v}/{f_total})" for k, v in topk_f]
+                print(" " * 15 + "↳ top file failures: " + ", ".join(parts_f))
+        else:
+            miss = " (missing dir)" if s.get("missing") else ""
+            print(f"{label:12} | {'-'*BAR_WIDTH} |   n/a   (0/0, skipped_small={f_skipped}){miss}")
+
+    if overall_total_files > 0:
+        overall_file_pct = overall_correct_files / overall_total_files
+        print("")
+        print(f"OVERALL (files)   | {ascii_bar(overall_file_pct)} | {overall_file_pct*100:5.1f}%  ({overall_correct_files}/{overall_total_files})")
 
 if __name__ == "__main__":
     try:

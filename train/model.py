@@ -175,6 +175,49 @@ def train_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, batch_labels
     return state, loss, acc
 
 @jax.jit
+def microbatch_grad_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.ndarray, rng):
+    """Compute gradients, loss, and accuracy for a single microbatch without applying updates."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng},
+        )
+        loss = cross_entropy_masked(logits, batch_labels)
+        return loss, logits
+
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    acc = accuracy_masked(logits, batch_labels)
+    return grads, loss, acc
+
+
+def microbatch_grad_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.ndarray, rng):
+    """Non-JIT version of microbatch_grad_step."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng},
+        )
+        loss = cross_entropy_masked(logits, batch_labels)
+        return loss, logits
+
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    acc = accuracy_masked(logits, batch_labels)
+    return grads, loss, acc
+
+
+def grad_global_norm(grads) -> jnp.ndarray:
+    """Compute global norm of a gradient PyTree."""
+    return jnp.sqrt(sum([jnp.sum(jnp.square(g)) for g in jtu.tree_leaves(grads)]))
+
+@jax.jit
 def eval_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.ndarray, rng):
     """Perform a single evaluation step."""
     logits = state.apply_fn(

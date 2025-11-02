@@ -26,6 +26,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.7")  # Limit JAX memo
 import gc
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpy as np
 from flax.training import checkpoints
 from flax import serialization
@@ -46,6 +47,9 @@ from model import (
     TrainState,
     count_params,
     train_step_no_jit,
+    microbatch_grad_step,
+    microbatch_grad_step_no_jit,
+    grad_global_norm,
 )
 from preview import build_preview_html
 
@@ -192,8 +196,9 @@ def main():
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--accum_steps", type=int, default=1)
     parser.add_argument("--model_dim", type=int, default=256)
-    parser.add_argument("--channels", type=str, default="96,128,160,192,224,256,288,320")
+    parser.add_argument("--channels", type=str, default="32,64,64,128,128,128,128,256")
     parser.add_argument("--dropout_rate", type=float, default=0.15)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=250)
@@ -205,6 +210,9 @@ def main():
     parser.add_argument("--preview_count", type=int, default=10)
 
     args = parser.parse_args()
+
+    if args.accum_steps < 1:
+        raise ValueError("--accum_steps must be >= 1")
 
     selected_langs = None
     if args.langs:
@@ -254,6 +262,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup=args.warmup,
+        accum_steps=args.accum_steps,
         model_dim=args.model_dim,
         channels=tuple(map(int, args.channels.split(","))),
         dropout_rate=args.dropout_rate,
@@ -336,6 +345,17 @@ def main():
     from epoch_batcher import EpochPrefetchBatcher
     data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
     train_step_fn = train_step_no_jit if t_cfg.no_jit else train_step
+    micro_step_fn = (
+        microbatch_grad_step_no_jit if t_cfg.no_jit else microbatch_grad_step
+    )
+    accum_steps = max(1, int(t_cfg.accum_steps))
+    if accum_steps > 1:
+        effective_batch = accum_steps * d_cfg.batch_size
+        print(
+            f"Gradient accumulation: {accum_steps} microbatches "
+            f"(effective batch size ≈ {effective_batch})",
+            flush=True,
+        )
 
     print("Starting training...", flush=True)
     start_time = time.time()
@@ -383,20 +403,72 @@ def main():
                     break
 
                 step_start = time.time()
+                data_time = 0.0
+                compute_time = 0.0
+                grad_norm_value = None
 
-                data_start = time.time()
-                batch_tokens, batch_labels = data_fetcher.get()
-                batch_tokens = sanitize_tokens(batch_tokens)
-                data_time = time.time() - data_start
+                rng, step_base_rng = jax.random.split(rng)
 
-                rng, step_rng = jax.random.split(rng)
-                state, loss, acc = train_step_fn(
-                    state, batch_tokens, batch_labels, step_rng
-                )
-                # Explicitly delete batch data to free memory
-                del batch_tokens
-                del batch_labels
-                compute_time = time.time() - data_start - data_time
+                if accum_steps == 1:
+                    data_start = time.time()
+                    batch_tokens, batch_labels = data_fetcher.get()
+                    batch_tokens = sanitize_tokens(batch_tokens)
+                    data_time = time.time() - data_start
+
+                    compute_start = time.time()
+                    state, loss, acc = train_step_fn(
+                        state, batch_tokens, batch_labels, step_base_rng
+                    )
+                    loss_value = float(loss)
+                    acc_value = float(acc)
+                    compute_time = time.time() - compute_start
+                    loss = loss_value
+                    acc = acc_value
+
+                    del batch_tokens
+                    del batch_labels
+                else:
+                    losses = []
+                    accs = []
+                    grad_accum = None
+                    micro_rng = step_base_rng
+
+                    for _ in range(accum_steps):
+                        data_start = time.time()
+                        mb_tokens, mb_labels = data_fetcher.get()
+                        mb_tokens = sanitize_tokens(mb_tokens)
+                        data_time += time.time() - data_start
+
+                        micro_rng, use_rng = jax.random.split(micro_rng)
+                        compute_start = time.time()
+                        grads, micro_loss, micro_acc = micro_step_fn(
+                            state, mb_tokens, mb_labels, use_rng
+                        )
+                        micro_loss_value = float(micro_loss)
+                        micro_acc_value = float(micro_acc)
+                        compute_time += time.time() - compute_start
+
+                        if grad_accum is None:
+                            grad_accum = grads
+                        else:
+                            grad_accum = jtu.tree_map(
+                                lambda a, b: a + b, grad_accum, grads
+                            )
+
+                        losses.append(micro_loss_value)
+                        accs.append(micro_acc_value)
+
+                        del mb_tokens
+                        del mb_labels
+
+                    scale = jnp.asarray(accum_steps, dtype=jnp.float32)
+                    grad_accum = jtu.tree_map(lambda g: g / scale, grad_accum)
+                    grad_norm_value = float(grad_global_norm(grad_accum))
+                    apply_start = time.time()
+                    state = state.apply_gradients(grads=grad_accum)
+                    compute_time += time.time() - apply_start
+                    loss = float(sum(losses) / len(losses))
+                    acc = float(sum(accs) / len(accs))
 
                 step_time = time.time() - step_start
 
@@ -433,6 +505,19 @@ def main():
                     "perf/compute_time": compute_time,
                     "perf/total_step_time": step_time,
                 }
+
+                if grad_norm_value is not None:
+                    rs = _compute_running_stats(
+                        metrics_history["grad_norm"], grad_norm_value
+                    )
+                    metrics.update(
+                        {
+                            "train/grad_norm": grad_norm_value,
+                            "train/grad_norm_mean": rs["mean"],
+                            "train/grad_norm_std": rs["std"],
+                            "train/grad_norm_trend": rs["trend"],
+                        }
+                    )
 
                 rs = _compute_running_stats(metrics_history["loss"], float(loss))
                 metrics.update(

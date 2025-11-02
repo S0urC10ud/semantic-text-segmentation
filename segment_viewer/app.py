@@ -5,7 +5,7 @@ Segmenter Viewer — FastAPI backend + beautiful frontend
 Run:
   pip install fastapi uvicorn jax jaxlib flax optax numpy orbax-checkpoint
   # (Install the right jax/jaxlib for your CUDA setup if using GPU.)
-  python app.py --ckpt ./seg-unet1d.msgpack --model-dim 256 --channels 96,128,192,256 --dtype bfloat16 --chunk 1024 --lang html,css,javascript,php
+  python app.py --ckpt ./seg-unet1d.msgpack --model-dim 256 --channels 96,128,192,256 --dtype bfloat16 --chunk 1024 --lang html,css,javascript_typescript,php
 
 Then open http://127.0.0.1:8000
 """
@@ -148,6 +148,39 @@ def _extract_run_id_from_checkpoint(path: Path) -> Optional[str]:
         return None
     return match.group(1)
 
+def _parse_label_names_from_output(log_text: str) -> List[str]:
+    labels: List[str] = []
+    seen = set()
+    collecting = False
+    for raw_line in log_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("[Validation] Per-class metrics"):
+            collecting = False
+            continue
+        if line.startswith("label ") and "support" in line:
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if line.startswith("-"):
+            continue
+        if not line or line.startswith("Step "):
+            collecting = False
+            continue
+        if line.startswith("ALL"):
+            continue
+        if line.startswith("WARNING") or line.startswith("INFO"):
+            collecting = False
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        label = parts[0]
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return labels
+
 
 def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
     run_id = _extract_run_id_from_checkpoint(ckpt_path)
@@ -210,9 +243,82 @@ def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
                 if label_names:
                     ordered = [label_names[i] for i in sorted(label_names)]
                     result["label_names"] = ordered
+                    result["_label_source"] = "wandb"
+        # Fallback: parse label order from output.log
+        output_log = run_dir / "files" / "output.log"
+        if output_log.exists():
+            parsed_labels = _parse_label_names_from_output(output_log.read_text())
+            if parsed_labels:
+                result.setdefault("label_names", parsed_labels)
+                result.setdefault("_label_source", "output_log")
         if result:
             return result
     return {}
+
+def _infer_checkpoint_architecture(ckpt_path: Path) -> Dict[str, Any]:
+    """Best-effort inference of model hyperparameters from a Flax msgpack checkpoint."""
+    result: Dict[str, Any] = {}
+    p = ckpt_path.resolve()
+    if not p.is_file():
+        return result
+    try:
+        params = serialization.msgpack_restore(p.read_bytes())
+    except Exception:
+        return result
+
+    # Embedding dimension -> model_dim
+    try:
+        embedding = params["Embed_0"]["embedding"]
+        result["model_dim"] = int(embedding.shape[1])
+        result["dtype"] = getattr(embedding.dtype, "name", str(embedding.dtype))
+    except Exception:
+        pass
+
+    # Down path channels: walk ConvBlock1D_{0,2,4,...} until we hit the up path
+    channels: List[int] = []
+    current_in = result.get("model_dim")
+    block_idx = 0
+    while True:
+        name = f"ConvBlock1D_{block_idx}"
+        block = params.get(name)
+        if block is None:
+            break
+        conv = block.get("Conv_0")
+        if conv is None:
+            break
+        kernel = conv.get("kernel")
+        if kernel is None:
+            break
+        in_ch = int(kernel.shape[-2])
+        out_ch = int(kernel.shape[-1])
+        if block_idx == 0 and current_in is None:
+            current_in = in_ch
+            result["model_dim"] = in_ch
+        if channels and current_in is not None and in_ch != current_in:
+            break
+        channels.append(out_ch)
+        current_in = out_ch
+        block_idx += 2  # skip the paired block belonging to the same stage
+    if channels:
+        result["channels"] = channels
+
+    # Output layer -> num_classes
+    try:
+        result["num_classes"] = int(params["Conv_0"]["kernel"].shape[-1])
+    except Exception:
+        pass
+
+    return result
+
+def _resolve_hparam(cli_value, wandb_value, inferred_value, default_value):
+    """Pick a hyperparameter value while recording its source."""
+    if cli_value not in (None, "", []):
+        return cli_value, "cli"
+    if wandb_value is not None:
+        return wandb_value, "wandb"
+    if inferred_value is not None:
+        return inferred_value, "checkpoint"
+    return default_value, "default"
 
 
 def auto_color(k: int, n: int) -> str:
@@ -227,14 +333,13 @@ def auto_color(k: int, n: int) -> str:
 DEFAULT_COLOR_BY_LABEL = {
     "html": "#f2994a",
     "css": "#3498db",
-    "javascript": "#f1c40f",
+    "javascript_typescript": "#f1c40f",
     "php": "#9b59b6",
     "python": "#2ecc71",
     "json": "#1abc9c",
     "sql": "#e74c3c",
     "java": "#8e44ad",
     "go": "#16a085",
-    "typescript": "#95a5a6",
     "c_family": "#2ecc71",
     "csharp": "#1abc9c",
     "csv": "#e74c3c",
@@ -242,6 +347,8 @@ DEFAULT_COLOR_BY_LABEL = {
     "rust": "#16a085",
     "text": "#95a5a6",
     "yaml": "#d35400",
+    "powershell": "#8e44ad",
+    "shell": "#636e72",
 }
 
 
@@ -466,6 +573,24 @@ _ALLOWED_MODEL_TOKEN_VALUES = np.array(
     sorted(set(_ALLOWED_MODEL_BYTE_VALUES.tolist()) | {int(PAD_BYTE_ID)}),
     dtype=np.int32,
 )
+
+_PLACEHOLDER_CHAR = "\u00A4"
+_ALLOWED_TEXT_CHARS = {chr(b) for b in _VISIBLE_ASCII_BYTES}
+_ALLOWED_TEXT_CHARS.update({" ", "\n", "\t", _PLACEHOLDER_CHAR})
+
+
+def _normalize_input_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    out_chars: List[str] = []
+    for ch in text:
+        if ch == "\r":
+            ch = "\n"
+        if ch in _ALLOWED_TEXT_CHARS:
+            out_chars.append(ch)
+        else:
+            out_chars.append(_PLACEHOLDER_CHAR)
+    return "".join(out_chars)
 
 
 def _sanitize_model_bytes(arr: np.ndarray) -> np.ndarray:
@@ -747,32 +872,60 @@ args, _ = parser.parse_known_args()
 
 ckpt_path = Path(args.ckpt).resolve()
 auto_hparams = _load_checkpoint_hparams(ckpt_path)
+ckpt_inferred = _infer_checkpoint_architecture(ckpt_path)
 
 label_names = auto_hparams.get("label_names")
 if label_names:
     _apply_label_mapping(label_names)
 
-model_dim = args.model_dim if args.model_dim is not None else auto_hparams.get("model_dim", 256)
-dtype = args.dtype if args.dtype is not None else auto_hparams.get("dtype", "bfloat16")
-if isinstance(dtype, str):
-    dtype = dtype.rsplit(".", 1)[-1]
+model_dim_value, model_dim_source = _resolve_hparam(
+    args.model_dim,
+    auto_hparams.get("model_dim"),
+    ckpt_inferred.get("model_dim"),
+    256,
+)
+model_dim = int(model_dim_value)
 
-if args.channels:
-    channel_values = [int(x) for x in args.channels.split(",") if x.strip()]
+dtype_value, dtype_source = _resolve_hparam(
+    args.dtype,
+    auto_hparams.get("dtype"),
+    ckpt_inferred.get("dtype"),
+    "bfloat16",
+)
+if isinstance(dtype_value, str):
+    dtype = dtype_value.rsplit(".", 1)[-1]
 else:
-    channel_values = [int(x) for x in auto_hparams.get("channels", DEFAULT_CHANNELS)]
+    dtype = str(dtype_value)
+
+channels_cli = None
+if args.channels:
+    channels_cli = [int(x) for x in args.channels.split(",") if x.strip()]
+channels_value, channels_source = _resolve_hparam(
+    channels_cli,
+    auto_hparams.get("channels"),
+    ckpt_inferred.get("channels"),
+    list(DEFAULT_CHANNELS),
+)
+channel_values = [int(x) for x in channels_value]
 channels = tuple(channel_values)
 
 args.model_dim = model_dim
 args.dtype = dtype
 args.channels = ",".join(str(ch) for ch in channels)
 
-if auto_hparams:
-    extra = f", classes={len(label_names)}" if label_names else ""
-    print(
-        f"ℹ️  Using checkpoint hyperparameters: model_dim={model_dim}, channels={list(channels)}, dtype={dtype}{extra}",
-        flush=True,
-    )
+if auto_hparams or ckpt_inferred:
+    details = [
+        f"model_dim={model_dim} ({model_dim_source})",
+        f"channels={list(channels)} ({channels_source})",
+        f"dtype={dtype} ({dtype_source})",
+    ]
+    label_source = auto_hparams.pop("_label_source", None)
+    if label_names:
+        origin = label_source if label_source else "wandb"
+        details.append(f"classes={len(label_names)} ({origin})")
+    elif ckpt_inferred.get("num_classes"):
+        details.append(f"classes={ckpt_inferred['num_classes']} (checkpoint)")
+    print(f"ℹ️  Resolved hyperparameters: {', '.join(details)}", flush=True)
 
 try:
     canonical_label_names, display_label_names = _resolve_langs_and_display(args.lang)
@@ -781,6 +934,12 @@ except (RuntimeError, ValueError) as exc:
     parser.error(str(exc))
 
 num_classes = len(canonical_label_names)
+ckpt_classes = ckpt_inferred.get("num_classes")
+if ckpt_classes is not None and ckpt_classes != num_classes:
+    print(
+        f"⚠️  Checkpoint expects {ckpt_classes} classes but label config resolved {num_classes}.",
+        flush=True,
+    )
 print(
     f"Label order resolved from training config: {canonical_label_names}",
     flush=True,
@@ -833,14 +992,17 @@ def get_labels():
 def api_segment(req: SegmentRequest):
     if load_error is not None or predictor is None:
         raise HTTPException(status_code=500, detail=f"Model failed to load: {load_error}")
-    if not isinstance(req.text, str) or len(req.text) == 0:
+    if not isinstance(req.text, str):
+        return {"segments": [], "stats": {}, "html": ""}
+    text = _normalize_input_text(req.text)
+    if len(text) == 0:
         return {"segments": [], "stats": {}, "html": ""}
 
     import time as _time
     t0 = _time.perf_counter()
     try:
         segs, char_labels, char_probs = predictor.segment_text(
-            req.text, min_run_chars=int(req.min_run),
+            text, min_run_chars=int(req.min_run),
             chunk=int(req.chunk) if req.chunk else args.chunk
         )
     except ValueError as exc:
@@ -853,7 +1015,7 @@ def api_segment(req: SegmentRequest):
 
     out_html = []
     for (s, e, lbl) in segs:
-        raw = req.text[s:e]
+        raw = text[s:e]
         cls = ID2SLUG.get(lbl, f"class-{lbl}")
         color = ID2COLOR.get(lbl, "#888888")
         bg_color = _hex_to_rgba(color, 0.22)

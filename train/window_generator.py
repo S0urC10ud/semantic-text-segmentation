@@ -20,6 +20,48 @@ if TYPE_CHECKING:
 from data_utils import bytes_from_text
 from token_utils import sanitize_tokens
 
+_PROHIBITED_INJECTION_LANGS = {"csv", "json", "yaml", "text", "html"}
+_PROHIBITED_INJECTION_LIDS = {
+    lid
+    for name, lid in getattr(cfg, "LANG2ID", {}).items()
+    if isinstance(name, str) and name.lower() in _PROHIBITED_INJECTION_LANGS and lid is not None
+}
+if hasattr(cfg, "ID2LANG"):
+    _PROHIBITED_INJECTION_LIDS.update(
+        {
+            int(lid)
+            for lid, name in cfg.ID2LANG.items()
+            if isinstance(name, str) and name.lower() in _PROHIBITED_INJECTION_LANGS
+        }
+    )
+
+_MAX_LINE_INJECT_COMMENT_RATIO = 0.4
+_SYNTHETIC_MARKDOWN_PHRASES = [
+    "In this section we walk through the implementation details.",
+    "The following code sample highlights the subtle edge cases we found.",
+    "Remember that any input must be sanitized before reaching this block.",
+    "Below you can find the reproduction steps captured during triage.",
+    "We should mention the trade-offs before the reader inspects the snippet.",
+    "Here's some inline context so the surrounding prose still makes sense.",
+]
+
+
+def _count_ascii_letters(text: str) -> int:
+    """Count ASCII alphabetic characters."""
+    return sum(1 for ch in text if ("a" <= ch <= "z") or ("A" <= ch <= "Z"))
+
+
+def _line_looks_terminated(line: str) -> bool:
+    stripped = line.rstrip()
+    if not stripped:
+        return True
+    tail = stripped[-1]
+    if tail in {";", "}", "]", ")", ">", ","}:
+        return True
+    if stripped.endswith(("```", '"""', "'''")):
+        return True
+    return False
+
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -92,13 +134,130 @@ def _choose_segment_slice(
 ) -> np.ndarray:
     """
     Pick a slice of ``byte_content`` up to ``seg_len`` bytes. For shorter slices we
-    bias toward samples that contain at least ``min_letters`` ASCII alphabetic chars.
+    bias toward samples that contain at least ``min_letters`` ASCII alphabetic characters.
     """
     total = int(len(byte_content))
     if seg_len <= 0 or total == 0:
         return np.empty((0,), dtype=np.uint8)
 
     seg_len = min(seg_len, total)
+    max_overrun = max(32, seg_len // 4)
+
+    # Prefer aligned line snippets when the fragment has line structure.
+    buffer_bytes = byte_content.tobytes()
+    try:
+        text = buffer_bytes.decode("utf-8", "ignore")
+    except Exception:
+        text = ""
+    if text and "\n" in text:
+        lines = text.splitlines(keepends=True)
+        if lines:
+            line_byte_lengths = [len(line.encode("utf-8", "ignore")) for line in lines]
+            line_offsets: List[int] = []
+            offset = 0
+            for length in line_byte_lengths:
+                line_offsets.append(offset)
+                offset += length
+            total_lines = len(lines)
+
+            interior = list(range(1, total_lines - 1)) if total_lines > 2 else []
+            edges = [idx for idx in (0, total_lines - 1) if 0 <= idx < total_lines]
+            random.shuffle(interior)
+            random.shuffle(edges)
+            start_candidates = interior + edges if interior else edges
+            if not start_candidates:
+                start_candidates = [0]
+
+            max_candidates = min(len(start_candidates), 64)
+            desired_min = max(int(seg_len * 0.75), min(seg_len, 96))
+            contiguous_candidates: List[Tuple[Tuple[int, int, int, int, int], np.ndarray, int]] = []
+
+            for start_index in start_candidates[:max_candidates]:
+                block_start = start_index
+                back_steps = 0
+                while block_start > 0 and back_steps < 3:
+                    prev_line = lines[block_start - 1]
+                    if not prev_line.strip():
+                        break
+                    if line_byte_lengths[block_start - 1] > seg_len:
+                        break
+                    block_start -= 1
+                    back_steps += 1
+
+                end_line = block_start
+                total_bytes = 0
+                letters_accum = 0
+                while end_line < total_lines:
+                    next_len = line_byte_lengths[end_line]
+                    if total_bytes + next_len > seg_len + max_overrun:
+                        break
+                    total_bytes += next_len
+                    letters_accum += _count_letters(lines[end_line])
+                    end_line += 1
+                    if total_bytes >= seg_len:
+                        break
+
+                if total_bytes <= 0:
+                    continue
+
+                # Extend forward to avoid chopping mid-block when budget allows.
+                while end_line < total_lines and total_bytes <= seg_len + max_overrun:
+                    prev_line = lines[end_line - 1]
+                    if _line_looks_terminated(prev_line):
+                        break
+                    next_len = line_byte_lengths[end_line]
+                    if total_bytes + next_len > seg_len + max_overrun:
+                        break
+                    letters_accum += _count_letters(lines[end_line])
+                    total_bytes += next_len
+                    end_line += 1
+
+                if end_line < total_lines and not lines[end_line].strip():
+                    blank_len = line_byte_lengths[end_line]
+                    if total_bytes + blank_len <= seg_len + max_overrun:
+                        total_bytes += blank_len
+                        end_line += 1
+
+                if block_start >= len(line_offsets):
+                    continue
+                start_byte = line_offsets[block_start]
+                end_byte = start_byte + total_bytes
+                if end_byte > total:
+                    end_byte = total
+                    total_bytes = end_byte - start_byte
+                if total_bytes <= 0:
+                    continue
+
+                snippet = byte_content[start_byte:end_byte]
+                snippet_text = snippet.tobytes().decode("utf-8", "ignore")
+                snippet_letters = _count_ascii_letters(snippet_text)
+                if snippet_letters < max(min_letters, 1):
+                    continue
+
+                overrun = max(0, total_bytes - seg_len)
+                if overrun > max_overrun:
+                    continue
+
+                priority = 0
+                if total_bytes < seg_len:
+                    priority = 1 if total_bytes >= desired_min else 2
+                edge_penalty = 0 if 0 < block_start < total_lines - 1 else 1
+                quality = (
+                    priority,
+                    abs(seg_len - total_bytes),
+                    edge_penalty,
+                    -snippet_letters,
+                    block_start,
+                )
+                contiguous_candidates.append((quality, snippet, start_byte))
+
+            if contiguous_candidates:
+                contiguous_candidates.sort(key=lambda item: item[0])
+                _, best_segment, best_start = contiguous_candidates[0]
+                if return_start:
+                    return best_segment, best_start  # type: ignore[return-value]
+                return best_segment
+
     chosen_start = 0
     if seg_len > guard_len:
         if total == seg_len:
@@ -118,7 +277,7 @@ def _choose_segment_slice(
             start = random.randint(0, total - seg_len)
         segment = byte_content[start:start + seg_len]
         text = segment.tobytes().decode("utf-8", "ignore")
-        letters = sum(("a" <= c <= "z") or ("A" <= c <= "Z") for c in text)
+        letters = _count_ascii_letters(text)
         if letters >= min_letters:
             return (segment, start) if return_start else segment
         if letters > best_letters:
@@ -335,6 +494,8 @@ def _make_mixed_window_impl(
     target_len: int,
     min_seg: int,
     collect_meta: bool = False,
+    *,
+    data_cfg: Optional["DataConfig"] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Optional[Dict]]:
     # inputs are int32 to allow PAD_BYTE_ID=256
     x_buf = np.full((target_len,), cfg.PAD_BYTE_ID, dtype=np.int32)
@@ -345,6 +506,11 @@ def _make_mixed_window_impl(
     if not lids:
         return sanitize_tokens(x_buf), y_buf, meta
 
+    max_langs = int(getattr(data_cfg, "max_mixed_languages", 3)) if data_cfg is not None else 3
+    if max_langs <= 0:
+        max_langs = 1
+    used_lids: List[int] = []
+
     nsegs = _sample_mixed_segment_count()
     left, pos = target_len, 0
     for i in range(nsegs):
@@ -354,9 +520,14 @@ def _make_mixed_window_impl(
         if seg_len <= 0:
             break
 
-        preferred = random.choice(lids)
+        if len(used_lids) >= max_langs:
+            candidate_lids = [lid for lid in lids if lid in used_lids] or used_lids or lids
+        else:
+            candidate_lids = lids
+
+        preferred = random.choice(candidate_lids)
         lid, ex, byte_content = _sample_nonempty_example(
-            dsets_by_lang, lids, prefer_lid=preferred
+            dsets_by_lang, candidate_lids, prefer_lid=preferred
         )
         if ex is None or byte_content is None or byte_content.size == 0:
             if collect_meta:
@@ -369,10 +540,10 @@ def _make_mixed_window_impl(
                         "start": int(pos),
                         "end": int(pos),
                         "bytes": 0,
-                        "requested_bytes": int(seg_len),
-                        "status": "failed_to_sample_nonempty",
-                    }
-                )
+                    "requested_bytes": int(seg_len),
+                    "status": "failed_to_sample_nonempty",
+                }
+            )
             pos += seg_len
             left -= seg_len
             continue
@@ -385,28 +556,36 @@ def _make_mixed_window_impl(
             segment = _choose_segment_slice(byte_content, seg_len)
             src_start = None
         L = int(segment.shape[0])
-        if L > 0:
-            x_buf[pos:pos + L] = segment[:L].astype(np.int32)
-            y_buf[pos:pos + L] = lid
+        if L > left and L > 0:
+            segment = segment[:left]
+            L = int(segment.shape[0])
+        write_len = min(L, left)
+        start_pos = pos
+        if write_len > 0:
+            x_buf[pos:pos + write_len] = segment[:write_len].astype(np.int32)
+            y_buf[pos:pos + write_len] = lid
+            if lid not in used_lids:
+                used_lids.append(lid)
         if collect_meta:
             entry = {
                 "origin": "base",
                 "language_id": int(lid),
                 "language": _lang_name(lid),
                 "source": _extract_example_source(ex),
-                "start": int(pos),
-                "end": int(pos + L),
-                "bytes": int(L),
+                "start": int(start_pos),
+                "end": int(start_pos + write_len),
+                "bytes": int(write_len),
                 "requested_bytes": int(seg_len),
             }
             if src_start is not None:
                 entry["source_offset"] = int(src_start)
-            if L == 0:
+            if write_len == 0:
                 entry["status"] = "zero_bytes"
             meta["samples"].append(entry)
 
-        pos += seg_len
-        left -= seg_len
+        used_bytes = write_len if write_len > 0 else seg_len
+        pos += used_bytes
+        left = max(0, left - used_bytes)
 
     return sanitize_tokens(x_buf), y_buf, meta
 
@@ -414,7 +593,9 @@ def _make_mixed_window_impl(
 def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
                       target_len: int,
                       min_seg: int) -> Tuple[np.ndarray, np.ndarray]:
-    x, y, _ = _make_mixed_window_impl(dsets_by_lang, target_len, min_seg, collect_meta=False)
+    x, y, _ = _make_mixed_window_impl(
+        dsets_by_lang, target_len, min_seg, collect_meta=False, data_cfg=None
+    )
     return sanitize_tokens(x), y
 
 
@@ -430,16 +611,18 @@ def _resolve_mix_probability(data_cfg: "DataConfig") -> float:
     mix_prob = getattr(data_cfg, "mix_prob", None)
     pure_prob = max(0.0, getattr(data_cfg, "pure_prob", 0.0))
     line_mode_prob = _line_inject_mode_prob(data_cfg)
+    markdown_prob = max(0.0, getattr(data_cfg, "markdown_prob", 0.0))
     if mix_prob is None:
-        mix_prob = 1.0 - pure_prob - line_mode_prob
+        mix_prob = 1.0 - pure_prob - line_mode_prob - markdown_prob
     return max(0.0, mix_prob)
 
 
 def _choose_window_mode(data_cfg: "DataConfig") -> str:
     pure_prob = max(0.0, getattr(data_cfg, "pure_prob", 0.0))
     line_mode_prob = _line_inject_mode_prob(data_cfg)
+    markdown_prob = max(0.0, getattr(data_cfg, "markdown_prob", 0.0))
     mix_prob = _resolve_mix_probability(data_cfg)
-    total = pure_prob + line_mode_prob + mix_prob
+    total = pure_prob + line_mode_prob + markdown_prob + mix_prob
     if total <= 0.0:
         return "mixed"
 
@@ -448,6 +631,8 @@ def _choose_window_mode(data_cfg: "DataConfig") -> str:
         return "pure"
     if r < pure_prob + line_mode_prob:
         return "line_inject"
+    if r < pure_prob + line_mode_prob + markdown_prob:
+        return "markdown"
     return "mixed"
 
 
@@ -476,6 +661,7 @@ def _make_training_window_internal(
         }
 
     mode = _choose_window_mode(data_cfg)
+    base_mode = mode
     resolved_mode = mode
     if mode == "pure":
         x, y, partial = _make_pure_window_impl(dsets_by_lang, target_len, collect_meta)
@@ -493,8 +679,27 @@ def _make_training_window_internal(
                 metadata["samples"].extend(partial.get("samples", []))
                 metadata["line_injections"].extend(partial.get("line_injections", []))
                 metadata["host"] = partial.get("host", metadata.get("host"))
+    elif mode == "markdown":
+        x, y, partial = _make_markdown_window_impl(dsets_by_lang, target_len, data_cfg, collect_meta)
+        if collect_meta and metadata is not None:
+            metadata["mode"] = "markdown"
+            metadata["requested_mode"] = "markdown"
+            if partial:
+                metadata["samples"].extend(partial.get("samples", []))
+                markdown_meta = partial.get("markdown_blocks")
+                if markdown_meta:
+                    metadata["markdown_blocks"] = markdown_meta
+                metadata["line_injections"].extend(partial.get("line_injections", []))
+                if metadata.get("host") is None:
+                    metadata["host"] = partial.get("host")
     else:
-        x, y, partial = _make_mixed_window_impl(dsets_by_lang, target_len, data_cfg.min_seg_len, collect_meta)
+        x, y, partial = _make_mixed_window_impl(
+            dsets_by_lang,
+            target_len,
+            data_cfg.min_seg_len,
+            collect_meta,
+            data_cfg=data_cfg,
+        )
         if collect_meta and metadata is not None:
             metadata["mode"] = "mixed"
             metadata["requested_mode"] = "mixed"
@@ -503,12 +708,14 @@ def _make_training_window_internal(
 
     # Optionally overlay mixed slices on top of base window
     both_prob = getattr(data_cfg, "both_prob", 0.2)
-    if both_prob > 0.0 and random.random() < both_prob:
+    allow_overlay = (base_mode == "pure")
+    if allow_overlay and both_prob > 0.0 and random.random() < both_prob:
         xm, ym, overlay_meta = _make_mixed_window_impl(
             dsets_by_lang,
             target_len,
             data_cfg.min_seg_len,
             collect_meta,
+            data_cfg=data_cfg,
         )
         nslices = random.randint(1, 3)
         for _ in range(nslices):
@@ -631,8 +838,120 @@ def _split_keepends_lines(text: str) -> List[str]:
     return text.splitlines(keepends=True) if text else []
 
 
+def _classify_comment_lines(lines: List[str]) -> List[bool]:
+    """Heuristic detection of comment-only lines."""
+    flags: List[bool] = []
+    inside_c_block = False
+    inside_doc_block: Optional[str] = None
+    inside_html_comment = False
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+        is_comment = False
+
+        if inside_doc_block:
+            is_comment = True
+            if inside_doc_block in stripped:
+                occurrences = stripped.count(inside_doc_block)
+                if occurrences % 2 == 1:
+                    inside_doc_block = None
+        elif inside_html_comment:
+            is_comment = True
+            if "-->" in line:
+                inside_html_comment = False
+        elif inside_c_block:
+            is_comment = True
+            if "*/" in line:
+                inside_c_block = False
+        else:
+            if stripped.startswith("//") or stripped.startswith("#") or stripped.startswith("--") or stripped.startswith("%"):
+                is_comment = True
+            elif lower.startswith("rem "):
+                is_comment = True
+            elif stripped.startswith("<!--"):
+                is_comment = True
+                if "-->" not in stripped:
+                    inside_html_comment = True
+            elif stripped.startswith("*/"):
+                is_comment = True
+            elif stripped.startswith("/*"):
+                is_comment = True
+                if "*/" not in stripped or stripped.find("*/") < stripped.find("/*"):
+                    inside_c_block = True
+            else:
+                comment_pos = stripped.find("/*")
+                if comment_pos != -1:
+                    if "*/" not in stripped[comment_pos + 2:]:
+                        inside_c_block = True
+                    if stripped[:comment_pos].strip() == "":
+                        is_comment = True
+            if stripped.startswith('"""') or stripped.startswith("'''"):
+                is_comment = True
+                delim = stripped[:3]
+                quote_count = stripped.count(delim)
+                if quote_count % 2 == 1:
+                    inside_doc_block = delim
+
+        flags.append(is_comment)
+    return flags
+
+
 def _count_letters(text: str) -> int:
-    return sum(("a" <= c <= "z") or ("A" <= c <= "Z") for c in text)
+    return _count_ascii_letters(text)
+
+
+def _clean_snippet_text(text: str) -> str:
+    if not text:
+        return ""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _trim_text_to_budget(text: str, byte_budget: int) -> Tuple[str, int]:
+    if byte_budget <= 0 or not text:
+        return "", 0
+    encoded = text.encode("utf-8", "ignore")
+    if not encoded:
+        return "", 0
+    if len(encoded) <= byte_budget:
+        return text, len(encoded)
+    trimmed = encoded[:byte_budget].decode("utf-8", "ignore")
+    trimmed_encoded = trimmed.encode("utf-8", "ignore")
+    return trimmed, len(trimmed_encoded)
+
+
+def _sample_lang_snippet(
+    dsets_by_lang: Dict[int, hfds.Dataset],
+    lid: int,
+    *,
+    max_chars: int = 320,
+    min_letters: int = 0,
+    strip: bool = False,
+) -> Tuple[str, Optional[dict]]:
+    ds = dsets_by_lang.get(lid)
+    if ds is None:
+        return "", None
+    attempts = 0
+    while attempts < 8:
+        ex = _random_example(ds)
+        attempts += 1
+        if not ex:
+            continue
+        content = ex.get("content", "")
+        if not isinstance(content, str):
+            continue
+        snippet = _clean_snippet_text(content)
+        if strip:
+            snippet = snippet.strip()
+        if not snippet:
+            continue
+        if len(snippet) > max_chars:
+            if len(snippet) > max_chars:
+                start = random.randint(0, max(0, len(snippet) - max_chars))
+                snippet = snippet[start:start + max_chars]
+        if min_letters > 0 and _count_letters(snippet) < min_letters:
+            continue
+        return snippet, ex
+    return "", None
 
 
 def _sample_truncated_exp_lines(lam: float, max_lines: int) -> int:
@@ -705,61 +1024,79 @@ def _prepare_donor_block(donor_text: str, data_cfg: "DataConfig", insertion_inde
         if has_interior:
             return ""
         pick = lines[:]  # fall back to whole donor when no interior exists
+        start_idx = 0
+        end_idx = len(lines)
 
-    if len(pick) == 1 and len(pick[0]) < data_cfg.line_inject_min_single_len:
+    comment_flags = _classify_comment_lines(lines)
+    letter_lengths = [_count_letters(ln) for ln in lines]
+    letter_count = sum(letter_lengths[start_idx:end_idx])
+    comment_count = sum(1 for flag in comment_flags[start_idx:end_idx] if flag)
+
+    if len(pick) == 1 and letter_count < data_cfg.line_inject_min_single_len:
         if end_idx < end_limit:
             pick.append(lines[end_idx])
+            letter_count += letter_lengths[end_idx]
+            comment_count += int(comment_flags[end_idx])
             end_idx += 1
         elif start_idx > interior_start:
             start_idx -= 1
             pick.insert(0, lines[start_idx])
+            letter_count += letter_lengths[start_idx]
+            comment_count += int(comment_flags[start_idx])
 
     if has_interior:
         max_total_lines = min(len(lines) - 2, data_cfg.line_inject_max_lines)
     else:
         max_total_lines = min(len(lines), data_cfg.line_inject_max_lines)
-    min_letters = getattr(data_cfg, "line_inject_min_letters", 4)
+    min_letters = getattr(data_cfg, "line_inject_min_letters", 6)
+    threshold = _MAX_LINE_INJECT_COMMENT_RATIO
 
-    def pick_letter_count() -> int:
-        return sum(_count_letters(ln) for ln in pick)
-
-    letter_count = pick_letter_count()
     while letter_count < min_letters and len(pick) < max_total_lines:
         expanded = False
         if end_idx < end_limit and len(pick) < max_total_lines:
             pick.append(lines[end_idx])
+            letter_count += letter_lengths[end_idx]
+            comment_count += int(comment_flags[end_idx])
             end_idx += 1
             expanded = True
-            letter_count = pick_letter_count()
         if letter_count < min_letters and len(pick) < max_total_lines and start_idx > interior_start:
             start_idx -= 1
             pick.insert(0, lines[start_idx])
+            letter_count += letter_lengths[start_idx]
+            comment_count += int(comment_flags[start_idx])
             expanded = True
-            letter_count = pick_letter_count()
         if not expanded:
             break
 
-    strip_prob = getattr(data_cfg, "line_inject_strip_prob", 0.8)
-    force_strip = random.random() < strip_prob
-    w_none, w_l, w_r, w_b = data_cfg.strip_weights
-    mode = random.choices(["none", "lstrip", "rstrip", "strip"], weights=[w_none, w_l, w_r, w_b], k=1)[0]
+    comment_ratio = (comment_count / len(pick)) if pick else 1.0
+    while len(pick) < max_total_lines and comment_ratio > threshold:
+        expanded = False
+        if end_idx < end_limit and len(pick) < max_total_lines:
+            pick.append(lines[end_idx])
+            letter_count += letter_lengths[end_idx]
+            comment_count += int(comment_flags[end_idx])
+            end_idx += 1
+            expanded = True
+        if comment_ratio > threshold and len(pick) < max_total_lines and start_idx > interior_start:
+            start_idx -= 1
+            pick.insert(0, lines[start_idx])
+            letter_count += letter_lengths[start_idx]
+            comment_count += int(comment_flags[start_idx])
+            expanded = True
+        if not expanded:
+            break
+        comment_ratio = comment_count / len(pick)
+
+    if not pick or comment_ratio > threshold:
+        return ""
 
     processed = []
     for ln in pick:
-        core = ln.rstrip('\n')
-        if force_strip:
-            core = core.strip()
-        elif mode == "lstrip":
-            core = core.lstrip()
-        elif mode == "rstrip":
-            core = core.rstrip()
-        elif mode == "strip":
-            core = core.strip()
-
+        newline = '\n' if ln.endswith('\n') else ''
+        core = ln[:-1] if newline else ln
         if random.random() < data_cfg.reindent_prob:
             core = insertion_indent + core.lstrip()
-
-        processed.append(core + ('\n' if ln.endswith('\n') else ''))
+        processed.append(core + newline)
 
     block = "".join(processed)
     if _count_letters(block) < min_letters:
@@ -863,7 +1200,11 @@ def _make_line_injected_window_impl(
     if not host_text:
         return _make_pure_window_impl(dsets_by_lang, target_len, collect_meta)
 
-    donor_lids = [lid for lid in lids if lid != text_lid] if text_lid is not None else list(lids)
+    if text_lid is not None:
+        donor_lids = [lid for lid in lids if lid != text_lid]
+    else:
+        donor_lids = list(lids)
+    donor_lids = [lid for lid in donor_lids if lid not in _PROHIBITED_INJECTION_LIDS]
     chars, labs = list(host_text), [host_lid] * len(host_text)
     char_sources: Optional[List[int]] = None
     host_idx: Optional[int] = None
@@ -1014,6 +1355,437 @@ def _make_line_injected_window_impl(
         host_info = meta.get("host")
         if isinstance(host_info, dict):
             host_info.pop("sample_index", None)
+    return sanitize_tokens(x), y, meta
+
+
+def _make_markdown_window_impl(
+    dsets_by_lang: Dict[int, hfds.Dataset],
+    target_len: int,
+    data_cfg: "DataConfig",
+    collect_meta: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Optional[Dict]]:
+    text_label_id = cfg.LANG2ID.get("text", cfg.PAD_ID)
+    lids = list(dsets_by_lang.keys())
+    code_lids = [lid for lid in lids if lid != text_label_id]
+    if not code_lids:
+        return _make_mixed_window_impl(
+            dsets_by_lang,
+            target_len,
+            data_cfg.min_seg_len,
+            collect_meta,
+            data_cfg=data_cfg,
+        )
+
+    host_lid = random.choice(code_lids)
+    host_snippet, host_ex = _sample_lang_snippet(
+        dsets_by_lang,
+        host_lid,
+        max_chars=360,
+        min_letters=0,
+        strip=False,
+    )
+    if not host_snippet:
+        return _make_mixed_window_impl(
+            dsets_by_lang,
+            target_len,
+            data_cfg.min_seg_len,
+            collect_meta,
+            data_cfg=data_cfg,
+        )
+
+    block_plan: List[Dict[str, Any]] = [
+        {"lid": host_lid, "snippet": host_snippet, "ex": host_ex, "role": "host"}
+    ]
+    if len(code_lids) > 1 and random.random() < 0.65:
+        alt_candidates = [lid for lid in code_lids if lid != host_lid]
+        random.shuffle(alt_candidates)
+        for lid in alt_candidates:
+            other_snippet, other_ex = _sample_lang_snippet(
+                dsets_by_lang,
+                lid,
+                max_chars=300,
+                min_letters=0,
+                strip=False,
+            )
+            if other_snippet:
+                block_plan.append({"lid": lid, "snippet": other_snippet, "ex": other_ex, "role": "other"})
+                break
+
+    if len(block_plan) > 1 and random.random() < 0.5:
+        random.shuffle(block_plan)
+
+    text_label = text_label_id if text_label_id is not None else host_lid
+    byte_budget = target_len
+    chars: List[str] = []
+    labels: List[int] = []
+    char_sources: Optional[List[int]] = [] if collect_meta else None
+    added_code = False
+    markdown_blocks_meta: List[Dict[str, Any]] = []
+    host_sample_idx: Optional[int] = None
+    host_block_lid = host_lid
+    host_block_source: Optional[str] = None
+
+    meta = {"samples": [], "line_injections": [], "markdown_blocks": []} if collect_meta else None
+    inline_code_prob = float(getattr(data_cfg, "markdown_inline_code_prob", 0.25))
+
+    def append_markup(text: str, label: Optional[int] = None) -> None:
+        nonlocal byte_budget
+        if byte_budget <= 0:
+            return
+        cleaned = _clean_snippet_text(text)
+        trimmed, used = _trim_text_to_budget(cleaned, byte_budget)
+        if used <= 0:
+            byte_budget = 0
+            return
+        target_label = label if label is not None else text_label
+        chars.extend(list(trimmed))
+        labels.extend([target_label] * len(trimmed))
+        if char_sources is not None:
+            char_sources.extend([-1] * len(trimmed))
+        byte_budget -= used
+
+    def append_dataset_segment(
+        lid: int,
+        text: str,
+        ex: Optional[dict],
+        origin: str,
+        *,
+        mark_code: bool = False,
+        source_hint: Optional[str] = None,
+    ) -> Optional[int]:
+        nonlocal byte_budget, added_code, host_block_source
+        if byte_budget <= 0:
+            return None
+        cleaned = _clean_snippet_text(text)
+        trimmed, used = _trim_text_to_budget(cleaned, byte_budget)
+        if used <= 0:
+            byte_budget = 0
+            return None
+        sample_idx: Optional[int] = None
+        if collect_meta and meta is not None:
+            requested_bytes = len(cleaned.encode("utf-8", "ignore"))
+            entry = {
+                "origin": origin,
+                "language_id": int(lid),
+                "language": _lang_name(lid),
+                "source": source_hint or (_extract_example_source(ex) if ex else "synthetic_markdown"),
+                "requested_bytes": requested_bytes,
+                "chars": len(trimmed),
+                "preview": trimmed[:160],
+            }
+            truncation = used < requested_bytes
+            if truncation:
+                entry["truncated"] = True
+            meta["samples"].append(entry)
+            sample_idx = len(meta["samples"]) - 1
+            if origin == "markdown_code" and mark_code and host_block_source is None and lid == host_block_lid:
+                host_block_source = entry["source"]
+        chars.extend(list(trimmed))
+        labels.extend([lid] * len(trimmed))
+        if char_sources is not None:
+            idx_val = sample_idx if sample_idx is not None else -1
+            char_sources.extend([idx_val] * len(trimmed))
+        byte_budget -= used
+        if mark_code:
+            added_code = True
+        return sample_idx
+
+    def sample_text_paragraph(max_chars: int = 220) -> Tuple[str, Optional[dict], bool]:
+        snippet = ""
+        ex: Optional[dict] = None
+        if text_label_id is not None and text_label_id in dsets_by_lang:
+            snippet, ex = _sample_lang_snippet(
+                dsets_by_lang,
+                text_label_id,
+                max_chars=max_chars,
+                min_letters=12,
+                strip=True,
+            )
+        synthetic = False
+        if not snippet:
+            snippet = random.choice(_SYNTHETIC_MARKDOWN_PHRASES)
+            ex = None
+            synthetic = True
+        snippet = snippet.strip()
+        return snippet, ex, synthetic
+
+    def append_markdown_text(
+        paragraph: str,
+        paragraph_ex: Optional[dict],
+        synthetic: bool,
+        role: str,
+        *,
+        suffix: str = "",
+    ) -> None:
+        if not (paragraph or suffix):
+            return
+
+        text_source_hint = "synthetic_markdown_text" if synthetic else None
+
+        def _add_text_piece(piece: str) -> Optional[int]:
+            if not piece:
+                return None
+            idx = append_dataset_segment(
+                text_label,
+                piece,
+                paragraph_ex,
+                "markdown_text",
+                source_hint=text_source_hint,
+            )
+            if collect_meta and meta is not None and idx is not None:
+                meta["samples"][idx]["role"] = role
+            return idx
+
+        def _fallback():
+            _add_text_piece((paragraph or "") + suffix)
+
+        embed = bool(code_lids) and random.random() < inline_code_prob
+        alt_pool = [lid for lid in code_lids if lid != host_lid] or code_lids
+        if not embed or not alt_pool:
+            _fallback()
+            return
+
+        alt_lid = random.choice(alt_pool)
+        alt_snippet, alt_ex = _sample_lang_snippet(
+            dsets_by_lang,
+            alt_lid,
+            max_chars=160,
+            min_letters=0,
+            strip=True,
+        )
+        alt_clean = alt_snippet.strip() if alt_snippet else ""
+        if not alt_clean:
+            _fallback()
+            return
+
+        lang_token = _lang_name(alt_lid).replace("_", "")
+
+        code_mode = random.random()
+        pre_markup: List[str]
+        post_markup: List[str]
+        code_text: Optional[str] = None
+        spacer_after = True
+
+        if code_mode < 0.33:
+            inline_body = " ".join(alt_clean.split())
+            inline_body = inline_body.replace("`", "'")[:160]
+            if not inline_body:
+                _fallback()
+                return
+            pre_markup = ["`"]
+            post_markup = ["`"]
+            code_text = inline_body
+        elif code_mode < 0.66:
+            fenced_body = alt_snippet.strip("\n")
+            if not fenced_body:
+                _fallback()
+                return
+            if not fenced_body.endswith("\n"):
+                fenced_body += "\n"
+            pre_markup = [f"```{lang_token}\n"]
+            post_markup = ["```\n"]
+            code_text = fenced_body
+            spacer_after = False
+        else:
+            safe_snippet = alt_snippet.replace("</code>", "&lt;/code&gt;")
+            if not safe_snippet:
+                _fallback()
+                return
+            pre_markup = [f"<code class=\"language-{lang_token}\">"]
+            post_markup = ["</code>"]
+            code_text = safe_snippet
+
+        content = paragraph or ""
+        insertion = len(content) // 2
+        if insertion < len(content):
+            while insertion < len(content) and not content[insertion].isspace():
+                insertion += 1
+        if insertion >= len(content):
+            insertion = len(content) // 2
+            while insertion > 0 and not content[insertion - 1].isspace():
+                insertion -= 1
+        prefix_text = content[:insertion]
+        suffix_text = content[insertion:]
+
+        _add_text_piece(prefix_text)
+        if prefix_text and not prefix_text.endswith((" ", "\t", "\n")):
+            append_markup(" ")
+
+        for chunk in pre_markup:
+            append_markup(chunk)
+
+        code_idx = None
+        if code_text:
+            code_idx = append_dataset_segment(
+                alt_lid,
+                code_text,
+                alt_ex,
+                "markdown_inline_code",
+                mark_code=True,
+            )
+        if collect_meta and meta is not None and code_idx is not None:
+            meta["samples"][code_idx]["role"] = "inline_code"
+
+        for chunk in post_markup:
+            append_markup(chunk)
+
+        trailing = suffix_text + suffix
+        if spacer_after and trailing and not trailing[0].isspace():
+            append_markup(" ")
+        _add_text_piece(trailing)
+
+    if random.random() < 0.25:
+        if random.random() < 0.6 and code_lids:
+            stray_lid = random.choice(code_lids)
+            lang_token = _lang_name(stray_lid).replace("_", "")
+            append_markup(f"```{lang_token}\n")
+        else:
+            append_markup("```\n")
+
+    if random.random() < 0.8 and byte_budget > 0:
+        paragraph, paragraph_ex, synthetic = sample_text_paragraph()
+        suffix = "\n\n" if random.random() < 0.6 else "\n"
+        append_markdown_text(paragraph, paragraph_ex, synthetic, "intro_text", suffix=suffix)
+
+    for idx, block in enumerate(block_plan):
+        fenced = random.random() < 0.85
+        include_lang = random.random() < 0.85
+        mismatch = include_lang and random.random() < 0.2 and len(code_lids) > 1
+        fence_lang_token = ""
+        if include_lang:
+            lang_for_token = block["lid"]
+            if mismatch:
+                alt = [lid for lid in code_lids if lid != block["lid"]]
+                if alt:
+                    lang_for_token = random.choice(alt)
+            fence_lang_token = _lang_name(lang_for_token).replace("_", "")
+        if fenced:
+            fence_text = "```" + (fence_lang_token if fence_lang_token else "")
+            if random.random() < 0.3:
+                fence_text += " "
+            fence_text += "\n"
+            if random.random() < 0.1:
+                fence_text = fence_text.rstrip("\n")
+            append_markup(fence_text)
+        elif random.random() < 0.2:
+            append_markup("```\n")
+
+        snippet = block["snippet"]
+        if random.random() < 0.4:
+            snippet = snippet.strip()
+        if not snippet.endswith("\n"):
+            snippet += "\n"
+        if random.random() < 0.25:
+            snippet = "\n".join(line.rstrip() for line in snippet.splitlines()) + "\n"
+
+        sample_idx = append_dataset_segment(
+            block["lid"],
+            snippet,
+            block.get("ex"),
+            "markdown_code",
+            mark_code=True,
+        )
+        if block["role"] == "host":
+            host_sample_idx = sample_idx
+            host_block_lid = block["lid"]
+            if block.get("ex") is not None:
+                host_block_source = _extract_example_source(block["ex"])
+
+        close_added = False
+        if fenced:
+            must_close = (idx != len(block_plan) - 1) or random.random() < 0.8
+            if must_close:
+                closing = "```\n"
+                if random.random() < 0.35:
+                    closing = closing.rstrip("\n")
+                append_markup(closing)
+                close_added = True
+
+        if collect_meta and meta is not None:
+            markdown_blocks_meta.append(
+                {
+                    "order": len(markdown_blocks_meta),
+                    "language_id": int(block["lid"]),
+                    "language": _lang_name(block["lid"]),
+                    "role": block["role"],
+                    "fenced": bool(fenced),
+                    "fence_language": fence_lang_token,
+                    "closed": bool(close_added),
+                }
+            )
+
+        if idx < len(block_plan) - 1 and byte_budget > 0:
+            if random.random() < 0.75:
+                paragraph, paragraph_ex, synthetic = sample_text_paragraph(max_chars=180)
+                joiner = "\n\n" if random.random() < 0.5 else "\n"
+                append_markdown_text(paragraph, paragraph_ex, synthetic, "between_text", suffix=joiner)
+            elif random.random() < 0.3:
+                append_markup("```\n")
+
+    if byte_budget > 0 and random.random() < 0.65:
+        paragraph, paragraph_ex, synthetic = sample_text_paragraph(max_chars=200)
+        tail = "\n" if random.random() < 0.7 else ""
+        append_markdown_text(paragraph, paragraph_ex, synthetic, "outro_text", suffix=tail)
+
+    if byte_budget > 0 and random.random() < 0.3:
+        append_markup("```")
+
+    if not added_code or not chars:
+        return _make_mixed_window_impl(
+            dsets_by_lang,
+            target_len,
+            data_cfg.min_seg_len,
+            collect_meta,
+            data_cfg=data_cfg,
+        )
+
+    xb_u8, yb_u8, source_idx_bytes = _to_bytes_with_byte_labels(chars, labels, char_sources)
+    if xb_u8.size == 0:
+        return _make_mixed_window_impl(
+            dsets_by_lang,
+            target_len,
+            data_cfg.min_seg_len,
+            collect_meta,
+            data_cfg=data_cfg,
+        )
+
+    x = np.full((target_len,), cfg.PAD_BYTE_ID, dtype=np.int32)
+    y = np.full((target_len,), cfg.PAD_ID, dtype=np.uint8)
+    used = min(int(xb_u8.shape[0]), target_len)
+    x[:used] = xb_u8[:used].astype(np.int32)
+    y[:used] = yb_u8[:used]
+
+    if xb_u8.shape[0] > target_len:
+        if source_idx_bytes is not None and source_idx_bytes.size:
+            source_idx_bytes = source_idx_bytes[:target_len]
+    elif source_idx_bytes is not None and source_idx_bytes.size < target_len:
+        pad_len = target_len - source_idx_bytes.size
+        if pad_len > 0:
+            source_idx_bytes = np.concatenate(
+                [source_idx_bytes, np.full((pad_len,), -1, dtype=np.int32)]
+            )
+
+    if collect_meta and meta is not None:
+        if source_idx_bytes is not None and source_idx_bytes.size:
+            _apply_final_byte_contributions(meta, source_idx_bytes)
+        meta["markdown_blocks"] = markdown_blocks_meta
+        if host_sample_idx is not None:
+            samples_list = meta.get("samples", [])
+            final_bytes = 0
+            final_spans: List[Dict[str, int]] = []
+            if 0 <= host_sample_idx < len(samples_list):
+                final_bytes = samples_list[host_sample_idx].get("final_bytes", 0)
+                final_spans = samples_list[host_sample_idx].get("final_spans", [])
+            meta["host"] = {
+                "language_id": int(host_block_lid),
+                "language": _lang_name(host_block_lid),
+                "source": host_block_source or (_extract_example_source(host_ex) if host_ex else "synthetic_markdown"),
+                "final_bytes": final_bytes,
+                "final_spans": final_spans,
+            }
+        else:
+            meta["host"] = None
+
     return sanitize_tokens(x), y, meta
 
 

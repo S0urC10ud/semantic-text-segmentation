@@ -35,7 +35,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 import re
 
 import numpy as np
@@ -50,8 +51,16 @@ DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
 PREDICTION_LABEL_ALIASES: Dict[str, str] = {
     "c": "c_family",
     "cpp": "c_family",
+    "javascript": "javascript_typescript",
+    "typescript": "javascript_typescript",
+    "shell_batchfile": "shell",
+    "batchfile": "shell",
 }
 
+NEEDLE_COVERAGE_THRESHOLD = 0.5
+MARKDOWN_IOU_THRESHOLD = 0.5
+PAYLOAD_IOU_THRESHOLD = 0.5
+_NEEDLE_BUCKET_RE = re.compile(r"^needle_(\d+)_((\d+)|plus)$")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -60,11 +69,14 @@ TRAIN_ROOT = REPO_ROOT / "train"
 if str(TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAIN_ROOT))
 
+MARKDOWN_FENCED_LABEL = r"\`\`\` fenced \`\`\`"
+MARKDOWN_INLINE_LABEL = r"inline code (\`...\`)"
 
 import datasets as hfds  # noqa: E402
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import flax.serialization as serialization  # noqa: E402
+from flax.errors import ScopeParamShapeError  # noqa: E402
 import orbax.checkpoint as ocp  # noqa: E402
 
 from train import config as cfg  # noqa: E402
@@ -76,6 +88,26 @@ from train.metrics_helper import compute_metrics_from_confusion  # noqa: E402
 # ---------------------------------------------------------------------------
 # Checkpoint loading helpers (adapted from segment_viewer.app without CLI)
 # ---------------------------------------------------------------------------
+
+NON_ASCII_PLACEHOLDER = "\u00A4"
+_VISIBLE_ASCII_MIN = 0x20
+_VISIBLE_ASCII_MAX = 0x7E
+_ALLOWED_TEXT_CONTROLS = {"\n", "\t"}
+
+
+def normalize_eval_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    out_chars: List[str] = []
+    for ch in text:
+        if ch == "\r":
+            ch = "\n"
+        code = ord(ch)
+        if ch in _ALLOWED_TEXT_CONTROLS or _VISIBLE_ASCII_MIN <= code <= _VISIBLE_ASCII_MAX or ch == NON_ASCII_PLACEHOLDER:
+            out_chars.append(ch)
+        else:
+            out_chars.append(NON_ASCII_PLACEHOLDER)
+    return "".join(out_chars)
 
 def _looks_like_orbax_step_dir(p: Path) -> bool:
     if not p.is_dir():
@@ -313,13 +345,37 @@ class SegmenterRunner:
         self.batch_size = int(batch_size)
         self.num_classes = cfg.NUM_CLASSES
         dt = getattr(jnp, dtype)
-        self.model = UNet1D(num_classes=self.num_classes, emb_dim=model_dim, channels=tuple(channels), dtype=dt)
+        requested_channels = tuple(int(ch) for ch in channels)
         self._weight_cache: Dict[int, np.ndarray] = {}
 
-        dummy_tokens = jnp.full((1, 256), cfg.PAD_BYTE_ID, dtype=jnp.int32)
-        variables = self.model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
-        template = variables["params"]
-        self.params = _load_params_from_any(checkpoint_path, template)
+        def _initialize_with_channels(channel_values: Sequence[int]):
+            model = UNet1D(
+                num_classes=self.num_classes,
+                emb_dim=model_dim,
+                channels=tuple(int(ch) for ch in channel_values),
+                dtype=dt,
+            )
+            dummy_tokens = jnp.full((1, 256), cfg.PAD_BYTE_ID, dtype=jnp.int32)
+            variables = model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
+            template = variables["params"]
+            params = _load_params_from_any(checkpoint_path, template)
+            return model, params
+
+        try:
+            model, params = _initialize_with_channels(requested_channels)
+        except ScopeParamShapeError:
+            fallback = _load_checkpoint_hparams(Path(checkpoint_path))
+            fallback_channels = fallback.get("channels")
+            fallback_tuple: Tuple[int, ...] = tuple(int(ch) for ch in fallback_channels) if fallback_channels else ()
+            if fallback_tuple and fallback_tuple != requested_channels:
+                model, params = _initialize_with_channels(fallback_tuple)
+                requested_channels = fallback_tuple
+            else:
+                raise
+
+        self.model = model
+        self.params = params
+        self.channels = tuple(int(ch) for ch in requested_channels)
 
         def apply_fn(tokens: jnp.ndarray):
             return self.model.apply({"params": self.params}, tokens, train=False)
@@ -397,6 +453,7 @@ class SegmenterRunner:
         return out_bytes, probs_accum
 
     def segment_text(self, text: str, *, min_run_chars: int = 1) -> Tuple[List[Tuple[int, int, int]], List[int], List[np.ndarray]]:
+        text = normalize_eval_text(text)
         byte_arr = np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8)
         byte_labels, byte_probs = self._segment_bytes(byte_arr)
         char_labels, char_probs = _byte_labels_to_char_labels(text, byte_labels, byte_probs, self.num_classes)
@@ -468,6 +525,31 @@ def _prepare_dataset(
     indices.sort()
     subset = dataset.select(indices.tolist())
     return subset, original_len, max_samples, True
+
+
+def _parse_metadata(example: Dict[str, Any]) -> Dict[str, Any]:
+    raw = example.get("metadata_json")
+    if raw is None:
+        return {}
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8", "ignore")
+        except Exception:
+            return {}
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            return {}
+        except Exception:
+            return {}
+    if isinstance(raw, dict):
+        return raw
+    return {}
 
 
 def _normalize_segments(segments) -> List[Dict[str, int]]:
@@ -544,6 +626,93 @@ def _confusion_size(labels: Iterable[str]) -> Tuple[List[str], Dict[str, int]]:
     return uniq, mapping
 
 
+def _needle_bucket_key(name: str) -> Optional[Tuple[int, int]]:
+    match = _NEEDLE_BUCKET_RE.match(name)
+    if not match:
+        return None
+    low = int(match.group(1))
+    high_str = match.group(2)
+    if high_str == "plus":
+        high = int(1e9)
+    else:
+        high = int(high_str)
+    return low, high
+
+
+def _task_name_sort_key(name: str) -> Tuple[Any, ...]:
+    bucket = _needle_bucket_key(name)
+    if bucket is not None:
+        low, high = bucket
+        return ("needle", low, high)
+    return (name, 0, 0)
+
+
+def _markdown_stat_group() -> Dict[str, Any]:
+    return {
+        "count": 0,
+        "detected_correct": 0,
+        "detected_nontext": 0,
+        "detected_text": 0,
+        "truth_chars": 0,
+        "correct_chars": 0,
+        "nontext_chars": 0,
+        "text_chars": 0,
+        "iou_sum": 0.0,
+        "wrong_label_cases": 0,
+        "wrong_label_fooled": 0,
+    }
+
+
+def _safe_ratio(numerator: float, denominator: float) -> Optional[float]:
+    if denominator:
+        try:
+            value = float(numerator) / float(denominator)
+        except Exception:
+            return None
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        value = float(value)
+    except Exception:
+        return None
+    if math.isfinite(value):
+        return value
+    return None
+
+
+def _top_confusions(
+    confusion: np.ndarray,
+    label_names: Sequence[str],
+    *,
+    top_k: int = 3,
+    exclude_labels: Optional[Sequence[str]] = None,
+) -> Dict[str, List[Tuple[str, float]]]:
+    exclude_set = set(exclude_labels or [])
+    result: Dict[str, List[Tuple[str, float]]] = {}
+    for true_idx, true_label in enumerate(label_names):
+        if true_label in exclude_set:
+            continue
+        row = confusion[true_idx]
+        total = float(row.sum())
+        if total <= 0:
+            continue
+        pairs: List[Tuple[float, str]] = []
+        for pred_idx, pred_label in enumerate(label_names):
+            if pred_label == true_label:
+                continue
+            count = float(row[pred_idx])
+            if count <= 0:
+                continue
+            pairs.append((count / total, pred_label))
+        pairs.sort(key=lambda x: x[0], reverse=True)
+        result[true_label] = pairs[:top_k]
+    return result
+
+
 @dataclass
 class TaskMetrics:
     name: str
@@ -554,7 +723,7 @@ class TaskMetrics:
     label_names: List[str]
     per_label_counts: Dict[str, int] = field(default_factory=dict)
     per_label_correct: Dict[str, int] = field(default_factory=dict)
-    extras: Dict[str, float] = field(default_factory=dict)
+    extras: Dict[str, Any] = field(default_factory=dict)
 
     def overall_accuracy(self) -> float:
         total = self.confusion.sum()
@@ -629,13 +798,108 @@ def evaluate_task(
     total_chars = 0
     per_label_counts: Dict[str, int] = {label: 0 for label in label_names}
     per_label_correct: Dict[str, int] = {label: 0 for label in label_names}
+    extra_payload: Dict[str, Any] = {}
+
+    pure_stats: Optional[Dict[str, int]] = None
+    if name == "pure_fragments":
+        pure_stats = {
+            "total": 0,
+            "perfect": 0,
+            "within_threshold": 0,
+            "threshold": 0.5,
+        }
+        extra_payload["pure_fragments_purity"] = pure_stats
+
+    needle_stats: Optional[Dict[str, Any]] = None
+    if name.startswith("needle_"):
+        needle_stats = {
+            "threshold": NEEDLE_COVERAGE_THRESHOLD,
+            "total": 0,
+            "detected": 0,
+            "below_threshold": 0,
+            "correct_chars": 0,
+            "needle_chars": 0,
+            "iou_sum": 0.0,
+            "any_detection": {
+                "count": 0,
+                "detected": 0,
+                "below_threshold": 0,
+                "truth_chars": 0,
+                "correct_chars": 0,
+                "iou_sum": 0.0,
+            },
+        }
+        extra_payload["needle_detection"] = needle_stats
+
+    markdown_stats: Optional[Dict[str, Any]] = None
+    if name == "markdown_mix":
+        markdown_stats = {
+            "threshold": MARKDOWN_IOU_THRESHOLD,
+            "roles": {
+                "host": {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+                "other": {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+            },
+            "overall": {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+            "wrong_label": {"cases": 0, "fooled": 0},
+            "inline": {
+                "threshold": MARKDOWN_IOU_THRESHOLD,
+                "count": 0,
+                "correct_hits": 0,
+                "nontext_hits": 0,
+                "text_hits": 0,
+                "truth_chars": 0,
+                "correct_chars": 0,
+                "nontext_chars": 0,
+                "text_chars": 0,
+                "by_wrapper": {},
+            },
+        }
+        extra_payload["markdown_segments"] = markdown_stats
+
+    payload_stats: Optional[Dict[str, Any]] = None
+    if name == "mal_injection":
+        payload_stats = {
+            "threshold": PAYLOAD_IOU_THRESHOLD,
+            "by_lang": {},
+            "any_detection": {
+                "count": 0,
+                "detected": 0,
+                "below_threshold": 0,
+                "truth_chars": 0,
+                "correct_chars": 0,
+                "iou_sum": 0.0,
+            },
+            "any_by_lang": {},
+        }
+        extra_payload["mal_payload_detection"] = payload_stats
+
+    sequence_stats: Optional[Dict[str, Any]] = None
+    if name == "sequence_pair":
+        sequence_stats = {
+            "segments": {
+                "first": {"correct": 0, "total": 0},
+                "second": {"correct": 0, "total": 0},
+            }
+        }
+        extra_payload["sequence_purity"] = sequence_stats
+    elif name == "sequence_triplet":
+        sequence_stats = {
+            "segments": {
+                "first": {"correct": 0, "total": 0},
+                "second": {"correct": 0, "total": 0},
+                "third": {"correct": 0, "total": 0},
+            }
+        }
+        extra_payload["sequence_purity"] = sequence_stats
 
     start_time = time.perf_counter()
     log_interval = getattr(evaluate_task, "_log_interval", 0) or 0
 
     for idx, example in enumerate(dataset):
-        content = example["content"]
-        normalized_segments = _normalize_segments(example["segments"])
+        row = example if isinstance(example, dict) else dict(example)
+        raw_content = row.get("content")
+        content = normalize_eval_text(raw_content if isinstance(raw_content, str) else "")
+        normalized_segments = _normalize_segments(row.get("segments"))
         truth = _segments_to_labels(content, normalized_segments, label_to_idx)
         segments, pred_labels, _ = runner.segment_text(content, min_run_chars=min_run_chars)
         pred_idx_array = np.full((len(pred_labels),), -1, dtype=np.int32)
@@ -655,6 +919,8 @@ def evaluate_task(
         pred_valid = pred_idx_array[valid_mask]
         same_mask = (pred_valid == truth_valid)
 
+        metadata = _parse_metadata(row)
+
         valid_pred_mask = pred_valid >= 0
         np.add.at(confusion, (truth_valid[valid_pred_mask], pred_valid[valid_pred_mask]), 1)
 
@@ -668,6 +934,380 @@ def evaluate_task(
             correct = int((same_mask & mask).sum())
             per_label_correct[lbl_name] += correct
 
+        if pure_stats is not None:
+            host_label = metadata.get("host_lang")
+            if not host_label and normalized_segments:
+                host_label = normalized_segments[0].get("label")
+            host_idx = label_to_idx.get(host_label) if host_label else None
+            if host_idx is not None:
+                sample_total = int(truth_valid.shape[0])
+                label_stats = None
+                if host_label:
+                    label_stats = pure_stats.setdefault("per_label", {}).setdefault(
+                        host_label,
+                        {"total": 0, "pure": 0, "within": 0, "ratios": []},
+                    )
+                if sample_total > 0:
+                    counts = np.bincount(pred_valid, minlength=len(label_names))
+                    foreign_counts = counts.copy()
+                    foreign_counts[host_idx] = 0
+                    foreign_sum = int(foreign_counts.sum()) if foreign_counts.size else 0
+                    pure_stats["total"] += 1
+                    if label_stats is not None:
+                        label_stats["total"] += 1
+                    if foreign_sum == 0:
+                        pure_stats["perfect"] += 1
+                        if label_stats is not None:
+                            label_stats["pure"] += 1
+                    if sample_total > 0:
+                        foreign_ratio = foreign_sum / sample_total
+                        pure_stats.setdefault("foreign_ratios", []).append(foreign_ratio)
+                        if label_stats is not None:
+                            label_stats["ratios"].append(foreign_ratio)
+                        if foreign_ratio <= pure_stats["threshold"]:
+                            pure_stats["within_threshold"] += 1
+                            if label_stats is not None:
+                                label_stats["within"] += 1
+
+        if needle_stats is not None:
+            donor_label = metadata.get("donor_lang")
+            donor_idx = label_to_idx.get(donor_label) if donor_label else None
+            host_label = metadata.get("host_lang")
+            if not host_label and normalized_segments:
+                host_label = normalized_segments[0].get("label")
+            host_idx = label_to_idx.get(host_label) if host_label else None
+            if donor_idx is not None:
+                truth_mask = (truth_valid == donor_idx)
+                needle_chars = int(truth_mask.sum())
+                if needle_chars > 0:
+                    needle_stats["total"] += 1
+                    needle_stats["needle_chars"] += needle_chars
+                    threshold = float(needle_stats.get("threshold", NEEDLE_COVERAGE_THRESHOLD))
+
+                    pred_slice = pred_valid[truth_mask]
+                    if pred_slice.size > 0:
+                        mis_mask = (pred_slice != donor_idx)
+                        if np.any(mis_mask):
+                            mis_counts = np.bincount(pred_slice[mis_mask], minlength=len(label_names))
+                            mis_hist = needle_stats.setdefault("misclass_counts", [0] * len(label_names))
+                            if len(mis_hist) < len(label_names):
+                                mis_hist.extend([0] * (len(label_names) - len(mis_hist)))
+                            for lbl_idx, value in enumerate(mis_counts):
+                                if lbl_idx < len(mis_hist):
+                                    mis_hist[lbl_idx] += int(value)
+
+                    pred_mask_lang = (pred_valid == donor_idx)
+                    intersection = int(np.logical_and(pred_mask_lang, truth_mask).sum())
+                    union = int(np.logical_or(pred_mask_lang, truth_mask).sum())
+                    if union > 0:
+                        iou = intersection / union
+                        needle_stats["correct_chars"] += intersection
+                        needle_stats["iou_sum"] += iou
+                        if iou >= threshold:
+                            needle_stats["detected"] += 1
+                        else:
+                            needle_stats["below_threshold"] += 1
+
+                    any_entry = needle_stats.get("any_detection")
+                    if any_entry is not None:
+                        valid_pred_mask = (pred_valid >= 0)
+                        if host_idx is not None:
+                            foreign_mask = np.logical_and(valid_pred_mask, pred_valid != host_idx)
+                        else:
+                            foreign_mask = valid_pred_mask
+                        detection_mask = np.logical_and(foreign_mask, truth_mask)
+                        intersection_any = int(detection_mask.sum())
+                        union_any = needle_chars
+                        if union_any > 0:
+                            iou_any = intersection_any / union_any
+                            any_entry["count"] += 1
+                            any_entry["truth_chars"] += needle_chars
+                            any_entry["correct_chars"] += intersection_any
+                            any_entry["iou_sum"] += iou_any
+                            if iou_any >= threshold:
+                                any_entry["detected"] += 1
+                            else:
+                                any_entry["below_threshold"] += 1
+
+        if markdown_stats is not None:
+            threshold = float(markdown_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
+            text_idx = label_to_idx.get("text")
+            markdown_stats.setdefault("per_language", {})
+            text_stats = markdown_stats.setdefault(
+                "text",
+                {"truth_chars": 0, "correct_chars": 0, "union_chars": 0, "samples": 0},
+            )
+            if text_idx is not None:
+                text_truth_mask = (truth_valid == text_idx)
+                truth_chars_text = int(text_truth_mask.sum())
+                pred_text_mask = (pred_valid == text_idx)
+                union_text = int(np.logical_or(text_truth_mask, pred_text_mask).sum())
+                intersection_text = int(np.logical_and(text_truth_mask, pred_text_mask).sum())
+                text_stats["truth_chars"] += truth_chars_text
+                text_stats["correct_chars"] += intersection_text
+                text_stats["union_chars"] += union_text
+                if truth_chars_text or int(pred_text_mask.sum()) > 0:
+                    text_stats["samples"] += 1
+
+            blocks_meta = metadata.get("markdown_blocks") or []
+            for block in blocks_meta:
+                start = int(block.get("char_start", 0))
+                end = int(block.get("char_end", start))
+                if end <= start:
+                    continue
+                start = max(0, min(len(pred_idx_array), start))
+                end = max(start, min(len(pred_idx_array), end))
+                actual_label = block.get("language")
+                actual_idx = label_to_idx.get(actual_label)
+                if actual_idx is None or end <= start:
+                    continue
+                slice_truth = truth[start:end]
+                valid_mask_block = (slice_truth == actual_idx)
+                block_len = int(valid_mask_block.sum())
+                if block_len <= 0:
+                    continue
+                slice_pred = pred_idx_array[start:end][valid_mask_block]
+                correct_chars = int((slice_pred == actual_idx).sum())
+                if text_idx is not None:
+                    text_chars = int((slice_pred == text_idx).sum())
+                    nontext_chars = int((slice_pred != text_idx).sum())
+                else:
+                    text_chars = 0
+                    nontext_chars = correct_chars
+                coverage = correct_chars / block_len if block_len else 0.0
+                nontext_cov = nontext_chars / block_len if block_len else 0.0
+                text_cov = text_chars / block_len if block_len else 0.0
+                wrapper_key = "wrapped" if block.get("wrapped") else "plain"
+                role = block.get("role", "host")
+                role_groups = markdown_stats["roles"].setdefault(
+                    role,
+                    {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+                )
+                role_group = role_groups[wrapper_key]
+                overall_group = markdown_stats["overall"][wrapper_key]
+                lang_group = markdown_stats.setdefault("per_language", {}).setdefault(
+                    actual_label,
+                    {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+                )[wrapper_key]
+                for group in (role_group, overall_group, lang_group):
+                    group["count"] += 1
+                    group["truth_chars"] += block_len
+                    group["correct_chars"] += correct_chars
+                    group["nontext_chars"] += nontext_chars
+                    group["text_chars"] += text_chars
+                    if math.isfinite(coverage):
+                        group["iou_sum"] += coverage
+                    if coverage >= threshold:
+                        group["detected_correct"] += 1
+                    if nontext_cov >= threshold:
+                        group["detected_nontext"] += 1
+                    if text_cov >= threshold:
+                        group["detected_text"] += 1
+
+                if block.get("mismatched") and block.get("display_language"):
+                    markdown_stats["wrong_label"]["cases"] += 1
+                    wrong_label_name = block.get("display_language")
+                    wrong_idx = label_to_idx.get(wrong_label_name)
+                    fooled = False
+                    if wrong_idx is not None:
+                        fooled_chars = int((slice_pred == wrong_idx).sum())
+                        if block_len > 0 and (fooled_chars / block_len) >= threshold:
+                            fooled = True
+                    if fooled:
+                        markdown_stats["wrong_label"]["fooled"] += 1
+                    for group in (role_group, overall_group, lang_group):
+                        group["wrong_label_cases"] += 1
+                        if fooled:
+                            group["wrong_label_fooled"] += 1
+
+            inline_meta = metadata.get("inline_blocks") or []
+            inline_stats = markdown_stats["inline"]
+            inline_stats.setdefault("per_language", {})
+            inline_threshold = float(inline_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
+            for inline_block in inline_meta:
+                start = int(inline_block.get("char_start", 0))
+                end = int(inline_block.get("char_end", start))
+                if end <= start:
+                    continue
+                start = max(0, min(len(pred_idx_array), start))
+                end = max(start, min(len(pred_idx_array), end))
+                inline_label = inline_block.get("language")
+                inline_idx = label_to_idx.get(inline_label)
+                if inline_idx is None or end <= start:
+                    continue
+                slice_truth = truth[start:end]
+                valid_mask_block = (slice_truth == inline_idx)
+                block_len = int(valid_mask_block.sum())
+                if block_len <= 0:
+                    continue
+                slice_pred = pred_idx_array[start:end][valid_mask_block]
+                correct_chars = int((slice_pred == inline_idx).sum())
+                if text_idx is not None:
+                    text_chars = int((slice_pred == text_idx).sum())
+                    nontext_chars = int((slice_pred != text_idx).sum())
+                else:
+                    text_chars = 0
+                    nontext_chars = correct_chars
+                coverage = correct_chars / block_len if block_len else 0.0
+                nontext_cov = nontext_chars / block_len if block_len else 0.0
+                text_cov = text_chars / block_len if block_len else 0.0
+                inline_stats["count"] += 1
+                inline_stats["truth_chars"] += block_len
+                inline_stats["correct_chars"] += correct_chars
+                inline_stats["nontext_chars"] += nontext_chars
+                inline_stats["text_chars"] += text_chars
+                wrapper_type = inline_block.get("wrapper", "inline_backtick")
+                wrapper_entry = inline_stats["by_wrapper"].setdefault(
+                    wrapper_type,
+                    {
+                        "count": 0,
+                        "correct_hits": 0,
+                        "nontext_hits": 0,
+                        "text_hits": 0,
+                        "truth_chars": 0,
+                        "correct_chars": 0,
+                        "nontext_chars": 0,
+                        "text_chars": 0,
+                    },
+                )
+                wrapper_entry["count"] += 1
+                wrapper_entry["truth_chars"] += block_len
+                wrapper_entry["correct_chars"] += correct_chars
+                wrapper_entry["nontext_chars"] += nontext_chars
+                wrapper_entry["text_chars"] += text_chars
+                if coverage >= inline_threshold:
+                    inline_stats["correct_hits"] += 1
+                    wrapper_entry["correct_hits"] += 1
+                if nontext_cov >= inline_threshold:
+                    inline_stats["nontext_hits"] += 1
+                    wrapper_entry["nontext_hits"] += 1
+                if text_cov >= inline_threshold:
+                    inline_stats["text_hits"] += 1
+                    wrapper_entry["text_hits"] += 1
+                lang_inline = inline_stats.setdefault("per_language", {}).setdefault(
+                    inline_label,
+                    {
+                        "count": 0,
+                        "correct_hits": 0,
+                        "nontext_hits": 0,
+                        "text_hits": 0,
+                        "truth_chars": 0,
+                        "correct_chars": 0,
+                        "nontext_chars": 0,
+                        "text_chars": 0,
+                    },
+                )
+                lang_inline["count"] += 1
+                lang_inline["truth_chars"] += block_len
+                lang_inline["correct_chars"] += correct_chars
+                lang_inline["nontext_chars"] += nontext_chars
+                lang_inline["text_chars"] += text_chars
+                if coverage >= inline_threshold:
+                    lang_inline["correct_hits"] += 1
+                if nontext_cov >= inline_threshold:
+                    lang_inline["nontext_hits"] += 1
+                if text_cov >= inline_threshold:
+                    lang_inline["text_hits"] += 1
+
+        if payload_stats is not None:
+            payload_lang = metadata.get("payload_lang")
+            host_lang = metadata.get("host_lang")
+            host_idx = label_to_idx.get(host_lang) if host_lang else None
+            if payload_lang:
+                idx = label_to_idx.get(payload_lang)
+                if idx is not None:
+                    truth_mask = (truth_valid == idx)
+                    truth_chars = int(truth_mask.sum())
+                    if truth_chars > 0:
+                        threshold = float(payload_stats.get("threshold", PAYLOAD_IOU_THRESHOLD))
+                        any_entry = payload_stats.get("any_detection")
+                        if any_entry is not None:
+                            if host_idx is not None:
+                                non_host_mask = (pred_valid != host_idx)
+                            else:
+                                non_host_mask = np.ones_like(pred_valid, dtype=bool)
+                            detection_mask = np.logical_and(non_host_mask, truth_mask)
+                            intersection_any = int(detection_mask.sum())
+                            union_any = truth_chars
+                            if union_any > 0:
+                                any_entry["count"] += 1
+                                any_entry["truth_chars"] += truth_chars
+                                any_entry["correct_chars"] += intersection_any
+                                iou_any = intersection_any / union_any
+                                any_entry["iou_sum"] += iou_any
+                                if iou_any >= threshold:
+                                    any_entry["detected"] += 1
+                                else:
+                                    any_entry["below_threshold"] += 1
+                                lang_any_entry = payload_stats.setdefault("any_by_lang", {}).setdefault(
+                                    payload_lang,
+                                    {
+                                        "count": 0,
+                                        "detected": 0,
+                                        "below_threshold": 0,
+                                        "truth_chars": 0,
+                                        "correct_chars": 0,
+                                        "iou_sum": 0.0,
+                                    },
+                                )
+                                lang_any_entry["count"] += 1
+                                lang_any_entry["truth_chars"] += truth_chars
+                                lang_any_entry["correct_chars"] += intersection_any
+                                lang_any_entry["iou_sum"] += iou_any
+                                if iou_any >= threshold:
+                                    lang_any_entry["detected"] += 1
+                                else:
+                                    lang_any_entry["below_threshold"] += 1
+
+                        pred_mask = (pred_valid == idx)
+                        intersection = int(np.logical_and(truth_mask, pred_mask).sum())
+                        union = int(np.logical_or(truth_mask, pred_mask).sum())
+                        if union <= 0:
+                            continue
+                        entry = payload_stats["by_lang"].setdefault(
+                            payload_lang,
+                            {
+                                "count": 0,
+                                "detected": 0,
+                                "below_threshold": 0,
+                                "truth_chars": 0,
+                                "correct_chars": 0,
+                                "iou_sum": 0.0,
+                            },
+                        )
+                        entry["count"] += 1
+                        entry["truth_chars"] += truth_chars
+                        entry["correct_chars"] += intersection
+                        iou = intersection / union
+                        entry["iou_sum"] += iou
+                        if iou >= threshold:
+                            entry["detected"] += 1
+                        else:
+                            entry["below_threshold"] += 1
+
+        if sequence_stats is not None:
+            segments_info = sequence_stats["segments"]
+            pairs: List[Tuple[str, Optional[str]]] = []
+            if "first" in segments_info:
+                pairs.append(("first", metadata.get("first_lang")))
+            if "second" in segments_info:
+                pairs.append(("second", metadata.get("second_lang")))
+            if "third" in segments_info:
+                pairs.append(("third", metadata.get("third_lang")))
+            for pos_key, lang in pairs:
+                if not lang:
+                    continue
+                idx = label_to_idx.get(lang)
+                if idx is None:
+                    continue
+                truth_mask = (truth_valid == idx)
+                total_chars_seg = int(truth_mask.sum())
+                if total_chars_seg == 0:
+                    continue
+                correct_chars_seg = int(np.logical_and(pred_valid == idx, truth_mask).sum())
+                segments_info[pos_key]["total"] += total_chars_seg
+                segments_info[pos_key]["correct"] += correct_chars_seg
+
         if log_interval > 0 and ((idx + 1) % log_interval == 0 or (idx + 1) == total_samples):
             elapsed = time.perf_counter() - start_time
             rate = (idx + 1) / elapsed if elapsed > 0 else 0.0
@@ -678,6 +1318,7 @@ def evaluate_task(
             )
 
     elapsed_total = time.perf_counter() - start_time
+    extra_payload["elapsed_seconds"] = elapsed_total
 
     return TaskMetrics(
         name=name,
@@ -688,7 +1329,7 @@ def evaluate_task(
         label_names=label_names,
         per_label_counts=per_label_counts,
         per_label_correct=per_label_correct,
-        extras={"elapsed_seconds": elapsed_total},
+        extras=extra_payload,
     )
 
 
@@ -751,7 +1392,16 @@ def measure_throughput(
             except Exception:
                 pass
     if total_bytes <= 0:
-        total_bytes = int(sum(len(example["content"].encode("utf-8", "ignore")) for example in dataset))
+        total_bytes = int(
+            sum(
+                len(
+                    normalize_eval_text(
+                        row.get("content") if isinstance(row, dict) else row["content"]
+                    ).encode("utf-8", "ignore")
+                )
+                for row in dataset
+            )
+        )
 
     devices = jax.devices()
     device = devices[0]
@@ -765,11 +1415,15 @@ def measure_throughput(
 
     # Warm-up with first example to trigger compilation
     warm_example = dataset[0]
-    runner.segment_text(warm_example["content"], min_run_chars=min_run_chars)
+    warm_text = normalize_eval_text(
+        warm_example.get("content") if isinstance(warm_example, dict) else warm_example["content"]
+    )
+    runner.segment_text(warm_text, min_run_chars=min_run_chars)
 
     start = time.perf_counter()
     for example in dataset:
-        runner.segment_text(example["content"], min_run_chars=min_run_chars)
+        text = normalize_eval_text(example.get("content") if isinstance(example, dict) else example["content"])
+        runner.segment_text(text, min_run_chars=min_run_chars)
     elapsed = time.perf_counter() - start
 
     rss_after = _process_rss_mb()
@@ -805,74 +1459,148 @@ def _extract_run_id_from_checkpoint(path: Path) -> Optional[str]:
 
 
 def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
-    run_id = _extract_run_id_from_checkpoint(ckpt_path)
-    if not run_id:
-        return {}
-    wandb_root = REPO_ROOT / "train" / "wandb"
-    if not wandb_root.exists():
-        return {}
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        return {}
-    pattern = f"run-*-{run_id}"
-    for run_dir in wandb_root.glob(pattern):
-        config_path = run_dir / "files" / "config.yaml"
-        if not config_path.exists():
-            continue
-        try:
-            config_data = yaml.safe_load(config_path.read_text())
-        except Exception:
-            continue
-        result: Dict[str, Any] = {}
-        if isinstance(config_data, dict):
-            channels_val = config_data.get("channels", {}).get("value")
-            if isinstance(channels_val, (list, tuple)):
-                try:
-                    result["channels"] = [int(x) for x in channels_val]
-                except (TypeError, ValueError):
-                    pass
-            model_dim_val = config_data.get("model_dim", {}).get("value")
-            if isinstance(model_dim_val, (int, float)):
-                result["model_dim"] = int(model_dim_val)
-            dtype_val = config_data.get("dtype", {}).get("value")
-            if isinstance(dtype_val, str):
-                result["dtype"] = dtype_val.rsplit(".", 1)[-1]
+    result: Dict[str, Any] = {}
 
-        summary_path = run_dir / "files" / "wandb-summary.json"
-        if summary_path.exists():
+    run_id = _extract_run_id_from_checkpoint(ckpt_path)
+    if run_id:
+        wandb_root = REPO_ROOT / "train" / "wandb"
+        if wandb_root.exists():
             try:
-                summary_data = json.loads(summary_path.read_text())
+                import yaml  # type: ignore
             except Exception:
-                summary_data = None
-            if isinstance(summary_data, dict):
-                label_names: Dict[int, str] = {}
-                prefix = "val/per_class/"
-                for key in summary_data.keys():
-                    if not key.startswith(prefix):
-                        continue
-                    remainder = key[len(prefix):]
-                    head = remainder.split("/", 1)[0]
-                    if "_" not in head:
-                        continue
-                    idx_str, label = head.split("_", 1)
-                    try:
-                        idx = int(idx_str)
-                    except ValueError:
-                        continue
-                    label_names[idx] = label
-                if label_names:
-                    ordered = [label_names[i] for i in sorted(label_names)]
-                    result["label_names"] = ordered
-        if result:
-            return result
-    return {}
+                yaml = None  # type: ignore
+            else:
+                pattern = f"run-*-{run_id}"
+                for run_dir in wandb_root.glob(pattern):
+                    config_path = run_dir / "files" / "config.yaml"
+                    if config_path.exists():
+                        try:
+                            config_data = yaml.safe_load(config_path.read_text())
+                        except Exception:
+                            config_data = None
+                        if isinstance(config_data, dict):
+                            channels_val = config_data.get("channels", {}).get("value")
+                            if isinstance(channels_val, (list, tuple)):
+                                try:
+                                    result["channels"] = [int(x) for x in channels_val]
+                                except (TypeError, ValueError):
+                                    pass
+                            model_dim_val = config_data.get("model_dim", {}).get("value")
+                            if isinstance(model_dim_val, (int, float)):
+                                result["model_dim"] = int(model_dim_val)
+                            dtype_val = config_data.get("dtype", {}).get("value")
+                            if isinstance(dtype_val, str):
+                                result["dtype"] = dtype_val.rsplit(".", 1)[-1]
+
+                    summary_path = run_dir / "files" / "wandb-summary.json"
+                    if summary_path.exists():
+                        try:
+                            summary_data = json.loads(summary_path.read_text())
+                        except Exception:
+                            summary_data = None
+                        if isinstance(summary_data, dict):
+                            label_names: Dict[int, str] = {}
+                            prefix = "val/per_class/"
+                            for key in summary_data.keys():
+                                if not key.startswith(prefix):
+                                    continue
+                                remainder = key[len(prefix):]
+                                head = remainder.split("/", 1)[0]
+                                if "_" not in head:
+                                    continue
+                                idx_str, label = head.split("_", 1)
+                                try:
+                                    idx = int(idx_str)
+                                except ValueError:
+                                    continue
+                                label_names[idx] = label
+                            if label_names:
+                                ordered = [label_names[i] for i in sorted(label_names)]
+                                result["label_names"] = ordered
+
+                    if result and "channels" in result:
+                        break
+
+                if "channels" not in result:
+                    wandb_bundles = list(
+                        wandb_root.glob(f"run-*-{run_id}/run-{run_id}.wandb")
+                    )
+                    for bundle in wandb_bundles:
+                        try:
+                            bundle_bytes = bundle.read_bytes()
+                        except Exception:
+                            continue
+                        match = re.search(rb"channels[^\[]*[\[%]([0-9,\s]+)\]", bundle_bytes)
+                        if match:
+                            chan_vals = [
+                                int(x.strip()) for x in match.group(1).split(b",") if x.strip()
+                            ]
+                            if chan_vals:
+                                result["channels"] = chan_vals
+                                break
+                if "channels" in result:
+                    return result
+
+    if "channels" in result:
+        return result
+
+    # Fallback: infer from checkpoint weights directly.
+    try:
+        from flax.serialization import msgpack_restore
+
+        raw = ckpt_path.read_bytes()
+        params = msgpack_restore(raw)
+        tree = params.get("params") if isinstance(params, Mapping) else None
+        if tree is None and isinstance(params, Mapping):
+            tree = params
+        embed = None
+        if isinstance(tree, Mapping):
+            embed_node = tree.get("Embed_0")
+            if isinstance(embed_node, Mapping):
+                embed = embed_node.get("embedding")
+        if embed is not None and hasattr(embed, "shape"):
+            result["model_dim"] = int(embed.shape[1])
+
+        inferred = _infer_channels_from_params_tree(tree) if isinstance(tree, Mapping) else None
+        if inferred:
+            result["channels"] = inferred
+    except Exception:
+        pass
+
+    return result
 
 
 def _apply_label_mapping(label_names: Sequence[str]) -> None:
     cfg.LANG2ID.clear()
     cfg.LANG2ID.update({name: idx for idx, name in enumerate(label_names)})
     cfg.update_lang_mappings()
+
+
+def _infer_channels_from_params_tree(params: Mapping[str, Any]) -> Optional[Tuple[int, ...]]:
+    if not isinstance(params, Mapping):
+        return None
+    channels: List[int] = []
+    idx = 0
+    while True:
+        key = f"ConvBlock1D_{idx}"
+        block = params.get(key)
+        if not isinstance(block, Mapping):
+            break
+        conv = block.get("Conv_0")
+        if not isinstance(conv, Mapping):
+            break
+        kernel = conv.get("kernel")
+        if not hasattr(kernel, "shape") or len(getattr(kernel, "shape", ())) != 3:
+            break
+        out_ch = int(kernel.shape[-1])
+        if not channels:
+            channels.append(out_ch)
+        elif out_ch > channels[-1]:
+            channels.append(out_ch)
+        elif out_ch < channels[-1]:
+            break
+        idx += 1
+    return tuple(channels) if channels else None
 
 
 def _format_bytes_per_sec(value: float) -> str:
@@ -893,7 +1621,12 @@ def _render_metrics_table(metrics: TaskMetrics) -> str:
         correct = metrics.per_label_correct.get(label, 0)
         acc = (correct / support) if support else float("nan")
         rows.append((label, support, acc))
-    rows.sort(key=lambda r: (-r[1], r[0]))
+    def sort_key(row):
+        label, support, acc = row
+        if math.isnan(acc):
+            return (1, 0.0, -support, label)
+        return (0, -acc, -support, label)
+    rows.sort(key=sort_key)
     lines = ["| Label | Support | Accuracy |", "| --- | ---: | ---: |"]
     for label, support, acc in rows:
         acc_str = "nan" if math.isnan(acc) else f"{acc:.4f}"
@@ -901,16 +1634,255 @@ def _render_metrics_table(metrics: TaskMetrics) -> str:
     return "\n".join(lines)
 
 
-def _render_summary_table(task_metrics: List[TaskMetrics]) -> str:
-    lines = ["| Task | Samples | Characters | Char Acc | Macro Recall |", "| --- | ---: | ---: | ---: | ---: |"]
-    for metrics in task_metrics:
-        per_class, aggregates = compute_metrics_from_confusion(metrics.confusion.astype(np.int64), len(metrics.label_names), ignore_class=None)
-        char_acc = metrics.overall_accuracy()
-        macro_rec = aggregates["macro"]["recall"]
-        lines.append(
-            f"| {metrics.name} | {metrics.samples} | {metrics.total_chars} | {char_acc:.4f} | {macro_rec:.4f} |"
+def _format_pct(value: Optional[float], *, digits: int = 1) -> str:
+    if value is None or not math.isfinite(value):
+        return "n/a"
+    digits = max(0, int(digits))
+    return f"{value * 100:.{digits}f}%"
+
+
+def _format_float(value: Optional[float], *, digits: int = 2) -> str:
+    if value is None or not math.isfinite(value):
+        return "n/a"
+    return f"{value:.{digits}f}"
+
+
+def _format_hits(hits: int, total: int) -> str:
+    if total <= 0:
+        return "—"
+    return f"{hits}/{total}"
+
+
+def _summarize_confusions(
+    metrics: TaskMetrics,
+    *,
+    limit: int = 5,
+    min_rate: float = 0.05,
+    min_count: int = 5,
+) -> str:
+    entries: List[Tuple[int, float, str, str]] = []
+    confusion = metrics.confusion
+    for true_idx, true_label in enumerate(metrics.label_names):
+        row_total = int(confusion[true_idx].sum())
+        if row_total <= 0:
+            continue
+        for pred_idx, pred_label in enumerate(metrics.label_names):
+            if pred_idx == true_idx:
+                continue
+            count = int(confusion[true_idx, pred_idx])
+            if count <= 0:
+                continue
+            rate = count / row_total
+            entries.append((count, rate, true_label, pred_label))
+    if not entries:
+        return "none"
+    entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    filtered = [item for item in entries if item[0] >= min_count or item[1] >= min_rate]
+    chosen = filtered[:limit] if filtered else entries[:limit]
+    return ", ".join(f"{true}->{pred} {count} ({rate * 100:.1f}%)" for count, rate, true, pred in chosen)
+
+
+def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
+    metrics_by_name = {m.name: m for m in task_metrics}
+    sections: List[str] = []
+
+    def add_section(title: str, body_lines: List[str]) -> None:
+        sections.append(f"##### {title}")
+        sections.extend(body_lines)
+        if not body_lines or body_lines[-1] != "":
+            sections.append("")
+
+    # mal_injection summary
+    mal_metrics = metrics_by_name.get("mal_injection")
+    if mal_metrics:
+        payload_stats = mal_metrics.extras.get("mal_payload_detection", {}) if mal_metrics.extras else {}
+        any_stats = payload_stats.get("any_detection", {})
+        any_total = int(any_stats.get("count", 0))
+        any_detected = int(any_stats.get("detected", 0))
+        any_truth = int(any_stats.get("truth_chars", 0))
+        any_correct = int(any_stats.get("correct_chars", 0))
+        any_avg_iou = _safe_ratio(any_stats.get("iou_sum", 0.0), any_total)
+        any_cov = _format_pct(_safe_ratio(any_correct, any_truth))
+
+        by_lang = payload_stats.get("by_lang", {})
+        correct_total = sum(int(entry.get("count", 0)) for entry in by_lang.values())
+        correct_detected = sum(int(entry.get("detected", 0)) for entry in by_lang.values())
+        correct_truth = sum(int(entry.get("truth_chars", 0)) for entry in by_lang.values())
+        correct_chars = sum(int(entry.get("correct_chars", 0)) for entry in by_lang.values())
+        correct_avg_iou = _safe_ratio(
+            sum(float(entry.get("iou_sum", 0.0)) for entry in by_lang.values()),
+            correct_total,
         )
-    return "\n".join(lines)
+        correct_cov = _format_pct(_safe_ratio(correct_chars, correct_truth))
+
+        table_lines = [
+            "| Scenario | IoU ≥50% | Coverage |",
+            "| --- | --- | --- |",
+            f"| Any non-wrapper | {_format_hits(any_detected, any_total)} (mean {_format_float(any_avg_iou)}) | {any_cov} |",
+            f"| Correct payload | {_format_hits(correct_detected, correct_total)} (mean {_format_float(correct_avg_iou)}) | {correct_cov} |",
+        ]
+        add_section("mal_injection", table_lines)
+
+    # markdown highlight
+    markdown_metrics = metrics_by_name.get("markdown_mix")
+    if markdown_metrics:
+        md_stats = markdown_metrics.extras.get("markdown_segments", {}) if markdown_metrics.extras else {}
+        overall = md_stats.get("overall", {})
+        inline_stats = md_stats.get("inline", {})
+        wrong = md_stats.get("wrong_label", {})
+
+        text_stats_overall = md_stats.get("text", {})
+
+        def _wrapper_row(name: str, group: Dict[str, Any]) -> str:
+            count = int(group.get("count", 0))
+            if count <= 0:
+                return f"| {name} | — | — | — | n/a | n/a |"
+            nontext_hits = int(group.get("detected_nontext", 0))
+            text_hits = int(group.get("detected_text", 0))
+            correct_hits = int(group.get("detected_correct", 0))
+            truth_chars = int(group.get("truth_chars", 0))
+            nontext_chars = int(group.get("nontext_chars", 0))
+            correct_chars = int(group.get("correct_chars", 0))
+            nontext_cov = _format_pct(_safe_ratio(nontext_chars, truth_chars))
+            correct_cov = _format_pct(_safe_ratio(correct_chars, truth_chars))
+            return (
+                f"| {name} | {_format_hits(nontext_hits, count)} | {_format_hits(text_hits, count)} | "
+                f"{_format_hits(correct_hits, count)} | {nontext_cov} | {correct_cov} |"
+            )
+
+        wrapper_table = [
+            "| Wrapper | Non-text hits | Text hits | Correct hits | Non-text coverage | Correct coverage |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+            _wrapper_row(MARKDOWN_FENCED_LABEL, overall.get("wrapped", {})),
+            _wrapper_row("bare code", overall.get("plain", {})),
+        ]
+
+        inline_count = int(inline_stats.get("count", 0))
+        if inline_count > 0:
+            inline_nontext = int(inline_stats.get("nontext_hits", 0))
+            inline_text = int(inline_stats.get("text_hits", 0))
+            inline_correct = int(inline_stats.get("correct_hits", 0))
+            inline_truth = int(inline_stats.get("truth_chars", 0))
+            inline_nontext_cov = _format_pct(
+                _safe_ratio(int(inline_stats.get("nontext_chars", 0)), inline_truth)
+            )
+            inline_correct_cov = _format_pct(
+                _safe_ratio(int(inline_stats.get("correct_chars", 0)), inline_truth)
+            )
+            wrapper_table.append(
+                f"| {MARKDOWN_INLINE_LABEL} | {_format_hits(inline_nontext, inline_count)} | {_format_hits(inline_text, inline_count)} | "
+                f"{_format_hits(inline_correct, inline_count)} | {inline_nontext_cov} | {inline_correct_cov} |"
+            )
+
+        text_cov_line = None
+        text_truth = int(text_stats_overall.get("truth_chars", 0))
+        if text_truth > 0:
+            text_cov_line = f"Text coverage (IoU ≥50%): {_format_pct(_safe_ratio(text_stats_overall.get('correct_chars', 0), text_truth))}"
+            wrapper_table.append("")
+            wrapper_table.append(text_cov_line)
+
+        wrong_cases = int(wrong.get("cases", 0))
+        fooled = int(wrong.get("fooled", 0))
+        summary_table = [
+            "| Metric | Value |",
+            "| --- | --- |",
+        ]
+        roles = md_stats.get("roles", {})
+        for role_key, role_label in (("host", "Host"), ("other", "Other")):
+            for wrapper_key, wrapper_label in (("wrapped", "fenced"), ("plain", "bare")):
+                group = roles.get(role_key, {}).get(wrapper_key, {})
+                count = int(group.get("count", 0))
+                hits = int(group.get("detected_correct", 0))
+                avg_iou = _safe_ratio(group.get("iou_sum", 0.0), count)
+                truth_chars = int(group.get("truth_chars", 0))
+                correct_chars = int(group.get("correct_chars", 0))
+                coverage = _format_pct(_safe_ratio(correct_chars, truth_chars))
+                summary_table.append(
+                    f"| {role_label} {wrapper_label} IoU ≥50% | {_format_hits(hits, count)} hits, mean IoU {_format_float(avg_iou)}, coverage {coverage} |"
+                )
+
+        if wrong_cases > 0:
+            summary_table.append(
+                f"| Wrong fence label fooled | {_format_hits(fooled, wrong_cases)} cases |"
+            )
+
+        add_section("markdown_mix", wrapper_table + [""] + summary_table)
+
+    # pure fragments highlight
+    pure_metrics = metrics_by_name.get("pure_fragments")
+    if pure_metrics:
+        pure_stats = pure_metrics.extras.get("pure_fragments_purity", {}) if pure_metrics.extras else {}
+        total = int(pure_stats.get("total", 0))
+        perfect = int(pure_stats.get("perfect", 0))
+        within = int(pure_stats.get("within_threshold", perfect))
+        threshold = float(pure_stats.get("threshold", 0.5))
+        ratios = pure_stats.get("foreign_ratios", [])
+        summary_lines = [
+            f"{perfect}/{total} samples stayed fully pure (no foreign chars). "
+            f"{within}/{total} stayed within ≤{threshold:.0%} foreign coverage.",
+        ]
+        if ratios:
+            mean_ratio = float(sum(ratios)) / max(1, len(ratios))
+            expected_bytes = mean_ratio * 1536
+            summary_lines.append(
+                f"Expected foreign bytes for a 1536-byte fragment: {expected_bytes:.1f}/1536"
+            )
+        add_section("pure_fragments", summary_lines)
+
+    # sequence tasks
+    for name in ("sequence_pair", "sequence_triplet"):
+        seq_metrics = metrics_by_name.get(name)
+        if not seq_metrics:
+            continue
+        seq_stats = seq_metrics.extras.get("sequence_purity", {}) if seq_metrics.extras else {}
+        segments = seq_stats.get("segments", {})
+        segment_lines: List[str] = []
+        for key in ("first", "second", "third"):
+            data = segments.get(key)
+            if not data:
+                continue
+            total = int(data.get("total", 0))
+            correct = int(data.get("correct", 0))
+            coverage = _format_pct(correct / total) if total > 0 else "n/a"
+            segment_lines.append(f"{key.title()} segment coverage {coverage}")
+        if segment_lines:
+            add_section(name, segment_lines)
+
+    # needle buckets (largest first)
+    needle_metrics = [
+        m for m in task_metrics if _needle_bucket_key(m.name) is not None
+    ]
+    if needle_metrics:
+        needle_metrics.sort(
+            key=lambda m: (_needle_bucket_key(m.name) or (0, 0))[0],
+            reverse=True,
+        )
+        table_lines = [
+            "| Bucket | Donor IoU ≥50% | Donor avg IoU | Donor coverage | Any IoU ≥50% | Any avg IoU | Any coverage |",
+            "| --- | --- | ---: | ---: | --- | ---: | ---: |",
+        ]
+        for m in needle_metrics:
+            stats = m.extras.get("needle_detection", {}) if m.extras else {}
+            total = int(stats.get("total", 0))
+            detected = int(stats.get("detected", 0))
+            avg_iou = _safe_ratio(stats.get("iou_sum", 0.0), total)
+            truth_chars = int(stats.get("needle_chars", 0))
+            correct_chars = int(stats.get("correct_chars", 0))
+            coverage = _format_pct(_safe_ratio(correct_chars, truth_chars))
+            any_stats = stats.get("any_detection", {})
+            any_count = int(any_stats.get("count", 0))
+            any_detected = int(any_stats.get("detected", 0))
+            any_avg = _safe_ratio(any_stats.get("iou_sum", 0.0), any_count)
+            any_truth = int(any_stats.get("truth_chars", 0))
+            any_correct = int(any_stats.get("correct_chars", 0))
+            any_cov = _format_pct(_safe_ratio(any_correct, any_truth))
+            table_lines.append(
+                f"| {m.name} | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage} | "
+                f"{_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | {any_cov} |"
+            )
+        add_section("needle buckets", table_lines)
+
+    return sections
 
 
 def _render_throughput_table(results: List[ThroughputResult]) -> str:
@@ -932,6 +1904,308 @@ def _render_throughput_table(results: List[ThroughputResult]) -> str:
     return "\n".join(lines)
 
 
+def _comparison_key_from_checkpoint(checkpoint_path: str) -> str:
+    parsed = urlparse(checkpoint_path)
+    if parsed.scheme and parsed.scheme != "file":
+        candidate = (parsed.netloc + parsed.path) or checkpoint_path
+    else:
+        candidate = checkpoint_path
+    candidate = candidate.rstrip("/").split("/")[-1] or candidate
+    if "." in candidate:
+        candidate = candidate.rsplit(".", 1)[0]
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", candidate)
+    return sanitized or "model"
+
+
+def _collect_comparison_metrics(args, task_metrics: List[TaskMetrics], throughput_results: List[ThroughputResult]) -> Dict[str, Any]:
+    metrics_by_name = {m.name: m for m in task_metrics}
+    data: Dict[str, Any] = {
+        "meta": {
+            "checkpoint": args.checkpoint,
+            "model_dim": args.model_dim,
+            "channels": list(args.channels) if isinstance(args.channels, (list, tuple)) else args.channels,
+            "dtype": args.dtype,
+            "sample_seed": args.sample_seed,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+        "tasks": {},
+    }
+
+    # Malicious injections -------------------------------------------------
+    mal_metrics = metrics_by_name.get("mal_injection")
+    if mal_metrics and mal_metrics.extras:
+        payload_stats = mal_metrics.extras.get("mal_payload_detection", {})
+        any_stats = payload_stats.get("any_detection", {})
+        by_lang = payload_stats.get("by_lang", {})
+        any_by_lang = payload_stats.get("any_by_lang", {})
+
+        payload_total = sum(entry.get("count", 0) for entry in by_lang.values())
+        payload_detected = sum(entry.get("detected", 0) for entry in by_lang.values())
+        payload_iou_sum = sum(entry.get("iou_sum", 0.0) for entry in by_lang.values())
+        payload_correct_chars = sum(entry.get("correct_chars", 0) for entry in by_lang.values())
+        payload_truth_chars = sum(entry.get("truth_chars", 0) for entry in by_lang.values())
+
+        result = {
+            "inj.payload.det_rate@0.5": _float_or_none(_safe_ratio(payload_detected, payload_total)),
+            "inj.payload.mean_iou": _float_or_none(_safe_ratio(payload_iou_sum, payload_total)),
+            "inj.any.det_rate@0.5": _float_or_none(_safe_ratio(any_stats.get("detected", 0), any_stats.get("count", 0))),
+            "inj.any.mean_iou": _float_or_none(_safe_ratio(any_stats.get("iou_sum", 0.0), any_stats.get("count", 0))),
+        }
+
+        payload_cov = _safe_ratio(payload_correct_chars, payload_truth_chars)
+        if payload_cov is not None:
+            result["inj.payload.coverage"] = _float_or_none(payload_cov)
+        any_cov = _safe_ratio(any_stats.get("correct_chars", 0), any_stats.get("truth_chars", 0))
+        if any_cov is not None:
+            result["inj.any.coverage"] = _float_or_none(any_cov)
+
+        per_lang: Dict[str, Any] = {}
+        for lang, entry in sorted(by_lang.items()):
+            per_lang[lang] = {
+                "det_rate@0.5": _float_or_none(_safe_ratio(entry.get("detected", 0), entry.get("count", 0))),
+                "mean_iou": _float_or_none(_safe_ratio(entry.get("iou_sum", 0.0), entry.get("count", 0))),
+                "coverage": _float_or_none(_safe_ratio(entry.get("correct_chars", 0), entry.get("truth_chars", 0))),
+                "support": int(entry.get("count", 0)),
+            }
+        if per_lang:
+            result["per_language_correct"] = per_lang
+
+        per_lang_any: Dict[str, Any] = {}
+        for lang, entry in sorted(any_by_lang.items()):
+            per_lang_any[lang] = {
+                "det_rate@0.5": _float_or_none(_safe_ratio(entry.get("detected", 0), entry.get("count", 0))),
+                "mean_iou": _float_or_none(_safe_ratio(entry.get("iou_sum", 0.0), entry.get("count", 0))),
+                "coverage": _float_or_none(_safe_ratio(entry.get("correct_chars", 0), entry.get("truth_chars", 0))),
+                "support": int(entry.get("count", 0)),
+            }
+        if per_lang_any:
+            result["per_language_any"] = per_lang_any
+
+        data["tasks"]["mal_injection"] = result
+
+    # Markdown -------------------------------------------------------------
+    markdown_metrics = metrics_by_name.get("markdown_mix")
+    if markdown_metrics and markdown_metrics.extras:
+        md_stats = markdown_metrics.extras.get("markdown_segments", {})
+        md_data: Dict[str, Any] = {}
+
+        per_language = md_stats.get("per_language", {})
+        plain_per_lang: Dict[str, Any] = {}
+        wrapped_per_lang: Dict[str, Any] = {}
+        for lang, groups in per_language.items():
+            for wrapper_key, target_dict in (("plain", plain_per_lang), ("wrapped", wrapped_per_lang)):
+                group = groups.get(wrapper_key, {})
+                count = int(group.get("count", 0))
+                if count <= 0:
+                    continue
+                target_dict[lang] = {
+                    "det_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_correct", 0), count)),
+                    "coverage": _float_or_none(_safe_ratio(group.get("correct_chars", 0), group.get("truth_chars", 0))),
+                    "nontext_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_nontext", 0), count)),
+                    "nontext_coverage": _float_or_none(_safe_ratio(group.get("nontext_chars", 0), group.get("truth_chars", 0))),
+                    "text_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_text", 0), count)),
+                    "text_coverage": _float_or_none(_safe_ratio(group.get("text_chars", 0), group.get("truth_chars", 0))),
+                    "support": count,
+                }
+        block_section: Dict[str, Any] = {}
+        overall_block = {}
+        for key, label in (("plain", "plain"), ("wrapped", "fenced")):
+            group = md_stats.get("overall", {}).get(key, {})
+            count = int(group.get("count", 0))
+            if count <= 0:
+                continue
+            overall_block[label] = {
+                "det_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_correct", 0), count)),
+                "coverage": _float_or_none(_safe_ratio(group.get("correct_chars", 0), group.get("truth_chars", 0))),
+                "nontext_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_nontext", 0), count)),
+                "nontext_coverage": _float_or_none(_safe_ratio(group.get("nontext_chars", 0), group.get("truth_chars", 0))),
+                "text_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_text", 0), count)),
+                "text_coverage": _float_or_none(_safe_ratio(group.get("text_chars", 0), group.get("truth_chars", 0))),
+                "support": count,
+            }
+        if overall_block:
+            block_section["overall"] = overall_block
+        if wrapped_per_lang:
+            block_section["fenced_per_language"] = wrapped_per_lang
+        if plain_per_lang:
+            block_section["plain_per_language"] = plain_per_lang
+        if block_section:
+            md_data["block"] = block_section
+
+        inline_stats = md_stats.get("inline", {})
+        inline_per_lang = inline_stats.get("per_language", {})
+        inline_section: Dict[str, Any] = {}
+        inline_count = int(inline_stats.get("count", 0))
+        if inline_count > 0:
+            inline_section["overall"] = {
+                "det_rate@0.5": _float_or_none(_safe_ratio(inline_stats.get("correct_hits", 0), inline_count)),
+                "coverage": _float_or_none(_safe_ratio(inline_stats.get("correct_chars", 0), inline_stats.get("truth_chars", 0))),
+                "nontext_rate@0.5": _float_or_none(_safe_ratio(inline_stats.get("nontext_hits", 0), inline_count)),
+                "nontext_coverage": _float_or_none(_safe_ratio(inline_stats.get("nontext_chars", 0), inline_stats.get("truth_chars", 0))),
+                "text_rate@0.5": _float_or_none(_safe_ratio(inline_stats.get("text_hits", 0), inline_count)),
+                "text_coverage": _float_or_none(_safe_ratio(inline_stats.get("text_chars", 0), inline_stats.get("truth_chars", 0))),
+                "support": inline_count,
+            }
+        if inline_per_lang:
+            inline_data = {}
+            for lang, entry in inline_per_lang.items():
+                count = int(entry.get("count", 0))
+                if count <= 0:
+                    continue
+                inline_data[lang] = {
+                    "det_rate@0.5": _float_or_none(_safe_ratio(entry.get("correct_hits", 0), count)),
+                    "coverage": _float_or_none(_safe_ratio(entry.get("correct_chars", 0), entry.get("truth_chars", 0))),
+                    "nontext_rate@0.5": _float_or_none(_safe_ratio(entry.get("nontext_hits", 0), count)),
+                    "nontext_coverage": _float_or_none(_safe_ratio(entry.get("nontext_chars", 0), entry.get("truth_chars", 0))),
+                    "text_rate@0.5": _float_or_none(_safe_ratio(entry.get("text_hits", 0), count)),
+                    "text_coverage": _float_or_none(_safe_ratio(entry.get("text_chars", 0), entry.get("truth_chars", 0))),
+                    "support": count,
+                }
+            if inline_data:
+                inline_section["per_language"] = inline_data
+        if inline_section:
+            md_data["inline"] = inline_section
+
+        wrong = md_stats.get("wrong_label", {})
+        wrong_cases = int(wrong.get("cases", 0))
+        if wrong_cases > 0:
+            md_data["wrong_fence_fooled_rate"] = _float_or_none(_safe_ratio(wrong.get("fooled", 0), wrong_cases))
+
+        text_stats = md_stats.get("text", {})
+        text_truth = int(text_stats.get("truth_chars", 0))
+        union_chars = int(text_stats.get("union_chars", 0))
+        if text_truth or union_chars:
+            md_data["text_accuracy"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), text_truth))
+            md_data["text_iou"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), union_chars))
+
+        if md_data:
+            data["tasks"]["markdown_mix"] = md_data
+
+    # Pure fragments -------------------------------------------------------
+    pure_metrics = metrics_by_name.get("pure_fragments")
+    if pure_metrics and pure_metrics.extras:
+        pure_stats = pure_metrics.extras.get("pure_fragments_purity", {})
+        per_label = pure_stats.get("per_label", {})
+        per_language = {}
+        for lang, entry in per_label.items():
+            total = int(entry.get("total", 0))
+            if total <= 0:
+                continue
+            per_language[lang] = {
+                "fully_pure_rate": _float_or_none(_safe_ratio(entry.get("pure", 0), total)),
+                "within_threshold_rate": _float_or_none(_safe_ratio(entry.get("within", 0), total)),
+                "support": total,
+            }
+        if per_language:
+            data["tasks"]["pure_fragments"] = {"per_language": per_language}
+
+    # Sequence tasks -------------------------------------------------------
+    for name in ("sequence_pair", "sequence_triplet"):
+        seq_metrics = metrics_by_name.get(name)
+        if not seq_metrics or not seq_metrics.extras:
+            continue
+        seq_stats = seq_metrics.extras.get("sequence_purity", {})
+        segments = seq_stats.get("segments", {})
+        segment_data = {}
+        for key in ("first", "second", "third"):
+            seg = segments.get(key)
+            if not seg:
+                continue
+            total = int(seg.get("total", 0))
+            if total <= 0:
+                continue
+            segment_data[key] = {
+                "coverage": _float_or_none(_safe_ratio(seg.get("correct", 0), total)),
+                "support": total,
+            }
+        if segment_data:
+            data["tasks"][name] = {
+                "segments": segment_data,
+                "overall_accuracy": _float_or_none(seq_metrics.overall_accuracy()),
+            }
+
+    # Needle datasets ------------------------------------------------------
+    needle_entries = {}
+    for metrics in task_metrics:
+        bucket = _needle_bucket_key(metrics.name)
+        if not bucket:
+            continue
+        stats = metrics.extras.get("needle_detection", {}) if metrics.extras else {}
+        total = int(stats.get("total", 0))
+        detected = int(stats.get("detected", 0))
+        mean_iou = _safe_ratio(stats.get("iou_sum", 0.0), total)
+        coverage = _safe_ratio(stats.get("correct_chars", 0), stats.get("needle_chars", 0))
+
+        any_stats = stats.get("any_detection", {})
+        any_count = int(any_stats.get("count", 0))
+        any_detected = int(any_stats.get("detected", 0))
+        any_mean_iou = _safe_ratio(any_stats.get("iou_sum", 0.0), any_count)
+        any_cov = _safe_ratio(any_stats.get("correct_chars", 0), any_stats.get("truth_chars", 0))
+
+        mis_counts = stats.get("misclass_counts", [])
+        top_conf = []
+        if mis_counts and metrics.confusion.size:
+            total_mis = sum(mis_counts)
+            if total_mis > 0:
+                pairs = [
+                    (mis_counts[idx] / total_mis, metrics.label_names[idx])
+                    for idx in range(min(len(mis_counts), len(metrics.label_names)))
+                    if mis_counts[idx] > 0
+                ]
+                pairs.sort(key=lambda x: x[0], reverse=True)
+                top_conf = [
+                    {"label": label, "fraction": _float_or_none(prob)}
+                    for prob, label in pairs[:5]
+                ]
+
+        needle_entries[metrics.name] = {
+            "donor": {
+                "det_rate@0.5": _float_or_none(_safe_ratio(detected, total)),
+                "mean_iou": _float_or_none(mean_iou),
+                "coverage": _float_or_none(coverage),
+                "support": total,
+            },
+            "any": {
+                "det_rate@0.5": _float_or_none(_safe_ratio(any_detected, any_count)),
+                "mean_iou": _float_or_none(any_mean_iou),
+                "coverage": _float_or_none(any_cov),
+                "support": any_count,
+            },
+            "top_misclassifications": top_conf,
+        }
+    if needle_entries:
+        data["tasks"]["needle"] = needle_entries
+
+    # Markdown text accuracy already handled above.
+
+    # Throughput -----------------------------------------------------------
+    if throughput_results:
+        throughput_data = {}
+        for res in throughput_results:
+            throughput_data[res.task] = {
+                "device": res.device,
+                "samples": res.samples,
+                "total_bytes": res.total_bytes,
+                "elapsed": _float_or_none(res.elapsed),
+                "throughput_bytes_per_sec": _float_or_none(res.throughput),
+                "rss_delta_mb": _float_or_none(res.rss_delta),
+                "device_mem_delta_mb": _float_or_none(res.device_mem_delta),
+            }
+        data["throughput"] = throughput_data
+
+    return data
+
+
+def _write_comparison_metrics(checkpoint_path: str, payload: Dict[str, Any]) -> None:
+    comparisons_dir = REPO_ROOT / "comparisons"
+    comparisons_dir.mkdir(parents=True, exist_ok=True)
+    key = _comparison_key_from_checkpoint(checkpoint_path)
+    output_path = comparisons_dir / f"{key}.json"
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    print(f"📝 Comparison metrics written to {output_path}", flush=True)
+
+
 def write_report(
     report_path: Path,
     *,
@@ -940,6 +2214,12 @@ def write_report(
     task_metrics: List[TaskMetrics],
     throughput_results: List[ThroughputResult],
 ) -> None:
+    ordered_task_metrics = sorted(task_metrics, key=lambda m: _task_name_sort_key(m.name))
+    non_needle_metrics = [m for m in ordered_task_metrics if _needle_bucket_key(m.name) is None]
+    needle_only_metrics = [m for m in ordered_task_metrics if _needle_bucket_key(m.name) is not None]
+    needle_only_metrics.sort(key=lambda m: (_needle_bucket_key(m.name) or (0, 0))[0], reverse=True)
+    ordered_task_metrics = non_needle_metrics + needle_only_metrics
+
     def _format_channels(value) -> str:
         if isinstance(value, str):
             return value
@@ -961,40 +2241,220 @@ def write_report(
     report_lines.append(f"- Evaluation data root: `{manifest.get('output_root')}`")
     report_lines.append(f"- Generated at: {manifest.get('generated_at')}")
     report_lines.append("")
-    report_lines.append("## Summary")
-    report_lines.append("")
-    report_lines.append(_render_summary_table(task_metrics))
-    report_lines.append("")
+    highlights = _collect_task_highlights(ordered_task_metrics)
+    if highlights:
+        report_lines.append("### Task Highlights")
+        report_lines.append("")
+        report_lines.extend(highlights)
+        report_lines.append("")
+
+    comparison_payload = _collect_comparison_metrics(args, ordered_task_metrics, throughput_results)
+    if comparison_payload:
+        _write_comparison_metrics(args.checkpoint, comparison_payload)
 
     report_lines.append("## Task Details")
     report_lines.append("")
-    for metrics in task_metrics:
+    for metrics in ordered_task_metrics:
         report_lines.append(f"### {metrics.name}")
         report_lines.append("")
         report_lines.append(metrics.description)
         report_lines.append("")
+        extras = metrics.extras or {}
         report_lines.append(f"- Samples: {metrics.samples}")
         report_lines.append(f"- Characters evaluated: {metrics.total_chars}")
         report_lines.append(f"- Overall accuracy: {metrics.overall_accuracy():.4f}")
-        
-        # Special analysis for pure fragments dataset
-        if metrics.name == "pure_fragments":
+        report_lines.append(f"- High confusions: {_summarize_confusions(metrics)}")
+
+        name = metrics.name
+        per_label_acc = metrics.per_label_accuracy()
+
+        if name == "mal_injection":
+            payload_stats = extras.get("mal_payload_detection", {})
+            any_by_lang = payload_stats.get("any_by_lang", {})
+            correct_by_lang = payload_stats.get("by_lang", {})
+            top_mis = _top_confusions(
+                metrics.confusion, metrics.label_names, exclude_labels=["__unknown__"]
+            )
+            languages = [
+                lang
+                for lang in sorted(set(any_by_lang.keys()) | set(correct_by_lang.keys()))
+                if lang and lang != "__unknown__"
+            ]
+            if languages:
+                table_lines = [
+                    "| Language | Non-wrapper IoU ≥50% | Non-wrapper avg IoU | Non-wrapper coverage | "
+                    "Correct IoU ≥50% | Correct avg IoU | Correct coverage | Top misclassifications |",
+                    "| --- | --- | ---: | ---: | --- | ---: | ---: | --- |",
+                ]
+                for lang in languages:
+                    any_entry = any_by_lang.get(lang, {})
+                    corr_entry = correct_by_lang.get(lang, {})
+                    any_count = int(any_entry.get("count", 0))
+                    any_detected = int(any_entry.get("detected", 0))
+                    any_avg = _safe_ratio(any_entry.get("iou_sum", 0.0), any_count)
+                    any_truth = int(any_entry.get("truth_chars", 0))
+                    any_correct = int(any_entry.get("correct_chars", 0))
+                    any_cov = _format_pct(_safe_ratio(any_correct, any_truth))
+
+                    corr_count = int(corr_entry.get("count", 0))
+                    corr_detected = int(corr_entry.get("detected", 0))
+                    corr_avg = _safe_ratio(corr_entry.get("iou_sum", 0.0), corr_count)
+                    corr_truth = int(corr_entry.get("truth_chars", 0))
+                    corr_chars = int(corr_entry.get("correct_chars", 0))
+                    corr_cov = _format_pct(_safe_ratio(corr_chars, corr_truth))
+
+                    class_cov = per_label_acc.get(lang)
+                    class_cov_str = _format_pct(class_cov)
+
+                    mis_list = top_mis.get(lang, [])
+                    mis_str = ", ".join(f"{pred} ({prob * 100:.1f}%)" for prob, pred in mis_list[:3]) or "—"
+
+                    table_lines.append(
+                        f"| {lang} | {_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | {any_cov} | "
+                        f"{_format_hits(corr_detected, corr_count)} | {_format_float(corr_avg)} | {corr_cov} (overall {class_cov_str}) | {mis_str} |"
+                    )
+                report_lines.append("")
+                report_lines.extend(table_lines)
+                report_lines.append("")
+            continue
+
+        if name == "pure_fragments":
+            pure_stats = extras.get("pure_fragments_purity", {})
+            ratios = pure_stats.get("foreign_ratios", [])
+            if ratios:
+                mean_ratio = float(sum(ratios)) / max(1, len(ratios))
+                expected_bytes = mean_ratio * 1536
+                report_lines.append("")
+                report_lines.append(
+                    f"Expected foreign bytes for a 1536-byte fragment: {expected_bytes:.1f}/1536"
+                )
+                report_lines.append("")
+
             purity_scores, misclassifications = _analyze_pure_fragments(metrics)
-            report_lines.append("\n### Purity Analysis\n")
+            report_lines.append("#### Purity Analysis")
+            report_lines.append("")
             report_lines.append("| Language | Purity % | Top Misclassifications |")
             report_lines.append("| --- | ---: | --- |")
-            
             for lang, purity in sorted(purity_scores.items(), key=lambda x: x[1], reverse=True):
                 misclass_str = ""
                 if lang in misclassifications:
-                    top_mistakes = [f"{label} ({pct:.1f}%)" 
-                                  for label, pct in list(misclassifications[lang].items())[:3]]
+                    top_mistakes = [
+                        f"{label} ({pct:.1f}%)"
+                        for label, pct in list(misclassifications[lang].items())[:3]
+                    ]
                     misclass_str = ", ".join(top_mistakes)
-                report_lines.append(f"| {lang} | {purity:.1f}% | {misclass_str} |")
+                report_lines.append(f"| {lang} | {purity:.1f}% | {misclass_str or '—'} |")
             report_lines.append("")
-            
+
+            per_label_table = _render_metrics_table(metrics)
+            report_lines.append(per_label_table)
+            report_lines.append("")
+            continue
+
+        if _needle_bucket_key(name) is not None:
+            report_lines.append("")
+            report_lines.append(_render_metrics_table(metrics))
+            report_lines.append("")
+
+            stats = extras.get("needle_detection", {}) or {}
+            total = int(stats.get("total", 0))
+            detected = int(stats.get("detected", 0))
+            avg_iou = _safe_ratio(stats.get("iou_sum", 0.0), total)
+            coverage = _format_pct(_safe_ratio(stats.get("correct_chars", 0), stats.get("needle_chars", 0)))
+
+            any_stats = stats.get("any_detection", {}) or {}
+            any_count = int(any_stats.get("count", 0))
+            any_detected = int(any_stats.get("detected", 0))
+            any_avg = _safe_ratio(any_stats.get("iou_sum", 0.0), any_count)
+            any_cov = _format_pct(_safe_ratio(any_stats.get("correct_chars", 0), any_stats.get("truth_chars", 0)))
+
+            mis_counts = stats.get("misclass_counts", [])
+            mis_lines = "—"
+            if mis_counts:
+                total_mis = sum(mis_counts)
+                if total_mis > 0:
+                    pairs = [
+                        (mis_counts[idx] / total_mis, metrics.label_names[idx])
+                        for idx in range(min(len(mis_counts), len(metrics.label_names)))
+                        if idx < len(metrics.label_names) and mis_counts[idx] > 0
+                    ]
+                    pairs.sort(key=lambda x: x[0], reverse=True)
+                    mis_lines = ", ".join(f"{label} ({prob * 100:.1f}%)" for prob, label in pairs[:3]) or "—"
+
+            report_lines.append("| Scenario | IoU ≥50% | Mean IoU | Coverage | Top misclassifications |")
+            report_lines.append("| --- | --- | ---: | ---: | --- |")
+            report_lines.append(
+                f"| Any non-wrapper | {_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | {any_cov} | {mis_lines} |"
+            )
+            report_lines.append(
+                f"| Correct label | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage} | — |"
+            )
+            report_lines.append("")
+            continue
+
+        if name in ("sequence_pair", "sequence_triplet"):
+            seq_stats = extras.get("sequence_purity", {})
+            segments = seq_stats.get("segments", {})
+            report_lines.append("")
+            report_lines.append("| Segment | Coverage |")
+            report_lines.append("| --- | ---: |")
+            for key in ("first", "second", "third"):
+                data = segments.get(key)
+                if not data:
+                    continue
+                total = int(data.get("total", 0))
+                correct = int(data.get("correct", 0))
+                coverage = _format_pct(correct / total) if total > 0 else "n/a"
+                report_lines.append(f"| {key.title()} | {coverage} |")
+            report_lines.append("")
+
+        # Default handling for other tasks
+        if name == "markdown_mix":
+            markdown_stats = extras.get("markdown_segments", {})
+            threshold = float(markdown_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
+            wrapped_group = markdown_stats.get("overall", {}).get("wrapped", {})
+            plain_group = markdown_stats.get("overall", {}).get("plain", {})
+            report_lines.append("")
+            report_lines.append("| Wrapper | Non-text hits | Text hits | Correct hits | Non-text coverage | Correct coverage |")
+            report_lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+            for label, group in ((MARKDOWN_FENCED_LABEL, wrapped_group), ("bare code", plain_group)):
+                count = int(group.get("count", 0))
+                if count <= 0:
+                    report_lines.append(f"| {label} | — | — | — | n/a | n/a |")
+                    continue
+                nontext_hits = int(group.get("detected_nontext", 0))
+                text_hits = int(group.get("detected_text", 0))
+                correct_hits = int(group.get("detected_correct", 0))
+                truth_chars = int(group.get("truth_chars", 0))
+                nontext_cov = _format_pct(_safe_ratio(int(group.get("nontext_chars", 0)), truth_chars))
+                correct_cov = _format_pct(_safe_ratio(int(group.get("correct_chars", 0)), truth_chars))
+                report_lines.append(
+                    f"| {label} | {_format_hits(nontext_hits, count)} | {_format_hits(text_hits, count)} | "
+                    f"{_format_hits(correct_hits, count)} | {nontext_cov} | {correct_cov} |"
+                )
+            inline_stats = markdown_stats.get("inline", {})
+            inline_count = int(inline_stats.get("count", 0))
+            if inline_count > 0:
+                inline_nontext = int(inline_stats.get("nontext_hits", 0))
+                inline_text = int(inline_stats.get("text_hits", 0))
+                inline_correct = int(inline_stats.get("correct_hits", 0))
+                inline_truth = int(inline_stats.get("truth_chars", 0))
+                inline_nontext_cov = _format_pct(_safe_ratio(int(inline_stats.get("nontext_chars", 0)), inline_truth))
+                inline_correct_cov = _format_pct(_safe_ratio(int(inline_stats.get("correct_chars", 0)), inline_truth))
+                report_lines.append(
+                    f"| {MARKDOWN_INLINE_LABEL} | {_format_hits(inline_nontext, inline_count)} | {_format_hits(inline_text, inline_count)} | "
+                    f"{_format_hits(inline_correct, inline_count)} | {inline_nontext_cov} | {inline_correct_cov} |"
+                )
+            text_truth = int(markdown_stats.get("text", {}).get("truth_chars", 0))
+            if text_truth > 0:
+                text_cov = _format_pct(
+                    _safe_ratio(markdown_stats.get("text", {}).get("correct_chars", 0), text_truth)
+                )
+                report_lines.append("")
+                report_lines.append(f"Text coverage (IoU ≥50%): {text_cov}")
+            report_lines.append("")
+
         per_label_table = _render_metrics_table(metrics)
-        report_lines.append("")
         report_lines.append(per_label_table)
         report_lines.append("")
 
@@ -1085,6 +2545,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             device=args.device,
             batch_size=args.batch_size,
         )
+        channels = [int(ch) for ch in getattr(accuracy_runner, "channels", channels)]
+        args.channels = channels
 
         datasets = _collect_datasets(data_root, args.tasks)
         if not datasets:
@@ -1128,7 +2590,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         task_metrics: List[TaskMetrics] = []
         throughput_results: List[ThroughputResult] = []
 
-        for name in sorted(accuracy_names):
+        for name in sorted(accuracy_names, key=_task_name_sort_key):
             ds = prepared_datasets[name]
             meta = dataset_meta[name]
             sample_note = " • subsampled" if meta["sampled"] else ""
@@ -1166,7 +2628,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"⚠️  Skipping CPU throughput ({exc})", flush=True)
                 cpu_runner = None
             if cpu_runner is not None:
-                for name in sorted(throughput_names):
+                for name in sorted(throughput_names, key=_task_name_sort_key):
                     ds = prepared_datasets[name]
                     meta = dataset_meta[name]
                     print(
@@ -1206,7 +2668,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     print(f"⚠️  Skipping {args.gpu_device} throughput ({exc})", flush=True)
                     gpu_runner = None
                 if gpu_runner is not None:
-                    for name in sorted(throughput_names):
+                    for name in sorted(throughput_names, key=_task_name_sort_key):
                         ds = prepared_datasets[name]
                         print(
                             f"▶️  Throughput '{name}' on {args.gpu_device} [{len(ds)} samples]",
