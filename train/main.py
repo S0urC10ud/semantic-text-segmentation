@@ -172,7 +172,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     # 4KB fixed windows by default
     parser.add_argument("--bucket_step", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_minutes", type=int, default=0)
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")

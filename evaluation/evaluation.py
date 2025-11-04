@@ -2490,7 +2490,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--chunk", type=int, default=1024)
     parser.add_argument("--min-run", type=int, default=1, help="Minimum run-length smoothing for character labels.")
     parser.add_argument("--report-path", default=str(REPO_ROOT / "evaluation" / "report.md"))
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for inference windows.")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for inference windows.")
     parser.add_argument("--max-samples", type=int, default=2000, help="Maximum samples per accuracy task (0 = all).")
     parser.add_argument("--sample-seed", type=int, default=13, help="Seed for subsampling large datasets.")
     parser.add_argument("--log-interval", type=int, default=250, help="Progress logging interval (in samples).")

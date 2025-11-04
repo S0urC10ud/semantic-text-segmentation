@@ -75,6 +75,7 @@ class DataConfig:
     markdown_prob: float = 0.1
     max_mixed_languages: int = 3
     markdown_inline_code_prob: float = 0.25
+    language_pair_mode_prob: float = 0.5
     # remaining probability mass is used for mixed windows
 
     # Prefetching
@@ -94,8 +95,8 @@ class DataConfig:
     start_with_newline_prob: float = 0.5
     strip_weights: Tuple[float, float, float, float] = (0.1, 0.2, 0.2, 0.5) # none, l, r, both
     inject_extra_newlines_max: int = 4
-    host_skip_top_min: int = 5
-    host_skip_top_max: int = 20
+    host_skip_top_min: int = 0
+    host_skip_top_max: int = 0
     donor_skip_top_min: int = 5
     donor_skip_top_max: int = 20
     both_prob: float = 0 # probability to overlay/inject substrings after the window ways built

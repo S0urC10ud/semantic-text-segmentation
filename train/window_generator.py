@@ -8,7 +8,7 @@ import re
 import threading
 import queue
 import time
-from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any
+from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any, Set
 
 import numpy as np
 import datasets as hfds
@@ -36,14 +36,256 @@ if hasattr(cfg, "ID2LANG"):
     )
 
 _MAX_LINE_INJECT_COMMENT_RATIO = 0.4
-_SYNTHETIC_MARKDOWN_PHRASES = [
-    "In this section we walk through the implementation details.",
-    "The following code sample highlights the subtle edge cases we found.",
-    "Remember that any input must be sanitized before reaching this block.",
-    "Below you can find the reproduction steps captured during triage.",
-    "We should mention the trade-offs before the reader inspects the snippet.",
-    "Here's some inline context so the surrounding prose still makes sense.",
-]
+_LANGUAGE_PAIR_WEIGHTS = (
+    (("html", "css"), 10),
+    (("html", "javascript_typescript"), 10),
+    (("javascript_typescript", "json"), 9),
+    (("php", "html"), 9),
+    (("php", "sql"), 9),
+    (("javascript_typescript", "css"), 8),
+    (("python", "json"), 8),
+    (("python", "sql"), 8),
+    (("sql", "java"), 8),
+    (("sql", "csharp"), 8),
+    (("sql", "javascript_typescript"), 8),
+    (("json", "java"), 8),
+    (("json", "csharp"), 8),
+    (("json", "go"), 8),
+    (("dockerfile", "shell"), 8),
+    (("powershell", "json"), 8),
+    (("rust", "c_family"), 8),
+    (("php", "javascript_typescript"), 7),
+    (("python", "csv"), 7),
+    (("sql", "go"), 7),
+    (("sql", "ruby"), 7),
+    (("json", "ruby"), 7),
+    (("yaml", "go"), 7),
+    (("yaml", "python"), 7),
+    (("powershell", "csharp"), 7),
+    (("encoding_base64", "json"), 7),
+    (("encoding_hex", "c_family"), 7),
+    (("visual_basic", "sql"), 7),
+    (("python", "shell"), 7),
+    (("dockerfile", "yaml"), 7),
+    (("yaml", "json"), 6),
+    (("yaml", "ruby"), 6),
+    (("shell", "c_family"), 6),
+    (("visual_basic", "csharp"), 6),
+    (("encoding_base64", "html"), 6),
+    (("encoding_base85", "c_family"), 6),
+    (("encoding_base58", "rust"), 6),
+    (("encoding_base32", "yaml"), 4),
+)
+_DEFAULT_LANGUAGE_PAIR_MODE_PROB = 0.5
+
+
+_LANGUAGE_PAIR_ADJACENCY: Dict[int, Set[int]] = {}
+for (lang_a, lang_b), _ in _LANGUAGE_PAIR_WEIGHTS:
+    lid_a = cfg.LANG2ID.get(lang_a)
+    lid_b = cfg.LANG2ID.get(lang_b)
+    if lid_a is None or lid_b is None:
+        continue
+    ia, ib = int(lid_a), int(lid_b)
+    _LANGUAGE_PAIR_ADJACENCY.setdefault(ia, set()).add(ib)
+    _LANGUAGE_PAIR_ADJACENCY.setdefault(ib, set()).add(ia)
+
+
+_LINE_INJECT_CALL_COUNTER = 0
+_LINE_INJECT_COUNTER_LOCK = threading.Lock()
+
+
+_MARKDOWN_FENCE_TOKEN_MAP: Dict[str, List[str]] = {
+    "javascript_typescript": ["javascript", "js", "typescript", "ts"],
+    "typescript": ["typescript", "ts"],  # safeguard if future configs split typescript
+    "php": ["php"],
+    "csharp": ["csharp", "cs"],
+    "go": ["go"],
+    "sql": ["sql"],
+    "rust": ["rust"],
+    "yaml": ["yaml", "yml"],
+    "ruby": ["ruby", "rb"],
+    "python": ["python", "py"],
+    "java": ["java"],
+    "c_family": ["c", "cpp"],
+    "json": ["json"],
+    "css": ["css"],
+    "html": ["html", "xml"],
+    "csv": ["csv"],
+    "shell": ["bash", "sh", "shell"],
+    "powershell": ["powershell", "ps1"],
+    "visual_basic": ["vb", "vbnet"],
+    "dockerfile": ["dockerfile", "docker"],
+    "markdown": ["markdown", "md"],
+}
+_MARKDOWN_GENERIC_TOKENS: List[str] = ["text", "plaintext", "plain", "none"]
+_MARKDOWN_RANDOM_TOKEN_POOL: List[str] = sorted(
+    {
+        token
+        for tokens in _MARKDOWN_FENCE_TOKEN_MAP.values()
+        for token in tokens
+    }.union(_MARKDOWN_GENERIC_TOKENS)
+)
+
+
+def _markdown_fence_tokens_for_lid(lid: int) -> List[str]:
+    name = _lang_name(lid)
+    if not name:
+        return []
+    lname = name.lower()
+    if lname.startswith("encoding") or lname in {"text", "markdown_text"}:
+        return []
+    tokens = _MARKDOWN_FENCE_TOKEN_MAP.get(lname)
+    if tokens:
+        return list(tokens)
+    cleaned = lname.replace("_", "")
+    if cleaned and cleaned.isalpha() and not cleaned.startswith("encoding"):
+        return [cleaned]
+    return []
+
+
+def _pick_markdown_fence_label(
+    lid: Optional[int],
+    *,
+    allow_generic: bool = True,
+    random_pool: Optional[List[str]] = None,
+) -> str:
+    if lid is not None:
+        tokens = _markdown_fence_tokens_for_lid(int(lid))
+        if tokens:
+            return random.choice(tokens)
+    if allow_generic:
+        pool = random_pool if random_pool is not None else _MARKDOWN_RANDOM_TOKEN_POOL
+        if pool:
+            return random.choice(pool)
+    return ""
+
+
+def _available_language_pairs(lids: List[int]) -> List[Tuple[Tuple[int, int], int]]:
+    """Return list of ((lid_a, lid_b), weight) for lids present in the dataset view."""
+    if not lids:
+        return []
+    lid_set = set(lids)
+    pairs: List[Tuple[Tuple[int, int], int]] = []
+    for (lang_a, lang_b), weight in _LANGUAGE_PAIR_WEIGHTS:
+        lid_a = cfg.LANG2ID.get(lang_a)
+        lid_b = cfg.LANG2ID.get(lang_b)
+        if lid_a is None or lid_b is None:
+            continue
+        if lid_a in lid_set and lid_b in lid_set:
+            pairs.append(((int(lid_a), int(lid_b)), weight))
+    return pairs
+
+
+def _maybe_choose_language_pair(
+    lids: List[int],
+    data_cfg: Optional["DataConfig"],
+) -> Optional[Tuple[int, int]]:
+    """
+    Optionally choose a language pair based on configured probability and weights.
+    The returned pair is unordered, expressed as a sorted tuple of language ids.
+    """
+    prob = _DEFAULT_LANGUAGE_PAIR_MODE_PROB
+    if data_cfg is not None:
+        prob = getattr(data_cfg, "language_pair_mode_prob", prob)
+    if prob <= 0.0 or random.random() >= prob:
+        return None
+    weighted_pairs = _available_language_pairs(lids)
+    if not weighted_pairs:
+        return None
+    pairs, weights = zip(*weighted_pairs)
+    normalized_pairs = [tuple(sorted(pair)) for pair in pairs]
+    choice = random.choices(normalized_pairs, weights=weights, k=1)[0]
+    return choice
+
+
+def _init_language_pair_meta(
+    pair_lids: Optional[Tuple[int, int]],
+    *,
+    mode: str,
+    probability: float,
+    transitive_ids: Optional[List[int]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Prepare metadata payload describing a selected language pair."""
+    if not pair_lids:
+        return None
+    ordered = tuple(int(x) for x in pair_lids)
+    meta = {
+        "mode": mode,
+        "ids": list(ordered),
+        "languages": [_lang_name(lid) for lid in ordered],
+        "probability": float(probability),
+        "selected": True,
+        "active": True,
+        "applied": False,
+    }
+    if transitive_ids:
+        dedup = list(dict.fromkeys(int(x) for x in transitive_ids))
+        meta["transitive_seed_ids"] = dedup
+        meta["transitive_seed_languages"] = [_lang_name(lid) for lid in dedup]
+    return meta
+
+
+def _unlock_language_neighbors(
+    lid: int,
+    available: Set[int],
+    unlocked: Set[int],
+) -> List[int]:
+    """Add lid and its adjacent popular-pair neighbors to the unlocked set.
+
+    Returns a list of newly unlocked language ids.
+    """
+    newly_added: List[int] = []
+    lid = int(lid)
+    if lid in available and lid not in unlocked:
+        unlocked.add(lid)
+        newly_added.append(lid)
+    for neighbor in _LANGUAGE_PAIR_ADJACENCY.get(lid, ()):  # immediate neighbors only
+        if neighbor in available and neighbor not in unlocked:
+            unlocked.add(neighbor)
+            newly_added.append(int(neighbor))
+    return newly_added
+
+
+def _sample_fallback_text_snippet(
+    dsets_by_lang: Dict[int, hfds.Dataset],
+    text_lid: Optional[int],
+    *,
+    max_chars: int,
+    min_letters: int = 0,
+    min_length: int = 24,
+    attempts: int = 24,
+) -> Tuple[str, Optional[dict]]:
+    """
+    Draw a text snippet directly from the text dataset when regular sampling fails.
+    Attempts to keep a reasonable character and letter count while respecting the byte budget.
+    """
+    if text_lid is None:
+        return "", None
+    ds = dsets_by_lang.get(text_lid)
+    if ds is None:
+        return "", None
+    tries = 0
+    while tries < attempts:
+        ex = _random_example(ds)
+        tries += 1
+        if not ex:
+            continue
+        content = ex.get("content", "")
+        if not isinstance(content, str):
+            continue
+        cleaned = _clean_snippet_text(content)
+        if not cleaned:
+            continue
+        if len(cleaned) > max_chars:
+            start = random.randint(0, max(0, len(cleaned) - max_chars))
+            cleaned = cleaned[start:start + max_chars]
+        cleaned = cleaned.strip()
+        if len(cleaned) < min_length:
+            continue
+        if min_letters > 0 and _count_letters(cleaned) < min_letters:
+            continue
+        return cleaned, ex
+    return "", None
 
 
 def _count_ascii_letters(text: str) -> int:
@@ -506,12 +748,57 @@ def _make_mixed_window_impl(
     if not lids:
         return sanitize_tokens(x_buf), y_buf, meta
 
+    pair_prob = _DEFAULT_LANGUAGE_PAIR_MODE_PROB
+    if data_cfg is not None:
+        pair_prob = getattr(data_cfg, "language_pair_mode_prob", pair_prob)
+    pair_lids = _maybe_choose_language_pair(lids, data_cfg)
+    available_set: Set[int] = {int(l) for l in lids}
+    unlocked_lids: Set[int] = set()
+    unlock_trace: List[Dict[str, Any]] = []
+    if pair_lids:
+        unlocked_lids = {int(lid) for lid in pair_lids if int(lid) in available_set}
+        if unlocked_lids:
+            unlock_trace.append(
+                {
+                    "event": "seed",
+                    "language_ids": sorted(unlocked_lids),
+                    "languages": [_lang_name(lid) for lid in sorted(unlocked_lids)],
+                }
+            )
+    if collect_meta and meta is not None:
+        transitive_seeds = sorted(unlocked_lids) if unlocked_lids else None
+        pair_meta = _init_language_pair_meta(
+            pair_lids,
+            mode="mixed",
+            probability=pair_prob,
+            transitive_ids=transitive_seeds,
+        )
+        if pair_meta:
+            meta["language_pair_mode"] = pair_meta
+    available_lids = list(unlocked_lids) if unlocked_lids else (list(pair_lids) if pair_lids else list(lids))
+    if not available_lids:
+        available_lids = list(lids)
+        if collect_meta and meta is not None and meta.get("language_pair_mode"):
+            meta["language_pair_mode"]["active"] = False
+            meta["language_pair_mode"]["reason"] = "pair_languages_unavailable"
+
+    pair_unique: List[int] = []
+    required_pair_lids: Set[int] = set()
+    if pair_lids:
+        pair_unique = list(dict.fromkeys(pair_lids))
+        required_pair_lids = {int(lid) for lid in pair_unique}
+
     max_langs = int(getattr(data_cfg, "max_mixed_languages", 3)) if data_cfg is not None else 3
+    if unlocked_lids:
+        max_langs = max(max_langs, len(unlocked_lids))
     if max_langs <= 0:
         max_langs = 1
     used_lids: List[int] = []
 
     nsegs = _sample_mixed_segment_count()
+    if required_pair_lids:
+        nsegs = max(nsegs, len(required_pair_lids))
+
     left, pos = target_len, 0
     for i in range(nsegs):
         seg_len = random.randint(min_seg, left) if left > min_seg else left
@@ -520,10 +807,15 @@ def _make_mixed_window_impl(
         if seg_len <= 0:
             break
 
-        if len(used_lids) >= max_langs:
-            candidate_lids = [lid for lid in lids if lid in used_lids] or used_lids or lids
+        if unlocked_lids:
+            available_lids = list(unlocked_lids)
+        prioritized = [lid for lid in available_lids if lid in required_pair_lids]
+        if prioritized:
+            candidate_lids = prioritized
+        elif len(used_lids) >= max_langs:
+            candidate_lids = [lid for lid in available_lids if lid in used_lids] or used_lids or available_lids
         else:
-            candidate_lids = lids
+            candidate_lids = available_lids
 
         preferred = random.choice(candidate_lids)
         lid, ex, byte_content = _sample_nonempty_example(
@@ -540,10 +832,10 @@ def _make_mixed_window_impl(
                         "start": int(pos),
                         "end": int(pos),
                         "bytes": 0,
-                    "requested_bytes": int(seg_len),
-                    "status": "failed_to_sample_nonempty",
-                }
-            )
+                        "requested_bytes": int(seg_len),
+                        "status": "failed_to_sample_nonempty",
+                    }
+                )
             pos += seg_len
             left -= seg_len
             continue
@@ -566,6 +858,23 @@ def _make_mixed_window_impl(
             y_buf[pos:pos + write_len] = lid
             if lid not in used_lids:
                 used_lids.append(lid)
+            if unlocked_lids:
+                newly_added = _unlock_language_neighbors(lid, available_set, unlocked_lids)
+                if newly_added:
+                    max_langs = max(max_langs, len(unlocked_lids))
+                    unlock_trace.append(
+                        {
+                            "event": "expand",
+                            "trigger": int(lid),
+                            "trigger_language": _lang_name(lid),
+                            "new_language_ids": sorted(newly_added),
+                            "new_languages": [_lang_name(x) for x in sorted(newly_added)],
+                            "available_language_ids": sorted(unlocked_lids),
+                            "available_languages": [_lang_name(x) for x in sorted(unlocked_lids)],
+                        }
+                    )
+            if lid in required_pair_lids:
+                required_pair_lids.discard(lid)
         if collect_meta:
             entry = {
                 "origin": "base",
@@ -587,6 +896,16 @@ def _make_mixed_window_impl(
         pos += used_bytes
         left = max(0, left - used_bytes)
 
+    if collect_meta and meta is not None:
+        pair_meta = meta.get("language_pair_mode")
+        if pair_meta:
+            if unlock_trace:
+                pair_meta["unlock_trace"] = unlock_trace
+        if pair_meta and unlocked_lids:
+            sorted_unlocked = sorted(unlocked_lids)
+            pair_meta["unlocked_language_ids"] = sorted_unlocked
+            pair_meta["unlocked_languages"] = [_lang_name(lid) for lid in sorted_unlocked]
+            pair_meta["unlocked_count"] = len(sorted_unlocked)
     return sanitize_tokens(x_buf), y_buf, meta
 
 
@@ -679,6 +998,8 @@ def _make_training_window_internal(
                 metadata["samples"].extend(partial.get("samples", []))
                 metadata["line_injections"].extend(partial.get("line_injections", []))
                 metadata["host"] = partial.get("host", metadata.get("host"))
+                if metadata.get("language_pair_mode") is None and partial.get("language_pair_mode"):
+                    metadata["language_pair_mode"] = partial["language_pair_mode"]
     elif mode == "markdown":
         x, y, partial = _make_markdown_window_impl(dsets_by_lang, target_len, data_cfg, collect_meta)
         if collect_meta and metadata is not None:
@@ -692,6 +1013,8 @@ def _make_training_window_internal(
                 metadata["line_injections"].extend(partial.get("line_injections", []))
                 if metadata.get("host") is None:
                     metadata["host"] = partial.get("host")
+                if metadata.get("language_pair_mode") is None and partial.get("language_pair_mode"):
+                    metadata["language_pair_mode"] = partial["language_pair_mode"]
     else:
         x, y, partial = _make_mixed_window_impl(
             dsets_by_lang,
@@ -705,6 +1028,8 @@ def _make_training_window_internal(
             metadata["requested_mode"] = "mixed"
             if partial:
                 metadata["samples"].extend(partial.get("samples", []))
+                if metadata.get("language_pair_mode") is None and partial.get("language_pair_mode"):
+                    metadata["language_pair_mode"] = partial["language_pair_mode"]
 
     # Optionally overlay mixed slices on top of base window
     both_prob = getattr(data_cfg, "both_prob", 0.2)
@@ -789,6 +1114,7 @@ def _make_training_window_internal(
             metadata["host"] = None
             metadata["samples"] = fallback_meta.get("samples", []) if fallback_meta else []
             metadata["fallback"] = "pure_due_to_empty"
+            metadata.pop("language_pair_mode", None)
 
     if collect_meta and metadata is not None:
         final_segments = []
@@ -800,6 +1126,27 @@ def _make_training_window_internal(
                 }
             )
         metadata["final_segments"] = final_segments
+        pair_meta = metadata.get("language_pair_mode")
+        if pair_meta and pair_meta.get("selected"):
+            requested_ids = tuple(int(i) for i in pair_meta.get("ids", []))
+            observed_ids = {int(seg["language_id"]) for seg in final_segments}
+            used_ids = [rid for rid in requested_ids if rid in observed_ids]
+            pair_meta["used_language_ids"] = used_ids
+            pair_meta["used_languages"] = [_lang_name(rid) for rid in used_ids]
+            missing_ids = [rid for rid in requested_ids if rid not in observed_ids]
+            if missing_ids:
+                pair_meta["missing_language_ids"] = missing_ids
+                pair_meta["missing_languages"] = [_lang_name(rid) for rid in missing_ids]
+            else:
+                pair_meta.pop("missing_language_ids", None)
+                pair_meta.pop("missing_languages", None)
+            active_flag = bool(pair_meta.get("active", True))
+            if not active_flag:
+                pair_meta["applied"] = False
+            else:
+                pair_meta["applied"] = not missing_ids and bool(requested_ids)
+            pair_meta["present_language_ids"] = sorted(observed_ids)
+            pair_meta["present_languages"] = [_lang_name(rid) for rid in sorted(observed_ids)]
         unique_langs = {seg["language_id"] for seg in final_segments}
         if metadata["line_injections"]:
             actual_mode = "line_inject"
@@ -959,20 +1306,41 @@ def _sample_truncated_exp_lines(lam: float, max_lines: int) -> int:
     return max(1, min(k, max_lines))
 
 
-def _choose_injection_boundaries(host_text: str, skip_top_min: int, skip_top_max: int, max_inj: int) -> List[int]:
+def _choose_injection_boundaries(
+    host_text: str,
+    skip_top_min: int,
+    skip_top_max: int,
+    max_inj: int,
+    *,
+    required_count: Optional[int] = None,
+) -> List[int]:
     lines = _split_keepends_lines(host_text)
     if not lines:
         return []
     boundaries = np.cumsum([len(ln) for ln in lines]).tolist()
-    skip = random.randint(skip_top_min, max(skip_top_min, skip_top_max))
-    valid = [b for b in boundaries if b > boundaries[skip - 1]] if skip < len(boundaries) else []
+    if not boundaries:
+        return []
+
+    skip_min = max(0, skip_top_min)
+    skip_max = max(skip_min, skip_top_max)
+
+    if skip_max > 0:
+        skip = random.randint(skip_min, skip_max)
+        valid = [b for idx, b in enumerate(boundaries) if idx >= skip]
+    else:
+        valid = boundaries[:]
+
     if not valid:
         return []
-    n = 1
-    # More injections per file
-    while n < max_inj and random.random() < 0.25:
-        n += 1
-    n = min(n, len(valid))
+
+    if required_count is not None and required_count > 0:
+        n = min(required_count, len(valid), max_inj)
+    else:
+        n = 1
+        # More injections per file
+        while n < max_inj and random.random() < 0.25:
+            n += 1
+        n = min(n, len(valid))
     picks = random.sample(valid, k=n)
     return sorted(picks, reverse=True)
 
@@ -1179,10 +1547,49 @@ def _make_line_injected_window_impl(
     if not lids:
         return sanitize_tokens(x), y, meta
 
-    preferred_host = random.choice(lids)
-    host_lid, host_ex, _ = _sample_nonempty_example(
-        dsets_by_lang, lids, prefer_lid=preferred_host
+    global _LINE_INJECT_CALL_COUNTER
+    with _LINE_INJECT_COUNTER_LOCK:
+        current_counter = _LINE_INJECT_CALL_COUNTER
+        _LINE_INJECT_CALL_COUNTER = (_LINE_INJECT_CALL_COUNTER + 1) % 3
+    enforce_three_injections = current_counter == 2
+
+    pair_prob = getattr(data_cfg, "language_pair_mode_prob", _DEFAULT_LANGUAGE_PAIR_MODE_PROB)
+    pair_lids = _maybe_choose_language_pair(lids, data_cfg)
+    available_set: Set[int] = {int(l) for l in lids}
+    transitive_unlocked: Set[int] = set()
+    if pair_lids:
+        transitive_unlocked = {int(lid) for lid in pair_lids if int(lid) in available_set}
+    unlock_trace: List[Dict[str, Any]] = []
+    if transitive_unlocked:
+        unlock_trace.append(
+            {
+                "event": "seed",
+                "language_ids": sorted(transitive_unlocked),
+                "languages": [_lang_name(lid) for lid in sorted(transitive_unlocked)],
+            }
+        )
+    pair_meta = _init_language_pair_meta(
+        pair_lids,
+        mode="line_inject",
+        probability=pair_prob,
+        transitive_ids=sorted(transitive_unlocked) if transitive_unlocked else None,
     )
+    if collect_meta and meta is not None and pair_meta:
+        meta["language_pair_mode"] = pair_meta
+    host_candidates = list(transitive_unlocked) if transitive_unlocked else (list(pair_lids) if pair_lids else list(lids))
+    if not host_candidates:
+        host_candidates = list(lids)
+
+    preferred_host = random.choice(host_candidates)
+    host_lid, host_ex, _ = _sample_nonempty_example(
+        dsets_by_lang, host_candidates, prefer_lid=preferred_host
+    )
+    if pair_lids and host_lid not in pair_lids:
+        if pair_meta is not None:
+            pair_meta["active"] = False
+            pair_meta["reason"] = "host_not_in_pair"
+        pair_lids = None
+        transitive_unlocked.clear()
     if host_ex is None:
         if collect_meta and meta is not None:
             meta["samples"].append(
@@ -1200,11 +1607,55 @@ def _make_line_injected_window_impl(
     if not host_text:
         return _make_pure_window_impl(dsets_by_lang, target_len, collect_meta)
 
-    if text_lid is not None:
-        donor_lids = [lid for lid in lids if lid != text_lid]
+    if pair_meta is not None and host_lid is not None:
+        pair_meta["host_language_id"] = int(host_lid)
+        pair_meta["host_language"] = _lang_name(host_lid)
+
+    if transitive_unlocked:
+        host_added = _unlock_language_neighbors(host_lid, available_set, transitive_unlocked)
+        if host_added:
+            unlock_trace.append(
+                {
+                    "event": "host_unlocked",
+                    "trigger": int(host_lid),
+                    "trigger_language": _lang_name(host_lid),
+                    "new_language_ids": sorted(host_added),
+                    "new_languages": [_lang_name(x) for x in sorted(host_added)],
+                    "available_language_ids": sorted(transitive_unlocked),
+                    "available_languages": [_lang_name(x) for x in sorted(transitive_unlocked)],
+                }
+            )
+
+    donor_lids: List[int]
+    transitive_active = bool(transitive_unlocked)
+
+    def _current_transitive_donors() -> List[int]:
+        candidates = {lid for lid in transitive_unlocked if lid != host_lid}
+        if text_lid is not None:
+            candidates.discard(int(text_lid))
+        candidates.difference_update(_PROHIBITED_INJECTION_LIDS)
+        return sorted(candidates)
+
+    if transitive_active:
+        donor_lids = _current_transitive_donors()
+        if pair_meta is not None:
+            pair_meta["donor_candidates"] = [int(lid) for lid in donor_lids]
+            pair_meta["donor_candidate_languages"] = [_lang_name(lid) for lid in donor_lids]
+        if not donor_lids:
+            if pair_meta is not None:
+                pair_meta["active"] = False
+                pair_meta["reason"] = "no_pair_donor_available"
+            transitive_unlocked.clear()
+            transitive_active = False
+
+    if not transitive_active:
+        if text_lid is not None:
+            donor_lids = [lid for lid in lids if lid != text_lid]
+        else:
+            donor_lids = list(lids)
+        donor_lids = [lid for lid in donor_lids if lid not in _PROHIBITED_INJECTION_LIDS]
     else:
-        donor_lids = list(lids)
-    donor_lids = [lid for lid in donor_lids if lid not in _PROHIBITED_INJECTION_LIDS]
+        donor_lids = list(donor_lids)
     chars, labs = list(host_text), [host_lid] * len(host_text)
     char_sources: Optional[List[int]] = None
     host_idx: Optional[int] = None
@@ -1230,10 +1681,27 @@ def _make_line_injected_window_impl(
         char_sources = [host_idx] * len(chars)
 
     boundaries = _choose_injection_boundaries(
-        host_text, data_cfg.host_skip_top_min, data_cfg.host_skip_top_max, data_cfg.line_inject_max_injections
+        host_text,
+        data_cfg.host_skip_top_min,
+        data_cfg.host_skip_top_max,
+        data_cfg.line_inject_max_injections,
+        required_count=3 if enforce_three_injections else None,
     )
 
+    if collect_meta and meta is not None:
+        meta.setdefault("policies", {})["line_inject_force_three_every_third"] = {
+            "requested": enforce_three_injections,
+            "actual_segments": len(boundaries),
+        }
+        if enforce_three_injections and len(boundaries) < 3:
+            meta["policies"]["line_inject_force_three_every_third"]["note"] = "insufficient_host_boundaries"
+
     for bidx in boundaries:
+        if transitive_active:
+            donor_lids = _current_transitive_donors()
+            if pair_meta is not None:
+                pair_meta["donor_candidates"] = [int(lid) for lid in donor_lids]
+                pair_meta["donor_candidate_languages"] = [_lang_name(lid) for lid in donor_lids]
         candidates = donor_lids
         if not candidates:
             continue
@@ -1255,6 +1723,25 @@ def _make_line_injected_window_impl(
         donor_block = _prepare_donor_block(donor_text, data_cfg, insertion_indent)
         if not donor_block:
             continue
+
+        if transitive_active:
+            newly = _unlock_language_neighbors(donor_lid, available_set, transitive_unlocked)
+            if newly:
+                if pair_meta is not None:
+                    expanded = sorted(transitive_unlocked)
+                    pair_meta["expanded_language_ids"] = expanded
+                    pair_meta["expanded_languages"] = [_lang_name(lid) for lid in expanded]
+                unlock_trace.append(
+                    {
+                        "event": "donor_unlocked",
+                        "trigger": int(donor_lid),
+                        "trigger_language": _lang_name(donor_lid),
+                        "new_language_ids": sorted(newly),
+                        "new_languages": [_lang_name(x) for x in sorted(newly)],
+                        "available_language_ids": sorted(transitive_unlocked),
+                        "available_languages": [_lang_name(x) for x in sorted(transitive_unlocked)],
+                    }
+                )
 
         newline_max = max(
             0,
@@ -1355,6 +1842,15 @@ def _make_line_injected_window_impl(
         host_info = meta.get("host")
         if isinstance(host_info, dict):
             host_info.pop("sample_index", None)
+        pair_meta_out = meta.get("language_pair_mode")
+        if pair_meta_out:
+            if unlock_trace:
+                pair_meta_out["unlock_trace"] = unlock_trace
+        if pair_meta_out and transitive_unlocked:
+            unlocked_sorted = sorted(transitive_unlocked)
+            pair_meta_out["unlocked_language_ids"] = unlocked_sorted
+            pair_meta_out["unlocked_languages"] = [_lang_name(lid) for lid in unlocked_sorted]
+            pair_meta_out["unlocked_count"] = len(unlocked_sorted)
     return sanitize_tokens(x), y, meta
 
 
@@ -1501,11 +1997,23 @@ def _make_markdown_window_impl(
                 min_letters=12,
                 strip=True,
             )
-        synthetic = False
         if not snippet:
-            snippet = random.choice(_SYNTHETIC_MARKDOWN_PHRASES)
-            ex = None
-            synthetic = True
+            snippet, ex = _sample_fallback_text_snippet(
+                dsets_by_lang,
+                text_label_id,
+                max_chars=max_chars,
+                min_letters=8,
+                min_length=32,
+            )
+        if not snippet:
+            snippet, ex = _sample_fallback_text_snippet(
+                dsets_by_lang,
+                text_label_id,
+                max_chars=max_chars,
+                min_letters=0,
+                min_length=8,
+            )
+        synthetic = False
         snippet = snippet.strip()
         return snippet, ex, synthetic
 
@@ -1558,7 +2066,7 @@ def _make_markdown_window_impl(
             _fallback()
             return
 
-        lang_token = _lang_name(alt_lid).replace("_", "")
+        lang_token = _pick_markdown_fence_label(alt_lid, allow_generic=False)
 
         code_mode = random.random()
         pre_markup: List[str]
@@ -1582,7 +2090,7 @@ def _make_markdown_window_impl(
                 return
             if not fenced_body.endswith("\n"):
                 fenced_body += "\n"
-            pre_markup = [f"```{lang_token}\n"]
+            pre_markup = [f"```{lang_token}\n"] if lang_token else ["```\n"]
             post_markup = ["```\n"]
             code_text = fenced_body
             spacer_after = False
@@ -1591,7 +2099,8 @@ def _make_markdown_window_impl(
             if not safe_snippet:
                 _fallback()
                 return
-            pre_markup = [f"<code class=\"language-{lang_token}\">"]
+            class_token = lang_token or "plain"
+            pre_markup = [f"<code class=\"language-{class_token}\">"]
             post_markup = ["</code>"]
             code_text = safe_snippet
 
@@ -1637,8 +2146,8 @@ def _make_markdown_window_impl(
     if random.random() < 0.25:
         if random.random() < 0.6 and code_lids:
             stray_lid = random.choice(code_lids)
-            lang_token = _lang_name(stray_lid).replace("_", "")
-            append_markup(f"```{lang_token}\n")
+            lang_token = _pick_markdown_fence_label(stray_lid, allow_generic=True)
+            append_markup(f"```{lang_token}\n" if lang_token else "```\n")
         else:
             append_markup("```\n")
 
@@ -1652,13 +2161,29 @@ def _make_markdown_window_impl(
         include_lang = random.random() < 0.85
         mismatch = include_lang and random.random() < 0.2 and len(code_lids) > 1
         fence_lang_token = ""
+        fence_label_source = "none"
+        label_lid_for_meta: Optional[int] = None
         if include_lang:
             lang_for_token = block["lid"]
+            fence_label_source = "actual"
             if mismatch:
-                alt = [lid for lid in code_lids if lid != block["lid"]]
+                alt = [lid for lid in code_lids if lid != block["lid"] and _markdown_fence_tokens_for_lid(lid)]
                 if alt:
                     lang_for_token = random.choice(alt)
-            fence_lang_token = _lang_name(lang_for_token).replace("_", "")
+                    fence_label_source = "mismatch"
+            candidate_tokens = _markdown_fence_tokens_for_lid(lang_for_token)
+            fence_lang_token = _pick_markdown_fence_label(
+                lang_for_token if candidate_tokens else None,
+                allow_generic=fence_label_source != "actual",
+            )
+            if not fence_lang_token and fence_label_source == "mismatch":
+                fence_lang_token = _pick_markdown_fence_label(None, allow_generic=True)
+                if fence_lang_token:
+                    fence_label_source = "generic"
+            if not fence_lang_token:
+                fence_label_source = "none"
+            else:
+                label_lid_for_meta = int(lang_for_token)
         if fenced:
             fence_text = "```" + (fence_lang_token if fence_lang_token else "")
             if random.random() < 0.3:
@@ -1710,6 +2235,9 @@ def _make_markdown_window_impl(
                     "role": block["role"],
                     "fenced": bool(fenced),
                     "fence_language": fence_lang_token,
+                    "fence_language_source": fence_label_source,
+                    "fence_label_target_language_id": label_lid_for_meta,
+                    "fence_label_mismatch": bool(fence_label_source in {"mismatch", "generic"}),
                     "closed": bool(close_added),
                 }
             )

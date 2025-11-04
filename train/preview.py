@@ -189,6 +189,69 @@ def _render_metadata_summary(metadata: Optional[Dict[str, Any]]) -> str:
         requested_display = requested_key.replace("_", " ").upper() if isinstance(requested_key, str) else str(requested_key)
         parts.append(f'<span class="meta-note">requested {_escape_html(requested_display)}</span>')
 
+    pair_meta = metadata.get("language_pair_mode")
+    if isinstance(pair_meta, dict) and pair_meta.get("selected"):
+        langs = pair_meta.get("languages") or []
+        if langs:
+            pair_display = " + ".join(str(lang).upper() for lang in langs)
+        else:
+            ids = pair_meta.get("ids") or []
+            pair_display = " + ".join(f"ID {int(lid)}" for lid in ids)
+        status_bits = []
+        prob = pair_meta.get("probability")
+        if isinstance(prob, (int, float)) and prob > 0:
+            status_bits.append(f"p={prob:.0%}")
+        if not pair_meta.get("active", True):
+            reason = str(pair_meta.get("reason") or "").replace("_", " ").strip()
+            status_bits.append(f"inactive: {reason}" if reason else "inactive")
+        else:
+            host_name = pair_meta.get("host_language")
+            if host_name:
+                status_bits.append(f"host {str(host_name).upper()}")
+            donors = pair_meta.get("donor_candidate_languages") or []
+            if donors:
+                donor_disp = " & ".join(str(name).upper() for name in donors)
+                status_bits.append(f"donors {donor_disp}")
+            unlocked = pair_meta.get("unlocked_languages") or []
+            if unlocked:
+                unlocked_disp = " & ".join(str(name).upper() for name in unlocked)
+                status_bits.append(f"unlocked {unlocked_disp}")
+            expanded = pair_meta.get("expanded_languages") or []
+            if expanded:
+                expanded_disp = " & ".join(str(name).upper() for name in expanded)
+                status_bits.append(f"expanded {expanded_disp}")
+            if pair_meta.get("applied"):
+                status_bits.append("applied")
+            else:
+                used = pair_meta.get("used_languages") or []
+                missing = pair_meta.get("missing_languages") or []
+                if used:
+                    used_disp = " & ".join(str(name).upper() for name in used)
+                    status_bits.append(f"used {used_disp}")
+                if missing:
+                    missing_disp = " & ".join(str(name).upper() for name in missing)
+                    status_bits.append(f"missing {missing_disp}")
+                if not used and not missing:
+                    status_bits.append("not used")
+        pair_note = f"pair {pair_display}"
+        if status_bits:
+            pair_note += " (" + "; ".join(status_bits) + ")"
+        parts.append(f'<span class="meta-note">{_escape_html(pair_note)}</span>')
+
+        unlock_trace = pair_meta.get("unlock_trace") or []
+        if unlock_trace:
+            parts.append('<details class="meta-section"><summary>Language Unlocks</summary><ul class="meta-list">')
+            for idx, event in enumerate(unlock_trace, start=1):
+                event_type = _escape_html(str(event.get("event", "event")))
+                trigger_lang = event.get("trigger_language")
+                trigger_text = f" by {_escape_html(str(trigger_lang).upper())}" if trigger_lang else ""
+                new_langs = event.get("new_languages") or []
+                avail_langs = event.get("available_languages") or []
+                new_text = f" → new: {', '.join(_escape_html(str(lang).upper()) for lang in new_langs)}" if new_langs else ""
+                avail_text = f" | available: {', '.join(_escape_html(str(lang).upper()) for lang in avail_langs)}" if avail_langs else ""
+                parts.append(f"<li>{idx}. {event_type}{trigger_text}{new_text}{avail_text}</li>")
+            parts.append('</ul></details>')
+
     final_segments = metadata.get("final_segments") or []
     if final_segments:
         seg_bits = []

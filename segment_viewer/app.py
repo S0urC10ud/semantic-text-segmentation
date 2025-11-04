@@ -196,11 +196,13 @@ def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
     pattern = f"run-*-{run_id}"
     for run_dir in wandb_root.glob(pattern):
         config_path = run_dir / "files" / "config.yaml"
-        if not config_path.exists():
-            continue
-        try:
-            config_data = yaml.safe_load(config_path.read_text())
-        except Exception:
+        config_data: Optional[Dict[str, Any]]
+        if config_path.exists():
+            try:
+                config_data = yaml.safe_load(config_path.read_text())
+            except Exception:
+                config_data = None
+        else:
             config_data = None
         if not isinstance(config_data, dict):
             config_data = {}

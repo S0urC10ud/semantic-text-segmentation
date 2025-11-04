@@ -90,14 +90,6 @@ _MAX_NEEDLE_COMMENT_RATIO = 0.4
 _PAYLOAD_MAX_VISIBLE = 1000
 _PAYLOAD_SHELL_CHOICES = ["/bin/bash", "/bin/sh", "/usr/bin/env python3", "/bin/zsh", "powershell", "cmd.exe"]
 _PROHIBITED_INJECTION_LANGS = {"csv", "json", "yaml", "text", "html"}
-_SYNTHETIC_MARKDOWN_PHRASES = [
-    "In this section we walk through the implementation details.",
-    "The following code sample highlights the subtle edge cases we found.",
-    "Remember that any input must be sanitized before reaching this block.",
-    "Below you can find the reproduction steps captured during triage.",
-    "We should mention the trade-offs before the reader inspects the snippet.",
-    "Here's some inline context so the surrounding prose still makes sense.",
-]
 _MARKDOWN_INLINE_CODE_PROB = 0.25
 
 
@@ -279,6 +271,39 @@ def _sample_fragment_snippet(
             continue
         snippet = _trim_text_to_budget(snippet, max_chars)
         if min_letters and _ascii_letter_count(snippet) < min_letters:
+            continue
+        return snippet, fragment
+    return "", None
+
+
+def _sample_fallback_text_fragment(
+    fragments_by_lang: Dict[str, List[Fragment]],
+    rng: random.Random,
+    *,
+    max_chars: int,
+    min_letters: int = 0,
+    min_length: int = 24,
+    attempts: int = 24,
+) -> Tuple[str, Optional[Fragment]]:
+    """
+    Fallback sampler that best-effort draws prose from the validation text pool.
+    Mirrors the behaviour used during training so eval data stays consistent.
+    """
+    pool = fragments_by_lang.get("text")
+    if not pool:
+        return "", None
+    for _ in range(attempts):
+        fragment = rng.choice(pool)
+        snippet = _clean_snippet_text(fragment.content)
+        if not snippet:
+            continue
+        if len(snippet) > max_chars:
+            start = rng.randint(0, max(0, len(snippet) - max_chars))
+            snippet = snippet[start:start + max_chars]
+        snippet = snippet.strip()
+        if len(snippet) < min_length:
+            continue
+        if min_letters > 0 and _ascii_letter_count(snippet) < min_letters:
             continue
         return snippet, fragment
     return "", None
@@ -774,17 +799,29 @@ def _build_markdown_dataset(
     labels = [lbl for lbl, frags in fragments_by_lang.items() if lbl != "text" and frags]
     text_available = bool(fragments_by_lang.get("text"))
     if not text_available:
-        _log("⚠️  No 'text' fragments available; markdown dataset will rely on synthetic prose.")
+        _log("⚠️  No 'text' fragments available; markdown dataset will omit prose blocks.")
 
     def _sample_text_paragraph(max_chars: int = 256) -> Tuple[str, Optional[Fragment], bool]:
         snippet, frag = _sample_fragment_snippet(
             fragments_by_lang, "text", rng, max_chars=max_chars, min_letters=12, strip=True
         )
-        synthetic = False
         if not snippet:
-            snippet = rng.choice(_SYNTHETIC_MARKDOWN_PHRASES)
-            frag = None
-            synthetic = True
+            snippet, frag = _sample_fallback_text_fragment(
+                fragments_by_lang,
+                rng,
+                max_chars=max_chars,
+                min_letters=8,
+                min_length=32,
+            )
+        if not snippet:
+            snippet, frag = _sample_fallback_text_fragment(
+                fragments_by_lang,
+                rng,
+                max_chars=max_chars,
+                min_letters=0,
+                min_length=8,
+            )
+        synthetic = False
         snippet = snippet.strip()
         return snippet, frag, synthetic
 
