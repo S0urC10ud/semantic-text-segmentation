@@ -8,6 +8,7 @@ let LABELS = [];
 let STATE = []; // per-example state: { lastJson: null }
 let tooltip = null;
 let focusMode = false;
+const MODEL_WINDOW = 1536;
 
 const SANITIZE_REGEX = /[^\x20-\x7E¤\n\r\t]/g;
 
@@ -132,7 +133,7 @@ async function runOne(section){
   const codeEl = section.querySelector('.code');
   const runBtn = section.querySelector('.runBtn');
   const minRun = parseInt(section.querySelector('.minRun').value || '6', 10);
-  const chunk = parseInt(section.querySelector('.chunk').value || '1024', 10);
+  const chunk = MODEL_WINDOW;
   const render = section.querySelector('.render');
   const stats = section.querySelector('.stats');
   const timeLabel = section.querySelector('.inferenceTime');
@@ -270,7 +271,7 @@ function createExampleSection(index, initialText){
           <input class="minRun" type="number" min="1" step="1" value="4" />
         </label>
         <label>Window (bytes)
-          <input class="chunk" type="number" min="64" step="64" value="1024" />
+          <input class="chunk" type="number" min="64" step="64" value="1536" readonly />
         </label>
         <span class="inferenceTime" aria-live="polite" title="Wall-clock inference time">—</span>
         <button class="btn primary runBtn">Segment</button>

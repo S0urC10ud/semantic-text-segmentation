@@ -2,6 +2,9 @@ from dataclasses import dataclass
 from typing import Tuple, List, Dict
 import jax.numpy as jnp
 
+# Fixed window size (bytes / tokens) used throughout the project.
+MODEL_WINDOW_BYTES = 1536
+
 # Language and class mapping
 LANG2ID = {
     # Real languages (must stay in sync with downloader outputs – see downloader/0_main.py)
@@ -64,8 +67,8 @@ class DataConfig:
     seed: int = 42
 
     # Windowing and batching
-    window_min_bytes: int = 1536
-    window_max_bytes: int = 1536
+    window_min_bytes: int = MODEL_WINDOW_BYTES
+    window_max_bytes: int = MODEL_WINDOW_BYTES
     bucket_step: int = 128
     batch_size: int = 16
     min_seg_len: int = 64
@@ -129,3 +132,4 @@ class TrainConfig:
     preview_only: bool = False
     preview_start: int = 0
     preview_count: int = 10
+    MODEL_WINDOW_BYTES = 1536

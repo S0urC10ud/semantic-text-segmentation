@@ -7,6 +7,7 @@ import math
 import os
 import random
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -57,18 +58,6 @@ SYNONYMS: Dict[str, Sequence[str]] = {
 def ascii_bar(pct: float, width: int = BAR_WIDTH) -> str:
     filled = int(round(pct * width))
     return "#" * filled + "-" * (width - filled)
-
-def pick_random_window(fp: Path, window_size: int) -> Optional[bytes]:
-    try:
-        size = fp.stat().st_size
-        if size < window_size:
-            return None
-        start = random.randint(0, size - window_size)
-        with fp.open("rb") as f:
-            f.seek(start)
-            return f.read(window_size)
-    except Exception:
-        return None
 
 def extract_label_from_result(res) -> Optional[str]:
     """
@@ -215,105 +204,37 @@ def iter_windows_cover_all_bytes(fp: Path, window_size: int):
 
 # -------------------- Core evaluation (main-thread, app-level batching) --------------------
 
-def eval_label(
+def evaluate_label(
     *,
     m: Magika,
     label: str,
-    dir_path: Path,
-    samples: int,
+    files: Sequence[Path],
     window_size: int,
     batch_size: int,
     show_progress: bool,
     all_labels: Sequence[str],
     threshold: float,
-) -> Tuple[int, int, int, Dict[str, int]]:
+) -> Tuple[Dict[str, object], Counter]:
     """
-    Per-window evaluation (existing behavior).
-    Returns (total_evaluated, correct, skipped_small, misclass_counts)
-    where misclass_counts maps predicted label -> count (only incorrect predictions).
+    Evaluate random-window accuracy (one randomly selected window per file) and
+    per-file accuracy (every window must pass) on the *same* sampled files.
+
+    Returns ``(stats_dict, pred_counter)`` where ``stats_dict`` retains the
+    legacy schema and ``pred_counter`` tallies canonical predictions for the
+    random-window sample (values include ``"(other)"`` for off-manifold outputs).
     """
-    files = choose_files(dir_path, samples, window_size)
+    _ = batch_size  # retained for CLI compatibility; batching handled per file.
+
+    label_set = set(all_labels)
     skipped_small = 0
-
-    # Collect one random window per selected file
-    windows: List[bytes] = []
-    for fp in files:
-        buf = pick_random_window(fp, window_size)
-        if buf is None:
-            skipped_small += 1
-            continue
-        windows.append(buf)
-
-    total = len(windows)
-    if total == 0:
-        return 0, 0, skipped_small, {}
-
-    correct = 0
-    miscls: Dict[str, int] = {}
-
-    indices = range(0, total, batch_size)
-    iterator = indices if not show_progress else tqdm(
-        indices, total=math.ceil(total / batch_size), desc=f"{label} (windows)", unit="batch", leave=False
-    )
-
-    # Application-level batching: process windows in chunks while calling identify_bytes() per window.
-    for i in iterator:
-        chunk = windows[i:i + batch_size]
-        for w in chunk:
-            res = m.identify_bytes(w)
-            pred_label = extract_label_from_result(res)
-            pred_str = str(pred_label).strip().lower() if pred_label else "(none)"
-
-            ok = bool(getattr(res, "ok", False))
-            score = float(getattr(res, "score", 0.0)) if ok else 0.0
-
-            canon = canonicalize_label(pred_label, all_labels)
-            matches_label = canon == label
-            meets_threshold = score > threshold
-
-            if matches_label and meets_threshold:
-                correct += 1
-                continue
-
-            if matches_label:
-                key = f"{pred_str} (below-threshold)"
-            else:
-                key = canon if canon != "(none)" else pred_str
-            miscls[key] = miscls.get(key, 0) + 1
-
-    return total, correct, skipped_small, miscls
-
-
-def eval_label_filewise(
-    *,
-    m: Magika,
-    label: str,
-    dir_path: Path,
-    samples: int,
-    window_size: int,
-    batch_size: int,
-    show_progress: bool,
-    all_labels: Sequence[str],
-    threshold: float,
-) -> Tuple[int, int, int, Dict[str, int]]:
-    """
-    Per-file evaluation.
-
-    For each sampled file, we create windows that *cover all bytes* of the file
-    (1536-byte windows as above), and we count the file as 'correct' only if
-    **every** window:
-        - canonicalizes to the target label, and
-        - satisfies score > threshold (if a score is available).
-
-    Returns (files_total, files_correct, skipped_small, per_file_failure_modes)
-    where per_file_failure_modes aggregates *file-level* failures by the most
-    frequent failing prediction within each failed file.
-    """
-    files = choose_files(dir_path, samples, window_size)
-    skipped_small = 0
+    files_skipped_small = 0
+    total_windows = 0
+    correct_windows = 0
+    per_window_miscls: Dict[str, int] = {}
     total_files = 0
     correct_files = 0
     file_fail_modes: Dict[str, int] = {}
+    pred_counter: Counter[str] = Counter()
 
     iterator = files if not show_progress else tqdm(
         files, total=len(files), desc=f"{label} (files)", unit="file", leave=False
@@ -323,75 +244,81 @@ def eval_label_filewise(
         try:
             size = fp.stat().st_size
         except Exception:
-            # If we can't stat, skip as "small/unreadable"
             skipped_small += 1
+            files_skipped_small += 1
             continue
 
         if size < window_size:
             skipped_small += 1
+            files_skipped_small += 1
+            continue
+
+        fail_counts: Dict[str, int] = {}
+        windows_seen = 0
+        random_choice: Optional[Tuple[bool, Optional[str], str]] = None
+
+        for wb in iter_windows_cover_all_bytes(fp, window_size):
+            if not wb:
+                continue
+
+            res = m.identify_bytes(wb)
+            pred_label = extract_label_from_result(res)
+            pred_str = str(pred_label).strip().lower() if pred_label else "(none)"
+
+            ok = bool(getattr(res, "ok", False))
+            score = float(getattr(res, "score", 0.0)) if ok else 0.0
+
+            canon = canonicalize_label(pred_label, all_labels)
+            matches_label = canon == label
+            meets_threshold = score > threshold
+            success = matches_label and meets_threshold
+
+            fail_key: Optional[str] = None
+            if not success:
+                if matches_label:
+                    fail_key = f"{pred_str} (below-threshold)"
+                else:
+                    fail_key = canon if canon != "(none)" else pred_str
+                fail_counts[fail_key] = fail_counts.get(fail_key, 0) + 1
+
+            windows_seen += 1
+            if random_choice is None or random.randrange(windows_seen) == 0:
+                random_choice = (success, fail_key, canon)
+
+        if windows_seen == 0 or random_choice is None:
+            skipped_small += 1
+            files_skipped_small += 1
             continue
 
         total_files += 1
-        fail_counts: Dict[str, int] = {}
-        batch_bufs: List[bytes] = []
+        total_windows += 1
+        success, fail_key, canon = random_choice
+        if success:
+            correct_windows += 1
+        else:
+            key = fail_key or "(unknown)"
+            per_window_miscls[key] = per_window_miscls.get(key, 0) + 1
 
-        # Stream windows, batching at the application level.
-        for w in iter_windows_cover_all_bytes(fp, window_size):
-            if not w:
-                continue
-            batch_bufs.append(w)
-            if len(batch_bufs) >= batch_size:
-                # Process batch
-                for wb in batch_bufs:
-                    res = m.identify_bytes(wb)
-                    pred_label = extract_label_from_result(res)
-                    pred_str = str(pred_label).strip().lower() if pred_label else "(none)"
+        pred_counter[canon if canon in label_set else "(other)"] += 1
 
-                    ok = bool(getattr(res, "ok", False))
-                    score = float(getattr(res, "score", 0.0)) if ok else 0.0
-
-                    canon = canonicalize_label(pred_label, all_labels)
-                    matches_label = canon == label
-                    meets_threshold = score > threshold
-
-                    if not (matches_label and meets_threshold):
-                        if matches_label:
-                            key = f"{pred_str} (below-threshold)"
-                        else:
-                            key = canon if canon != "(none)" else pred_str
-                        fail_counts[key] = fail_counts.get(key, 0) + 1
-                batch_bufs = []
-
-        # Flush any remaining windows in the final (possibly small) batch
-        if batch_bufs:
-            for wb in batch_bufs:
-                res = m.identify_bytes(wb)
-                pred_label = extract_label_from_result(res)
-                pred_str = str(pred_label).strip().lower() if pred_label else "(none)"
-
-                ok = bool(getattr(res, "ok", False))
-                score = float(getattr(res, "score", 0.0)) if ok else 0.0
-
-                canon = canonicalize_label(pred_label, all_labels)
-                matches_label = canon == label
-                meets_threshold = score > threshold
-
-                if not (matches_label and meets_threshold):
-                    if matches_label:
-                        key = f"{pred_str} (below-threshold)"
-                    else:
-                        key = canon if canon != "(none)" else pred_str
-                    fail_counts[key] = fail_counts.get(key, 0) + 1
-
-        # If there were no failures across the file's windows, it's a success.
         if not fail_counts:
             correct_files += 1
         else:
-            # Attribute this file's failure to the predominant failing key.
             top_key = max(fail_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
             file_fail_modes[top_key] = file_fail_modes.get(top_key, 0) + 1
 
-    return total_files, correct_files, skipped_small, file_fail_modes
+    stats = {
+        "total": total_windows,
+        "correct": correct_windows,
+        "skipped_small": skipped_small,
+        "missing": 0,
+        "miscls": per_window_miscls,
+        "files_total": total_files,
+        "files_correct": correct_files,
+        "files_skipped_small": files_skipped_small,
+        "files_miscls": file_fail_modes,
+    }
+    return stats, pred_counter
 
 
 # -------------------- CLI --------------------
@@ -442,6 +369,10 @@ def main() -> None:
     # Per-file overall accumulators
     overall_total_files = 0
     overall_correct_files = 0
+    pred_buckets = labels + ["(other)"]
+    label_to_idx = {lbl: idx for idx, lbl in enumerate(labels)}
+    pred_to_idx = {lbl: idx for idx, lbl in enumerate(pred_buckets)}
+    confusion = [[0 for _ in pred_buckets] for _ in labels]
 
     for label in labels:
         d, candidate_count = find_label_dir(root, label, window_size=args.window_size)
@@ -455,45 +386,28 @@ def main() -> None:
             print(f"[warn] Missing directory: {root / label}")
             continue
 
-        # ----- Per-window evaluation -----
-        total_w, correct_w, skipped_small_w, miscls_w = eval_label(
+        files = choose_files(d, args.samples_per_dir, args.window_size)
+        stats, pred_counts = evaluate_label(
             m=m,
             label=label,
-            dir_path=d,
-            samples=args.samples_per_dir,
+            files=files,
             window_size=args.window_size,
             batch_size=args.batch_size,
             show_progress=not args.no_progress and sys.stderr.isatty(),
             all_labels=labels,
             threshold=float(args.threshold),
         )
+        per_label_stats[label] = stats
 
-        # ----- Per-file evaluation (all bytes must pass) -----
-        total_f, correct_f, skipped_small_f, miscls_f = eval_label_filewise(
-            m=m,
-            label=label,
-            dir_path=d,
-            samples=args.samples_per_dir,
-            window_size=args.window_size,
-            batch_size=args.batch_size,
-            show_progress=not args.no_progress and sys.stderr.isatty(),
-            all_labels=labels,
-            threshold=float(args.threshold),
-        )
+        row_idx = label_to_idx[label]
+        for pred_label, count in pred_counts.items():
+            col_idx = pred_to_idx.get(pred_label, pred_to_idx["(other)"])
+            confusion[row_idx][col_idx] += int(count)
 
-        per_label_stats[label] = {
-            # windows
-            "total": total_w,
-            "correct": correct_w,
-            "skipped_small": skipped_small_w,
-            "missing": 0,
-            "miscls": miscls_w,
-            # files
-            "files_total": total_f,
-            "files_correct": correct_f,
-            "files_skipped_small": skipped_small_f,
-            "files_miscls": miscls_f,
-        }
+        total_w = int(stats["total"])
+        correct_w = int(stats["correct"])
+        total_f = int(stats["files_total"])
+        correct_f = int(stats["files_correct"])
 
         overall_total_windows += total_w
         overall_correct_windows += correct_w
@@ -557,6 +471,19 @@ def main() -> None:
         overall_file_pct = overall_correct_files / overall_total_files
         print("")
         print(f"OVERALL (files)   | {ascii_bar(overall_file_pct)} | {overall_file_pct*100:5.1f}%  ({overall_correct_files}/{overall_total_files})")
+
+    total_samples = sum(sum(row) for row in confusion)
+    if total_samples > 0:
+        print("\nPer-label confusion counts (random window sample):")
+        for label in labels:
+            row_idx = label_to_idx[label]
+            row = confusion[row_idx]
+            tp = row[pred_to_idx[label]]
+            fn = sum(row) - tp
+            col_idx = pred_to_idx[label]
+            fp = sum(confusion[r][col_idx] for r in range(len(labels))) - tp
+            tn = total_samples - (tp + fp + fn)
+            print(f"{label:12} TP={tp:5d} TN={tn:5d} FP={fp:5d} FN={fn:5d}")
 
 if __name__ == "__main__":
     try:

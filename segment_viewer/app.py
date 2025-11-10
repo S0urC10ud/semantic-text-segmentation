@@ -5,7 +5,7 @@ Segmenter Viewer — FastAPI backend + beautiful frontend
 Run:
   pip install fastapi uvicorn jax jaxlib flax optax numpy orbax-checkpoint
   # (Install the right jax/jaxlib for your CUDA setup if using GPU.)
-  python app.py --ckpt ./seg-unet1d.msgpack --model-dim 256 --channels 96,128,192,256 --dtype bfloat16 --chunk 1024 --lang html,css,javascript_typescript,php
+  python app.py --ckpt ./seg-unet1d.msgpack --model-dim 256 --channels 96,128,192,256 --dtype bfloat16 --chunk 1536 --lang html,css,javascript_typescript,php
 
 Then open http://127.0.0.1:8000
 """
@@ -33,6 +33,7 @@ import dataclasses
 from pathlib import Path
 import re
 import json
+import bisect
 import importlib.util
 import orbax.checkpoint as ocp
 import flax.serialization as serialization
@@ -63,6 +64,8 @@ except ImportError:
     TRAIN_CONFIG = None
 
 DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
+MODEL_WINDOW_BYTES: int = int(getattr(TRAIN_CONFIG, "MODEL_WINDOW_BYTES", 1536))
+DEFAULT_CHUNK_SIZE: int = MODEL_WINDOW_BYTES
 
 
 def _apply_label_mapping(label_names: Sequence[str]) -> None:
@@ -690,16 +693,18 @@ def make_slug(name: str) -> str:
 
 class Predictor:
     def __init__(self, ckpt_path: str, num_classes: int, model_dim: int,
-                 channels: Tuple[int, ...], dtype_str: str = "bfloat16", chunk: int = 1024):
+                 channels: Tuple[int, ...], dtype_str: str = "bfloat16", chunk: int = DEFAULT_CHUNK_SIZE):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         self.num_classes = int(num_classes)
-        self.chunk = int(chunk)
+        self.chunk = int(chunk or DEFAULT_CHUNK_SIZE)
+        if self.chunk <= 0:
+            raise ValueError("Chunk size must be positive.")
         self.dtype = getattr(jnp, dtype_str)
         self.model = UNet1D(num_classes=self.num_classes, emb_dim=int(model_dim),
                             channels=tuple(channels), dtype=self.dtype)
         # Init with dummy to create param structure (int32 tokens to allow PAD_BYTE_ID=256)
-        dummy_tokens = jnp.full((1, 512), PAD_BYTE_ID, dtype=jnp.int32)
+        dummy_tokens = jnp.full((1, self.chunk), PAD_BYTE_ID, dtype=jnp.int32)
         variables = self.model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
         params_template_for_msgpack = variables["params"]
 
@@ -708,6 +713,7 @@ class Predictor:
 
         # Precompile apply fn; JIT caches per-seq-length (shape-polymorphic)
         self._apply = jax.jit(lambda tok: self.model.apply({"params": self.params}, tok, train=False))
+        self._last_window_spans: List[Tuple[int, int]] = []
 
     @staticmethod
     def _window_weights(length: int) -> np.ndarray:
@@ -720,33 +726,54 @@ class Predictor:
         return weights.astype(np.float32)
 
     def _segment_bytes(self, byte_arr: np.ndarray, chunk: int = None) -> tuple[np.ndarray, np.ndarray]:
-        chunk = int(chunk or self.chunk)
+        chunk_size = self.chunk
+        if chunk is not None:
+            requested = int(chunk)
+            if requested != self.chunk:
+                raise ValueError(
+                    f"Predictor initialized with chunk={self.chunk} but received chunk={requested}."
+                )
         N = int(len(byte_arr))
         out = np.zeros((N,), dtype=np.uint8)
         probs_accum = np.zeros((N, self.num_classes), dtype=np.float32)
         weight_accum = np.zeros((N,), dtype=np.float32)
         if N == 0:
             return out, probs_accum
-        win = max(64, int(chunk))
+        win = max(64, chunk_size)
         stride = max(1, win // 2)
-        xs, idxs = [], []
-        for start in range(0, max(1, N - win + 1), stride):
-            xs.append(byte_arr[start:start+win])
-            idxs.append((start, min(start + win, N)))
+        start_positions = list(range(0, max(1, N - win + 1), stride))
+        if not start_positions:
+            start_positions = [0]
+        last_start = start_positions[-1]
+        tail_start = max(0, N - win)
+        if last_start + win < N and tail_start not in start_positions:
+            start_positions.append(tail_start)
+        spans: List[Tuple[int, int]] = []
+        xs: List[np.ndarray] = []
+        seen = set()
+        for start in start_positions:
+            if start in seen:
+                continue
+            seen.add(start)
+            end = min(start + win, N)
+            xs.append(byte_arr[start:end])
+            spans.append((start, end))
         if not xs:
-            xs, idxs = [byte_arr], [(0, N)]
+            xs = [byte_arr]
+            spans = [(0, N)]
         bs = 16
         for i in range(0, len(xs), bs):
             batch = xs[i:i+bs]
-            maxL = max(len(b) for b in batch)
-            tokens = np.full((len(batch), maxL), PAD_BYTE_ID, dtype=np.int32)
+            actual = len(batch)
+            tokens = np.full((bs, chunk_size), PAD_BYTE_ID, dtype=np.int32)
             for j, b in enumerate(batch):
-                tokens[j, :len(b)] = b.astype(np.int32)
+                length = min(len(b), chunk_size)
+                tokens[j, :length] = b[:length].astype(np.int32)
             tokens = _sanitize_model_tokens(tokens)
             logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
             # Convert logits to probabilities using softmax
-            probs_batch = np.array(jax.nn.softmax(logits, axis=-1))
-            for j, (s, e) in enumerate(idxs[i:i+bs]):
+            probs_batch = np.array(jax.nn.softmax(logits, axis=-1))[:actual, :chunk_size]
+            for j, (s, e) in enumerate(spans[i:i+bs]):
                 plen = e - s
                 if plen <= 0:
                     continue
@@ -763,6 +790,7 @@ class Predictor:
         else:
             probs_accum[:] = 1.0 / self.num_classes
         out = np.argmax(probs_accum, axis=-1).astype(np.uint8)
+        self._last_window_spans = [(int(s), int(e)) for (s, e) in spans]
         return out, probs_accum
 
     def _byte_labels_to_char_labels(self, text: str, byte_labels: np.ndarray, byte_probs: np.ndarray = None) -> tuple[List[int], List[Dict[str, float]]]:
@@ -822,7 +850,7 @@ class Predictor:
 
     def segment_text(self, text: str, min_run_chars: int = 6, chunk: int = None):
         b = _sanitize_model_bytes(np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8))
-        byte_labels, byte_probs = self._segment_bytes(b, chunk=chunk)
+        byte_labels, byte_probs = self._segment_bytes(b)
         char_labels, char_probs = self._byte_labels_to_char_labels(text, byte_labels, byte_probs)
         char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
         segs = []
@@ -833,7 +861,26 @@ class Predictor:
                     segs.append((start, i, cur))
                     start = i; cur = char_labels[i]
             segs.append((start, len(char_labels), cur))
-        return segs, char_labels, char_probs
+        spans = getattr(self, "_last_window_spans", None)
+        if not spans:
+            spans = [(0, int(len(b)))]
+        byte_offsets = [0]
+        for ch in text:
+            byte_offsets.append(byte_offsets[-1] + len(ch.encode("utf-8", "ignore")))
+        windows_info: List[Dict[str, int]] = []
+        for idx, (start_byte, end_byte) in enumerate(spans):
+            start_char = bisect.bisect_left(byte_offsets, start_byte)
+            end_char = bisect.bisect_left(byte_offsets, end_byte)
+            windows_info.append(
+                {
+                    "index": idx,
+                    "start_byte": int(start_byte),
+                    "end_byte": int(end_byte),
+                    "start_char": int(start_char),
+                    "end_char": int(end_char),
+                }
+            )
+        return segs, char_labels, char_probs, windows_info
 
 # ---------------------------
 # FastAPI wiring
@@ -851,7 +898,12 @@ parser.add_argument(
 parser.add_argument("--model-dim", type=int, default=None, help="Model embedding dimension (auto if omitted).")
 parser.add_argument("--channels", type=str, default=None, help="Comma-separated channel sizes (auto if omitted).")
 parser.add_argument("--dtype", type=str, default=None, help="Model dtype name (auto if omitted).")
-parser.add_argument("--chunk", type=int, default=1024, help="Inference window")
+parser.add_argument(
+    "--chunk",
+    type=int,
+    default=DEFAULT_CHUNK_SIZE,
+    help="Inference window size (model expects padded segments of this length).",
+)
 parser.add_argument(
     "--lang",
     type=str,
@@ -1000,12 +1052,17 @@ def api_segment(req: SegmentRequest):
     if len(text) == 0:
         return {"segments": [], "stats": {}, "html": ""}
 
+    if req.chunk and int(req.chunk) != predictor.chunk:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chunk size override ({req.chunk}) does not match model window ({predictor.chunk}).",
+        )
+
     import time as _time
     t0 = _time.perf_counter()
     try:
-        segs, char_labels, char_probs = predictor.segment_text(
-            text, min_run_chars=int(req.min_run),
-            chunk=int(req.chunk) if req.chunk else args.chunk
+        segs, char_labels, char_probs, window_info = predictor.segment_text(
+            text, min_run_chars=int(req.min_run)
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1015,7 +1072,37 @@ def api_segment(req: SegmentRequest):
         return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 .replace('"', "&quot;").replace("'", "&#39;"))
 
-    out_html = []
+    window_lookup = {int(w["index"]): w for w in window_info}
+    window_start_map: Dict[int, List[int]] = {}
+    window_end_map: Dict[int, List[int]] = {}
+    for entry in window_info:
+        idx = int(entry["index"])
+        window_start_map.setdefault(int(entry["start_char"]), []).append(idx)
+        window_end_map.setdefault(int(entry["end_char"]), []).append(idx)
+    for mapping in (window_start_map, window_end_map):
+        for key in mapping:
+            mapping[key].sort()
+
+    def marker_html(idx: int, position: str) -> str:
+        info = window_lookup.get(idx)
+        char_pos = info.get(f"{position}_char") if info else None
+        byte_pos = info.get(f"{position}_byte") if info else None
+        details = []
+        if isinstance(char_pos, int):
+            details.append(f"char {char_pos}")
+        if isinstance(byte_pos, int):
+            details.append(f"byte {byte_pos}")
+        label = f"Window {idx + 1} {position}"
+        if details:
+            label += " (" + ", ".join(details) + ")"
+        safe_label = esc(label)
+        return (
+            f'<span class="window-marker window-marker-{position}" '
+            f'data-window="{idx + 1}" data-position="{position}" '
+            f'title="{safe_label}" aria-label="{safe_label}">|</span>'
+        )
+
+    out_html: List[str] = []
     for (s, e, lbl) in segs:
         raw = text[s:e]
         cls = ID2SLUG.get(lbl, f"class-{lbl}")
@@ -1025,6 +1112,10 @@ def api_segment(req: SegmentRequest):
         chars_html = []
         for i, ch in enumerate(raw):
             char_idx = s + i
+            for win_idx in window_start_map.get(char_idx, []):
+                chars_html.append(marker_html(win_idx, "start"))
+            for win_idx in window_end_map.get(char_idx, []):
+                chars_html.append(marker_html(win_idx, "end"))
             probs = char_probs[char_idx]
             # Aggregate by canonical label
             agg: Dict[str, float] = {}
@@ -1055,6 +1146,12 @@ def api_segment(req: SegmentRequest):
             f'box-shadow: inset 0 -1px 0 {border_color};">'
             f'{"".join(chars_html)}</span>'
         )
+    total_chars = len(char_labels)
+    trailing_markers: List[str] = []
+    for win_idx in window_end_map.get(total_chars, []):
+        trailing_markers.append(marker_html(win_idx, "end"))
+    if trailing_markers:
+        out_html.append("".join(trailing_markers))
     html_joined = "".join(out_html)
 
     import collections
@@ -1069,6 +1166,7 @@ def api_segment(req: SegmentRequest):
         "stats": stats,
         "html": html_joined,
         "elapsed_ms": elapsed_ms,
+        "window_info": window_info,
     }
 
 if __name__ == "__main__":

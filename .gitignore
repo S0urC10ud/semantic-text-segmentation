@@ -5,6 +5,8 @@
 # Byte-compiled Python files
 __pycache__/
 *.pyc
+comparisons/
+train/confusion_images/
 downloader/stack*/**
 downloader/arrow*/**
 train/wandb/**

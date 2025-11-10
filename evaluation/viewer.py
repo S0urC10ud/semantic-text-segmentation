@@ -82,6 +82,7 @@ DEFAULT_COLOR_BY_LABEL: Dict[str, str] = {
 }
 
 DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
+DEFAULT_CHUNK_SIZE: int = cfg.MODEL_WINDOW_BYTES
 PREDICTION_LABEL_ALIASES: Dict[str, str] = {
     "c": "c_family",
     "cpp": "c_family",
@@ -369,7 +370,7 @@ class SegmenterRunner:
         model_dim: int,
         channels: Sequence[int],
         dtype: str,
-        chunk: int,
+        chunk: int = DEFAULT_CHUNK_SIZE,
         device: Optional[str],
     ):
         try:
@@ -379,7 +380,10 @@ class SegmenterRunner:
                 print(f"⚠️  Requested backend '{backend}' not available. Found: {sorted(available)}. Falling back to CPU.", flush=True)
                 backend = "cpu"
             self.backend = backend
-            self.chunk = int(max(64, chunk))
+            chunk_val = int(chunk or DEFAULT_CHUNK_SIZE)
+            if chunk_val <= 0:
+                raise ValueError("Chunk size must be positive.")
+            self.chunk = max(64, chunk_val)
             self.num_classes = cfg.NUM_CLASSES
             dt = getattr(jnp, dtype)
 
@@ -387,14 +391,17 @@ class SegmenterRunner:
             jax.config.update('jax_default_matmul_precision', 'float32')
 
             self.model = UNet1D(num_classes=self.num_classes, emb_dim=model_dim, channels=tuple(channels), dtype=dt)
-            dummy_tokens = jnp.full((1, 256), cfg.PAD_BYTE_ID, dtype=jnp.int32)
+            dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
             variables = self.model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
             params_template = variables["params"]
             self.params = self._load_params(checkpoint_path, params_template)
         except Exception as e:
             print(f"⚠️  Error initializing model: {e}. Trying with CPU backend.", flush=True)
             self.backend = "cpu"
-            self.chunk = int(max(64, chunk))
+            chunk_val = int(chunk or DEFAULT_CHUNK_SIZE)
+            if chunk_val <= 0:
+                raise ValueError("Chunk size must be positive.")
+            self.chunk = max(64, chunk_val)
             self.num_classes = cfg.NUM_CLASSES
             dt = getattr(jnp, dtype)
 
@@ -402,7 +409,7 @@ class SegmenterRunner:
             jax.config.update('jax_default_matmul_precision', 'float32')
 
             self.model = UNet1D(num_classes=self.num_classes, emb_dim=model_dim, channels=tuple(channels), dtype=dt)
-            dummy_tokens = jnp.full((1, 256), cfg.PAD_BYTE_ID, dtype=jnp.int32)
+            dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
             variables = self.model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
             params_template = variables["params"]
             self.params = self._load_params(checkpoint_path, params_template)
@@ -512,13 +519,14 @@ class SegmenterRunner:
         for idx in range(0, len(windows), batch):
             batch_windows = windows[idx:idx + batch]
             span_slice = spans[idx:idx + batch]
-            max_len = max(len(w) for w in batch_windows)
-            tokens = np.full((len(batch_windows), max_len), cfg.PAD_BYTE_ID, dtype=np.int32)
+            actual = len(batch_windows)
+            tokens = np.full((batch, self.chunk), cfg.PAD_BYTE_ID, dtype=np.int32)
             for j, win_bytes in enumerate(batch_windows):
-                tokens[j, : len(win_bytes)] = win_bytes.astype(np.int32)
+                length = min(len(win_bytes), self.chunk)
+                tokens[j, :length] = win_bytes[:length].astype(np.int32)
             tokens = sanitize_tokens(tokens)
             logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
-            probs = np.array(jax.nn.softmax(np.array(logits), axis=-1))
+            probs = np.array(jax.nn.softmax(np.array(logits), axis=-1))[:actual, :self.chunk]
             for j, (start, end) in enumerate(span_slice):
                 length = end - start
                 if length <= 0:
@@ -686,7 +694,12 @@ parser.add_argument("--device", default="auto", help="Device for inference (cpu/
 parser.add_argument("--model-dim", type=int, default=None)
 parser.add_argument("--channels", type=str, default=None)
 parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float32", "float16"])
-parser.add_argument("--chunk", type=int, default=1024, help="Sliding window size for inference.")
+parser.add_argument(
+    "--chunk",
+    type=int,
+    default=DEFAULT_CHUNK_SIZE,
+    help="Sliding window size for inference (model pads/truncates to this length).",
+)
 parser.add_argument("--min-run", type=int, default=1, help="Minimum run length smoothing for predictions (chars).")
 parser.add_argument("--max-preview-chars", type=int, default=6000, help="Trim displayed text beyond this many characters.")
 parser.add_argument("--host", type=str, default="127.0.0.1")

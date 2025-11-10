@@ -100,7 +100,7 @@ def count_params(params) -> int:
 def create_train_state(rng, cfg: "TrainConfig", num_classes: int):
     model = UNet1D(num_classes=num_classes, emb_dim=cfg.model_dim,
                    channels=cfg.channels, dropout_rate=cfg.dropout_rate, dtype=cfg.dtype)
-    dummy_tokens = jnp.zeros((1, 512), dtype=jnp.int32)
+    dummy_tokens = jnp.zeros((1, cfg.MODEL_WINDOW_BYTES), dtype=jnp.int32)
     variables = model.init({"params": rng, "dropout": rng}, dummy_tokens, train=True)
     params = variables["params"]
 

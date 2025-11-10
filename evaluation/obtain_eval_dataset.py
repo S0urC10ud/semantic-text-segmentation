@@ -4,28 +4,11 @@
 This script samples fragments from the downloader-produced validation split and
 derives a set of benchmark tasks covering:
 
-  • Pure single-label fragments (baseline accuracy by content type).
-  • Needle-in-the-haystack injections with multiple size buckets.
-  • Back-to-back multi-label sequences (pairs and triplets).
-  • Markdown-flavoured mixtures with optional prose/context blocks.
-  • Throughput stress datasets targeting fixed byte budgets.
-
-Each task is written as its own Hugging Face Dataset (Arrow format) under the
-requested output directory together with an inventory manifest.
-
-The generated records share a common schema:
-
-  - ``task``: identifier for the evaluation scenario.
-  - ``example_id``: deterministic unique id per example.
-  - ``content``: UTF-8 text presented to the model.
-  - ``segments``: ordered ground-truth segments with ``label``, ``char_start``,
-    and ``char_end`` (exclusive) indices.
-  - ``source_langs``: distinct labels contributing to the example.
-  - ``metadata_json``: JSON-encoded auxiliary metadata (host/donor UIDs, etc.).
-
-The default configuration samples 1,000 host fragments per content type for
-each task as requested, but smaller counts can be supplied to keep dataset size
-manageable during iteration.
+- Pure single-label fragments (baseline accuracy by content type).
+- Needle-in-the-haystack injections with multiple size buckets.
+- Back-to-back multi-label sequences (pairs and triplets).
+- Markdown-flavoured mixtures with optional prose/context blocks.
+- Throughput stress datasets targeting fixed byte budgets.
 """
 
 from __future__ import annotations

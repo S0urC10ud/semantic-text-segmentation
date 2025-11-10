@@ -1,28 +1,14 @@
 #!/usr/bin/env python3
-"""Comprehensive evaluation harness for the segmentation model.
+"""Comprehensive evaluation harness for the labeling model.
 
 The script expects evaluation datasets produced by ``obtain_eval_dataset.py``
-and runs a battery of benchmarks:
-
-  • Task accuracy on curated validation-derived datasets (pure fragments,
-    injections, mixed sequences, markdown blends).
-  • Throughput measurements on fixed-length windows for both CPU and GPU
-    (when available), including coarse memory usage observations.
-
-Results are aggregated into a Markdown report containing:
-
-  - Summary metrics per task (overall and macro accuracy).
-  - Per-label accuracy tables for each task (sorted by recall).
-  - Throughput/latency tables for the stress benchmarks.
+and runs a battery of benchmarks (outputs visible in report.md)
 
 Example:
-
-```
 python evaluation.py \
   --checkpoint checkpoints/seg-unet1d.msgpack \
   --data-root evaluation/data \
   --report-path evaluation/report.md
-```
 """
 
 from __future__ import annotations
@@ -48,6 +34,7 @@ except Exception:  # pragma: no cover
     psutil = None
 
 DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
+DEFAULT_CHUNK_SIZE: int  # populated after importing train.config
 PREDICTION_LABEL_ALIASES: Dict[str, str] = {
     "c": "c_family",
     "cpp": "c_family",
@@ -83,6 +70,8 @@ from train import config as cfg  # noqa: E402
 from train.model import UNet1D  # noqa: E402
 from train.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
 from train.metrics_helper import compute_metrics_from_confusion  # noqa: E402
+
+DEFAULT_CHUNK_SIZE = cfg.MODEL_WINDOW_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +319,7 @@ class SegmenterRunner:
         model_dim: int,
         channels: Sequence[int],
         dtype: str = "bfloat16",
-        chunk: int = 1024,
+        chunk: int = DEFAULT_CHUNK_SIZE,
         device: Optional[str] = None,
         batch_size: int = 16,
     ):
@@ -341,7 +330,9 @@ class SegmenterRunner:
                 f"Requested backend '{backend}' not available. Available: {sorted(available)}"
             )
         self.backend = backend
-        self.chunk = int(chunk)
+        self.chunk = int(chunk or DEFAULT_CHUNK_SIZE)
+        if self.chunk <= 0:
+            raise ValueError("Chunk size must be positive.")
         self.batch_size = int(batch_size)
         self.num_classes = cfg.NUM_CLASSES
         dt = getattr(jnp, dtype)
@@ -355,7 +346,7 @@ class SegmenterRunner:
                 channels=tuple(int(ch) for ch in channel_values),
                 dtype=dt,
             )
-            dummy_tokens = jnp.full((1, 256), cfg.PAD_BYTE_ID, dtype=jnp.int32)
+            dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
             variables = model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
             template = variables["params"]
             params = _load_params_from_any(checkpoint_path, template)
@@ -653,11 +644,16 @@ def _markdown_stat_group() -> Dict[str, Any]:
         "detected_correct": 0,
         "detected_nontext": 0,
         "detected_text": 0,
+        "detected_correct_iou": 0,
+        "detected_nontext_iou": 0,
+        "detected_text_iou": 0,
         "truth_chars": 0,
         "correct_chars": 0,
         "nontext_chars": 0,
         "text_chars": 0,
         "iou_sum": 0.0,
+        "nontext_iou_sum": 0.0,
+        "text_iou_sum": 0.0,
         "wrong_label_cases": 0,
         "wrong_label_fooled": 0,
     }
@@ -820,6 +816,9 @@ def evaluate_task(
             "correct_chars": 0,
             "needle_chars": 0,
             "iou_sum": 0.0,
+            "coverage_hits": 0,
+            "coverage_sum": 0.0,
+            "coverage_count": 0,
             "any_detection": {
                 "count": 0,
                 "detected": 0,
@@ -827,6 +826,9 @@ def evaluate_task(
                 "truth_chars": 0,
                 "correct_chars": 0,
                 "iou_sum": 0.0,
+                "coverage_hits": 0,
+                "coverage_sum": 0.0,
+                "coverage_count": 0,
             },
         }
         extra_payload["needle_detection"] = needle_stats
@@ -852,6 +854,12 @@ def evaluate_task(
                 "nontext_chars": 0,
                 "text_chars": 0,
                 "by_wrapper": {},
+                "correct_iou_hits": 0,
+                "nontext_iou_hits": 0,
+                "text_iou_hits": 0,
+                "correct_iou_sum": 0.0,
+                "nontext_iou_sum": 0.0,
+                "text_iou_sum": 0.0,
             },
         }
         extra_payload["markdown_segments"] = markdown_stats
@@ -868,6 +876,9 @@ def evaluate_task(
                 "truth_chars": 0,
                 "correct_chars": 0,
                 "iou_sum": 0.0,
+                "coverage_hits": 0,
+                "coverage_sum": 0.0,
+                "coverage_count": 0,
             },
             "any_by_lang": {},
         }
@@ -1007,6 +1018,11 @@ def evaluate_task(
                             needle_stats["detected"] += 1
                         else:
                             needle_stats["below_threshold"] += 1
+                    coverage_ratio = intersection / needle_chars if needle_chars > 0 else 0.0
+                    needle_stats["coverage_sum"] += coverage_ratio
+                    needle_stats["coverage_count"] += 1
+                    if coverage_ratio >= threshold:
+                        needle_stats["coverage_hits"] += 1
 
                     any_entry = needle_stats.get("any_detection")
                     if any_entry is not None:
@@ -1015,9 +1031,8 @@ def evaluate_task(
                             foreign_mask = np.logical_and(valid_pred_mask, pred_valid != host_idx)
                         else:
                             foreign_mask = valid_pred_mask
-                        detection_mask = np.logical_and(foreign_mask, truth_mask)
-                        intersection_any = int(detection_mask.sum())
-                        union_any = needle_chars
+                        intersection_any = int(np.logical_and(foreign_mask, truth_mask).sum())
+                        union_any = int(np.logical_or(foreign_mask, truth_mask).sum())
                         if union_any > 0:
                             iou_any = intersection_any / union_any
                             any_entry["count"] += 1
@@ -1028,6 +1043,11 @@ def evaluate_task(
                                 any_entry["detected"] += 1
                             else:
                                 any_entry["below_threshold"] += 1
+                        coverage_any = intersection_any / needle_chars if needle_chars > 0 else 0.0
+                        any_entry["coverage_sum"] += coverage_any
+                        any_entry["coverage_count"] += 1
+                        if coverage_any >= threshold:
+                            any_entry["coverage_hits"] += 1
 
         if markdown_stats is not None:
             threshold = float(markdown_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
@@ -1066,17 +1086,30 @@ def evaluate_task(
                 block_len = int(valid_mask_block.sum())
                 if block_len <= 0:
                     continue
-                slice_pred = pred_idx_array[start:end][valid_mask_block]
-                correct_chars = int((slice_pred == actual_idx).sum())
+                slice_pred_full = pred_idx_array[start:end]
+                slice_pred = slice_pred_full[valid_mask_block]
+                pred_correct_mask = (slice_pred_full == actual_idx)
                 if text_idx is not None:
-                    text_chars = int((slice_pred == text_idx).sum())
-                    nontext_chars = int((slice_pred != text_idx).sum())
+                    pred_text_mask = (slice_pred_full == text_idx)
+                    pred_nontext_mask = np.logical_not(pred_text_mask)
                 else:
-                    text_chars = 0
-                    nontext_chars = correct_chars
-                coverage = correct_chars / block_len if block_len else 0.0
-                nontext_cov = nontext_chars / block_len if block_len else 0.0
-                text_cov = text_chars / block_len if block_len else 0.0
+                    pred_text_mask = np.zeros_like(slice_pred_full, dtype=bool)
+                    pred_nontext_mask = np.ones_like(slice_pred_full, dtype=bool)
+                intersection_correct = int(np.logical_and(pred_correct_mask, valid_mask_block).sum())
+                union_correct = int(np.logical_or(pred_correct_mask, valid_mask_block).sum())
+                intersection_nontext = int(np.logical_and(pred_nontext_mask, valid_mask_block).sum())
+                union_nontext = int(np.logical_or(pred_nontext_mask, valid_mask_block).sum())
+                intersection_text = int(np.logical_and(pred_text_mask, valid_mask_block).sum())
+                union_text = int(np.logical_or(pred_text_mask, valid_mask_block).sum())
+                coverage = intersection_correct / block_len if block_len else 0.0
+                nontext_cov = intersection_nontext / block_len if block_len else 0.0
+                text_cov = intersection_text / block_len if block_len else 0.0
+                correct_iou = intersection_correct / union_correct if union_correct > 0 else 0.0
+                nontext_iou = intersection_nontext / union_nontext if union_nontext > 0 else 0.0
+                text_iou = intersection_text / union_text if union_text > 0 else 0.0
+                correct_chars = intersection_correct
+                nontext_chars = intersection_nontext
+                text_chars = intersection_text
                 wrapper_key = "wrapped" if block.get("wrapped") else "plain"
                 role = block.get("role", "host")
                 role_groups = markdown_stats["roles"].setdefault(
@@ -1095,14 +1128,22 @@ def evaluate_task(
                     group["correct_chars"] += correct_chars
                     group["nontext_chars"] += nontext_chars
                     group["text_chars"] += text_chars
-                    if math.isfinite(coverage):
-                        group["iou_sum"] += coverage
+                    if math.isfinite(correct_iou):
+                        group["iou_sum"] += correct_iou
+                    group["nontext_iou_sum"] += nontext_iou
+                    group["text_iou_sum"] += text_iou
                     if coverage >= threshold:
                         group["detected_correct"] += 1
                     if nontext_cov >= threshold:
                         group["detected_nontext"] += 1
                     if text_cov >= threshold:
                         group["detected_text"] += 1
+                    if correct_iou >= threshold:
+                        group["detected_correct_iou"] += 1
+                    if nontext_iou >= threshold:
+                        group["detected_nontext_iou"] += 1
+                    if text_iou >= threshold:
+                        group["detected_text_iou"] += 1
 
                 if block.get("mismatched") and block.get("display_language"):
                     markdown_stats["wrong_label"]["cases"] += 1
@@ -1140,22 +1181,40 @@ def evaluate_task(
                 block_len = int(valid_mask_block.sum())
                 if block_len <= 0:
                     continue
-                slice_pred = pred_idx_array[start:end][valid_mask_block]
-                correct_chars = int((slice_pred == inline_idx).sum())
+                slice_pred_full = pred_idx_array[start:end]
                 if text_idx is not None:
-                    text_chars = int((slice_pred == text_idx).sum())
-                    nontext_chars = int((slice_pred != text_idx).sum())
+                    pred_text_mask = (slice_pred_full == text_idx)
+                    pred_nontext_mask = np.logical_not(pred_text_mask)
                 else:
-                    text_chars = 0
-                    nontext_chars = correct_chars
-                coverage = correct_chars / block_len if block_len else 0.0
-                nontext_cov = nontext_chars / block_len if block_len else 0.0
-                text_cov = text_chars / block_len if block_len else 0.0
+                    pred_text_mask = np.zeros_like(slice_pred_full, dtype=bool)
+                    pred_nontext_mask = np.ones_like(slice_pred_full, dtype=bool)
+                pred_correct_mask = (slice_pred_full == inline_idx)
+                intersection_correct = int(np.logical_and(pred_correct_mask, valid_mask_block).sum())
+                union_correct = int(np.logical_or(pred_correct_mask, valid_mask_block).sum())
+                intersection_nontext = int(np.logical_and(pred_nontext_mask, valid_mask_block).sum())
+                union_nontext = int(np.logical_or(pred_nontext_mask, valid_mask_block).sum())
+                intersection_text = int(np.logical_and(pred_text_mask, valid_mask_block).sum())
+                union_text = int(np.logical_or(pred_text_mask, valid_mask_block).sum())
+                coverage = intersection_correct / block_len if block_len else 0.0
+                nontext_cov = intersection_nontext / block_len if block_len else 0.0
+                text_cov = intersection_text / block_len if block_len else 0.0
+                correct_iou = intersection_correct / union_correct if union_correct > 0 else 0.0
+                nontext_iou = intersection_nontext / union_nontext if union_nontext > 0 else 0.0
+                text_iou = intersection_text / union_text if union_text > 0 else 0.0
+                correct_chars = intersection_correct
+                nontext_chars = intersection_nontext
+                text_chars = intersection_text
                 inline_stats["count"] += 1
                 inline_stats["truth_chars"] += block_len
                 inline_stats["correct_chars"] += correct_chars
                 inline_stats["nontext_chars"] += nontext_chars
                 inline_stats["text_chars"] += text_chars
+                inline_stats.setdefault("correct_iou_sum", 0.0)
+                inline_stats.setdefault("nontext_iou_sum", 0.0)
+                inline_stats.setdefault("text_iou_sum", 0.0)
+                inline_stats["correct_iou_sum"] += correct_iou
+                inline_stats["nontext_iou_sum"] += nontext_iou
+                inline_stats["text_iou_sum"] += text_iou
                 wrapper_type = inline_block.get("wrapper", "inline_backtick")
                 wrapper_entry = inline_stats["by_wrapper"].setdefault(
                     wrapper_type,
@@ -1168,6 +1227,12 @@ def evaluate_task(
                         "correct_chars": 0,
                         "nontext_chars": 0,
                         "text_chars": 0,
+                        "correct_iou_sum": 0.0,
+                        "nontext_iou_sum": 0.0,
+                        "text_iou_sum": 0.0,
+                        "correct_iou_hits": 0,
+                        "nontext_iou_hits": 0,
+                        "text_iou_hits": 0,
                     },
                 )
                 wrapper_entry["count"] += 1
@@ -1175,6 +1240,9 @@ def evaluate_task(
                 wrapper_entry["correct_chars"] += correct_chars
                 wrapper_entry["nontext_chars"] += nontext_chars
                 wrapper_entry["text_chars"] += text_chars
+                wrapper_entry["correct_iou_sum"] += correct_iou
+                wrapper_entry["nontext_iou_sum"] += nontext_iou
+                wrapper_entry["text_iou_sum"] += text_iou
                 if coverage >= inline_threshold:
                     inline_stats["correct_hits"] += 1
                     wrapper_entry["correct_hits"] += 1
@@ -1184,6 +1252,15 @@ def evaluate_task(
                 if text_cov >= inline_threshold:
                     inline_stats["text_hits"] += 1
                     wrapper_entry["text_hits"] += 1
+                inline_stats.setdefault("correct_iou_hits", 0)
+                inline_stats.setdefault("nontext_iou_hits", 0)
+                inline_stats.setdefault("text_iou_hits", 0)
+                inline_stats["correct_iou_hits"] += int(correct_iou >= inline_threshold)
+                inline_stats["nontext_iou_hits"] += int(nontext_iou >= inline_threshold)
+                inline_stats["text_iou_hits"] += int(text_iou >= inline_threshold)
+                wrapper_entry["correct_iou_hits"] += int(correct_iou >= inline_threshold)
+                wrapper_entry["nontext_iou_hits"] += int(nontext_iou >= inline_threshold)
+                wrapper_entry["text_iou_hits"] += int(text_iou >= inline_threshold)
                 lang_inline = inline_stats.setdefault("per_language", {}).setdefault(
                     inline_label,
                     {
@@ -1195,6 +1272,12 @@ def evaluate_task(
                         "correct_chars": 0,
                         "nontext_chars": 0,
                         "text_chars": 0,
+                        "correct_iou_sum": 0.0,
+                        "nontext_iou_sum": 0.0,
+                        "text_iou_sum": 0.0,
+                        "correct_iou_hits": 0,
+                        "nontext_iou_hits": 0,
+                        "text_iou_hits": 0,
                     },
                 )
                 lang_inline["count"] += 1
@@ -1202,12 +1285,18 @@ def evaluate_task(
                 lang_inline["correct_chars"] += correct_chars
                 lang_inline["nontext_chars"] += nontext_chars
                 lang_inline["text_chars"] += text_chars
+                lang_inline["correct_iou_sum"] += correct_iou
+                lang_inline["nontext_iou_sum"] += nontext_iou
+                lang_inline["text_iou_sum"] += text_iou
                 if coverage >= inline_threshold:
                     lang_inline["correct_hits"] += 1
                 if nontext_cov >= inline_threshold:
                     lang_inline["nontext_hits"] += 1
                 if text_cov >= inline_threshold:
                     lang_inline["text_hits"] += 1
+                lang_inline["correct_iou_hits"] += int(correct_iou >= inline_threshold)
+                lang_inline["nontext_iou_hits"] += int(nontext_iou >= inline_threshold)
+                lang_inline["text_iou_hits"] += int(text_iou >= inline_threshold)
 
         if payload_stats is not None:
             payload_lang = metadata.get("payload_lang")
@@ -1226,9 +1315,13 @@ def evaluate_task(
                                 non_host_mask = (pred_valid != host_idx)
                             else:
                                 non_host_mask = np.ones_like(pred_valid, dtype=bool)
-                            detection_mask = np.logical_and(non_host_mask, truth_mask)
-                            intersection_any = int(detection_mask.sum())
-                            union_any = truth_chars
+                            intersection_any = int(np.logical_and(non_host_mask, truth_mask).sum())
+                            union_any = int(np.logical_or(non_host_mask, truth_mask).sum())
+                            coverage_any = intersection_any / truth_chars if truth_chars > 0 else 0.0
+                            any_entry["coverage_sum"] += coverage_any
+                            any_entry["coverage_count"] += 1
+                            if coverage_any >= threshold:
+                                any_entry["coverage_hits"] += 1
                             if union_any > 0:
                                 any_entry["count"] += 1
                                 any_entry["truth_chars"] += truth_chars
@@ -1248,11 +1341,18 @@ def evaluate_task(
                                         "truth_chars": 0,
                                         "correct_chars": 0,
                                         "iou_sum": 0.0,
+                                        "coverage_hits": 0,
+                                        "coverage_sum": 0.0,
+                                        "coverage_count": 0,
                                     },
                                 )
                                 lang_any_entry["count"] += 1
                                 lang_any_entry["truth_chars"] += truth_chars
                                 lang_any_entry["correct_chars"] += intersection_any
+                                lang_any_entry["coverage_sum"] += coverage_any
+                                lang_any_entry["coverage_count"] += 1
+                                if coverage_any >= threshold:
+                                    lang_any_entry["coverage_hits"] += 1
                                 lang_any_entry["iou_sum"] += iou_any
                                 if iou_any >= threshold:
                                     lang_any_entry["detected"] += 1
@@ -1273,6 +1373,8 @@ def evaluate_task(
                                 "truth_chars": 0,
                                 "correct_chars": 0,
                                 "iou_sum": 0.0,
+                                "coverage_hits": 0,
+                                "coverage_count": 0,
                             },
                         )
                         entry["count"] += 1
@@ -1280,6 +1382,10 @@ def evaluate_task(
                         entry["correct_chars"] += intersection
                         iou = intersection / union
                         entry["iou_sum"] += iou
+                        coverage_ratio = intersection / truth_chars if truth_chars > 0 else 0.0
+                        entry["coverage_count"] += 1
+                        if coverage_ratio >= threshold:
+                            entry["coverage_hits"] += 1
                         if iou >= threshold:
                             entry["detected"] += 1
                         else:
@@ -1715,11 +1821,15 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
         )
         correct_cov = _format_pct(_safe_ratio(correct_chars, correct_truth))
 
+        any_cov_hits = int(any_stats.get("coverage_hits", 0))
+        any_cov_total = int(any_stats.get("coverage_count", 0))
+        correct_cov_hits = sum(int(entry.get("coverage_hits", 0)) for entry in by_lang.values())
+        correct_cov_total = sum(int(entry.get("coverage_count", 0)) for entry in by_lang.values())
         table_lines = [
-            "| Scenario | IoU ≥50% | Coverage |",
-            "| --- | --- | --- |",
-            f"| Any non-wrapper | {_format_hits(any_detected, any_total)} (mean {_format_float(any_avg_iou)}) | {any_cov} |",
-            f"| Correct payload | {_format_hits(correct_detected, correct_total)} (mean {_format_float(correct_avg_iou)}) | {correct_cov} |",
+            "| Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Avg coverage |",
+            "| --- | --- | --- | --- | --- |",
+            f"| Any non-wrapper | {_format_hits(any_cov_hits, any_cov_total)} | {_format_hits(any_detected, any_total)} | {_format_float(any_avg_iou)} | {any_cov} |",
+            f"| Correct payload | {_format_hits(correct_cov_hits, correct_cov_total)} | {_format_hits(correct_detected, correct_total)} | {_format_float(correct_avg_iou)} | {correct_cov} |",
         ]
         add_section("mal_injection", table_lines)
 
@@ -1736,43 +1846,50 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
         def _wrapper_row(name: str, group: Dict[str, Any]) -> str:
             count = int(group.get("count", 0))
             if count <= 0:
-                return f"| {name} | — | — | — | n/a | n/a |"
-            nontext_hits = int(group.get("detected_nontext", 0))
+                return f"| {name} | — | — | — | — | — | — | — | — | — |"
+            nontext_cov_hits = int(group.get("detected_nontext", 0))
+            nontext_iou_hits = int(group.get("detected_nontext_iou", 0))
             text_hits = int(group.get("detected_text", 0))
-            correct_hits = int(group.get("detected_correct", 0))
+            correct_cov_hits = int(group.get("detected_correct", 0))
+            correct_iou_hits = int(group.get("detected_correct_iou", 0))
             truth_chars = int(group.get("truth_chars", 0))
             nontext_chars = int(group.get("nontext_chars", 0))
             correct_chars = int(group.get("correct_chars", 0))
             nontext_cov = _format_pct(_safe_ratio(nontext_chars, truth_chars))
             correct_cov = _format_pct(_safe_ratio(correct_chars, truth_chars))
+            nontext_avg_iou = _format_float(_safe_ratio(group.get("nontext_iou_sum", 0.0), count))
+            correct_avg_iou = _format_float(_safe_ratio(group.get("iou_sum", 0.0), count))
             return (
-                f"| {name} | {_format_hits(nontext_hits, count)} | {_format_hits(text_hits, count)} | "
-                f"{_format_hits(correct_hits, count)} | {nontext_cov} | {correct_cov} |"
+                f"| {name} | {_format_hits(nontext_cov_hits, count)} | {_format_hits(nontext_iou_hits, count)} | "
+                f"{nontext_cov} | {nontext_avg_iou} | {_format_hits(text_hits, count)} | "
+                f"{_format_hits(correct_cov_hits, count)} | {_format_hits(correct_iou_hits, count)} | "
+                f"{correct_cov} | {correct_avg_iou} |"
             )
 
         wrapper_table = [
-            "| Wrapper | Non-text hits | Text hits | Correct hits | Non-text coverage | Correct coverage |",
-            "| --- | ---: | ---: | ---: | ---: | ---: |",
+            "_Text hits column: lower is better._",
+            "| Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             _wrapper_row(MARKDOWN_FENCED_LABEL, overall.get("wrapped", {})),
             _wrapper_row("bare code", overall.get("plain", {})),
         ]
 
         inline_count = int(inline_stats.get("count", 0))
         if inline_count > 0:
-            inline_nontext = int(inline_stats.get("nontext_hits", 0))
-            inline_text = int(inline_stats.get("text_hits", 0))
-            inline_correct = int(inline_stats.get("correct_hits", 0))
-            inline_truth = int(inline_stats.get("truth_chars", 0))
-            inline_nontext_cov = _format_pct(
-                _safe_ratio(int(inline_stats.get("nontext_chars", 0)), inline_truth)
-            )
-            inline_correct_cov = _format_pct(
-                _safe_ratio(int(inline_stats.get("correct_chars", 0)), inline_truth)
-            )
-            wrapper_table.append(
-                f"| {MARKDOWN_INLINE_LABEL} | {_format_hits(inline_nontext, inline_count)} | {_format_hits(inline_text, inline_count)} | "
-                f"{_format_hits(inline_correct, inline_count)} | {inline_nontext_cov} | {inline_correct_cov} |"
-            )
+            inline_group = {
+                "count": inline_count,
+                "detected_nontext": inline_stats.get("nontext_hits", 0),
+                "detected_nontext_iou": inline_stats.get("nontext_iou_hits", 0),
+                "detected_text": inline_stats.get("text_hits", 0),
+                "detected_correct": inline_stats.get("correct_hits", 0),
+                "detected_correct_iou": inline_stats.get("correct_iou_hits", 0),
+                "truth_chars": inline_stats.get("truth_chars", 0),
+                "nontext_chars": inline_stats.get("nontext_chars", 0),
+                "correct_chars": inline_stats.get("correct_chars", 0),
+                "nontext_iou_sum": inline_stats.get("nontext_iou_sum", 0.0),
+                "iou_sum": inline_stats.get("correct_iou_sum", 0.0),
+            }
+            wrapper_table.append(_wrapper_row(MARKDOWN_INLINE_LABEL, inline_group))
 
         text_cov_line = None
         text_truth = int(text_stats_overall.get("truth_chars", 0))
@@ -1848,39 +1965,35 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
         if segment_lines:
             add_section(name, segment_lines)
 
-    # needle buckets (largest first)
-    needle_metrics = [
-        m for m in task_metrics if _needle_bucket_key(m.name) is not None
-    ]
-    if needle_metrics:
-        needle_metrics.sort(
-            key=lambda m: (_needle_bucket_key(m.name) or (0, 0))[0],
-            reverse=True,
-        )
-        table_lines = [
-            "| Bucket | Donor IoU ≥50% | Donor avg IoU | Donor coverage | Any IoU ≥50% | Any avg IoU | Any coverage |",
-            "| --- | --- | ---: | ---: | --- | ---: | ---: |",
+    # Needle buckets (individual sections, keep at end)
+    needle_metrics = [m for m in task_metrics if _needle_bucket_key(m.name) is not None]
+    needle_metrics.sort(key=lambda m: (_needle_bucket_key(m.name) or (0, 0))[0], reverse=True)
+    for m in needle_metrics:
+        stats = m.extras.get("needle_detection", {}) if m.extras else {}
+        if not stats:
+            continue
+        total = int(stats.get("total", 0))
+        detected = int(stats.get("detected", 0))
+        coverage_hits = int(stats.get("coverage_hits", 0))
+        coverage_total = int(stats.get("coverage_count", 0))
+        avg_iou = _safe_ratio(stats.get("iou_sum", 0.0), total)
+        coverage_pct = _format_pct(_safe_ratio(stats.get("correct_chars", 0), stats.get("needle_chars", 0)))
+
+        any_stats = stats.get("any_detection", {})
+        any_cov_hits = int(any_stats.get("coverage_hits", 0))
+        any_cov_total = int(any_stats.get("coverage_count", 0))
+        any_count = int(any_stats.get("count", 0))
+        any_detected = int(any_stats.get("detected", 0))
+        any_avg_iou = _safe_ratio(any_stats.get("iou_sum", 0.0), any_count)
+        any_cov = _format_pct(_safe_ratio(any_stats.get("correct_chars", 0), any_stats.get("truth_chars", 0)))
+
+        section_lines = [
+            "| Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage |",
+            "| --- | --- | --- | --- | --- |",
+            f"| Any non-wrapper | {_format_hits(any_cov_hits, any_cov_total)} | {_format_hits(any_detected, any_count)} | {_format_float(any_avg_iou)} | {any_cov} |",
+            f"| Correct payload | {_format_hits(coverage_hits, coverage_total)} | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage_pct} |",
         ]
-        for m in needle_metrics:
-            stats = m.extras.get("needle_detection", {}) if m.extras else {}
-            total = int(stats.get("total", 0))
-            detected = int(stats.get("detected", 0))
-            avg_iou = _safe_ratio(stats.get("iou_sum", 0.0), total)
-            truth_chars = int(stats.get("needle_chars", 0))
-            correct_chars = int(stats.get("correct_chars", 0))
-            coverage = _format_pct(_safe_ratio(correct_chars, truth_chars))
-            any_stats = stats.get("any_detection", {})
-            any_count = int(any_stats.get("count", 0))
-            any_detected = int(any_stats.get("detected", 0))
-            any_avg = _safe_ratio(any_stats.get("iou_sum", 0.0), any_count)
-            any_truth = int(any_stats.get("truth_chars", 0))
-            any_correct = int(any_stats.get("correct_chars", 0))
-            any_cov = _format_pct(_safe_ratio(any_correct, any_truth))
-            table_lines.append(
-                f"| {m.name} | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage} | "
-                f"{_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | {any_cov} |"
-            )
-        add_section("needle buckets", table_lines)
+        add_section(m.name, section_lines)
 
     return sections
 
@@ -2282,9 +2395,9 @@ def write_report(
             ]
             if languages:
                 table_lines = [
-                    "| Language | Non-wrapper IoU ≥50% | Non-wrapper avg IoU | Non-wrapper coverage | "
-                    "Correct IoU ≥50% | Correct avg IoU | Correct coverage | Top misclassifications |",
-                    "| --- | --- | ---: | ---: | --- | ---: | ---: | --- |",
+                    "| Language | Non-wrapper cov ≥50% | Non-wrapper coverage (avg) | Non-wrapper IoU ≥50% | Non-wrapper avg IoU | "
+                    "Correct cov ≥50% | Correct coverage (avg) | Correct IoU ≥50% | Correct avg IoU | Top misclassifications |",
+                    "| --- | --- | ---: | --- | ---: | --- | ---: | --- | ---: | --- |",
                 ]
                 for lang in languages:
                     any_entry = any_by_lang.get(lang, {})
@@ -2295,6 +2408,8 @@ def write_report(
                     any_truth = int(any_entry.get("truth_chars", 0))
                     any_correct = int(any_entry.get("correct_chars", 0))
                     any_cov = _format_pct(_safe_ratio(any_correct, any_truth))
+                    any_cov_hits = int(any_entry.get("coverage_hits", 0))
+                    any_cov_total = int(any_entry.get("coverage_count", 0))
 
                     corr_count = int(corr_entry.get("count", 0))
                     corr_detected = int(corr_entry.get("detected", 0))
@@ -2302,6 +2417,8 @@ def write_report(
                     corr_truth = int(corr_entry.get("truth_chars", 0))
                     corr_chars = int(corr_entry.get("correct_chars", 0))
                     corr_cov = _format_pct(_safe_ratio(corr_chars, corr_truth))
+                    corr_cov_hits = int(corr_entry.get("coverage_hits", 0))
+                    corr_cov_total = int(corr_entry.get("coverage_count", 0))
 
                     class_cov = per_label_acc.get(lang)
                     class_cov_str = _format_pct(class_cov)
@@ -2310,8 +2427,9 @@ def write_report(
                     mis_str = ", ".join(f"{pred} ({prob * 100:.1f}%)" for prob, pred in mis_list[:3]) or "—"
 
                     table_lines.append(
-                        f"| {lang} | {_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | {any_cov} | "
-                        f"{_format_hits(corr_detected, corr_count)} | {_format_float(corr_avg)} | {corr_cov} (overall {class_cov_str}) | {mis_str} |"
+                        f"| {lang} | {_format_hits(any_cov_hits, any_cov_total)} | {any_cov} | {_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | "
+                        f"{_format_hits(corr_cov_hits, corr_cov_total)} | {corr_cov} (overall {class_cov_str}) | "
+                        f"{_format_hits(corr_detected, corr_count)} | {_format_float(corr_avg)} | {mis_str} |"
                     )
                 report_lines.append("")
                 report_lines.extend(table_lines)
@@ -2381,13 +2499,17 @@ def write_report(
                     pairs.sort(key=lambda x: x[0], reverse=True)
                     mis_lines = ", ".join(f"{label} ({prob * 100:.1f}%)" for prob, label in pairs[:3]) or "—"
 
-            report_lines.append("| Scenario | IoU ≥50% | Mean IoU | Coverage | Top misclassifications |")
-            report_lines.append("| --- | --- | ---: | ---: | --- |")
+            coverage_hits = int(stats.get("coverage_hits", 0))
+            coverage_count = int(stats.get("coverage_count", 0))
+            any_cov_hits = int(any_stats.get("coverage_hits", 0))
+            any_cov_total = int(any_stats.get("coverage_count", 0))
+            report_lines.append("| Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |")
+            report_lines.append("| --- | --- | --- | ---: | ---: | --- |")
             report_lines.append(
-                f"| Any non-wrapper | {_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | {any_cov} | {mis_lines} |"
+                f"| Any non-wrapper | {_format_hits(any_cov_hits, any_cov_total)} | {_format_hits(any_detected, any_count)} | {_format_float(any_avg)} | {any_cov} | {mis_lines} |"
             )
             report_lines.append(
-                f"| Correct label | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage} | — |"
+                f"| Correct label | {_format_hits(coverage_hits, coverage_count)} | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage} | — |"
             )
             report_lines.append("")
             continue
@@ -2415,36 +2537,50 @@ def write_report(
             wrapped_group = markdown_stats.get("overall", {}).get("wrapped", {})
             plain_group = markdown_stats.get("overall", {}).get("plain", {})
             report_lines.append("")
-            report_lines.append("| Wrapper | Non-text hits | Text hits | Correct hits | Non-text coverage | Correct coverage |")
-            report_lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
-            for label, group in ((MARKDOWN_FENCED_LABEL, wrapped_group), ("bare code", plain_group)):
+            report_lines.append("_Text hits column: lower is better._")
+            report_lines.append("| Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |")
+            report_lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+
+            def _emit_wrapper_row(label: str, group: Dict[str, Any]) -> None:
                 count = int(group.get("count", 0))
                 if count <= 0:
-                    report_lines.append(f"| {label} | — | — | — | n/a | n/a |")
-                    continue
-                nontext_hits = int(group.get("detected_nontext", 0))
-                text_hits = int(group.get("detected_text", 0))
-                correct_hits = int(group.get("detected_correct", 0))
+                    report_lines.append(f"| {label} | — | — | — | — | — | — | — | — | — |")
+                    return
                 truth_chars = int(group.get("truth_chars", 0))
                 nontext_cov = _format_pct(_safe_ratio(int(group.get("nontext_chars", 0)), truth_chars))
                 correct_cov = _format_pct(_safe_ratio(int(group.get("correct_chars", 0)), truth_chars))
-                report_lines.append(
-                    f"| {label} | {_format_hits(nontext_hits, count)} | {_format_hits(text_hits, count)} | "
-                    f"{_format_hits(correct_hits, count)} | {nontext_cov} | {correct_cov} |"
+                nontext_avg_iou = _format_float(_safe_ratio(group.get("nontext_iou_sum", 0.0), count))
+                correct_avg_iou = _format_float(_safe_ratio(group.get("iou_sum", 0.0), count))
+                nontext_cov_hits = _format_hits(int(group.get("detected_nontext", 0)), count)
+                nontext_iou_hits = _format_hits(int(group.get("detected_nontext_iou", 0)), count)
+                text_hits = _format_hits(int(group.get("detected_text", 0)), count)
+                correct_cov_hits = _format_hits(int(group.get("detected_correct", 0)), count)
+                correct_iou_hits = _format_hits(int(group.get("detected_correct_iou", 0)), count)
+                row = (
+                    f"| {label} | {nontext_cov_hits} | {nontext_iou_hits} | {nontext_cov} | {nontext_avg_iou} | {text_hits} | "
+                    f"{correct_cov_hits} | {correct_iou_hits} | {correct_cov} | {correct_avg_iou} |"
                 )
+                report_lines.append(row)
+
+            for label, group in ((MARKDOWN_FENCED_LABEL, wrapped_group), ("bare code", plain_group)):
+                _emit_wrapper_row(label, group)
             inline_stats = markdown_stats.get("inline", {})
             inline_count = int(inline_stats.get("count", 0))
             if inline_count > 0:
-                inline_nontext = int(inline_stats.get("nontext_hits", 0))
-                inline_text = int(inline_stats.get("text_hits", 0))
-                inline_correct = int(inline_stats.get("correct_hits", 0))
-                inline_truth = int(inline_stats.get("truth_chars", 0))
-                inline_nontext_cov = _format_pct(_safe_ratio(int(inline_stats.get("nontext_chars", 0)), inline_truth))
-                inline_correct_cov = _format_pct(_safe_ratio(int(inline_stats.get("correct_chars", 0)), inline_truth))
-                report_lines.append(
-                    f"| {MARKDOWN_INLINE_LABEL} | {_format_hits(inline_nontext, inline_count)} | {_format_hits(inline_text, inline_count)} | "
-                    f"{_format_hits(inline_correct, inline_count)} | {inline_nontext_cov} | {inline_correct_cov} |"
-                )
+                inline_group = {
+                    "count": inline_count,
+                    "detected_nontext": inline_stats.get("nontext_hits", 0),
+                    "detected_nontext_iou": inline_stats.get("nontext_iou_hits", 0),
+                    "detected_text": inline_stats.get("text_hits", 0),
+                    "detected_correct": inline_stats.get("correct_hits", 0),
+                    "detected_correct_iou": inline_stats.get("correct_iou_hits", 0),
+                    "truth_chars": inline_stats.get("truth_chars", 0),
+                    "nontext_chars": inline_stats.get("nontext_chars", 0),
+                    "correct_chars": inline_stats.get("correct_chars", 0),
+                    "nontext_iou_sum": inline_stats.get("nontext_iou_sum", 0.0),
+                    "iou_sum": inline_stats.get("correct_iou_sum", 0.0),
+                }
+                _emit_wrapper_row(MARKDOWN_INLINE_LABEL, inline_group)
             text_truth = int(markdown_stats.get("text", {}).get("truth_chars", 0))
             if text_truth > 0:
                 text_cov = _format_pct(
@@ -2487,7 +2623,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--model-dim", type=int, default=None, help="Model embedding dimension. Defaults to checkpoint config or 256.")
     parser.add_argument("--channels", type=str, default=None, help="Comma-separated channel widths. Defaults to checkpoint config or 96,128,192,256.")
     parser.add_argument("--dtype", type=str, default=None, help="JAX dtype name for inference (e.g. bfloat16). Defaults to checkpoint config or bfloat16.")
-    parser.add_argument("--chunk", type=int, default=1024)
+    parser.add_argument("--chunk", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--min-run", type=int, default=1, help="Minimum run-length smoothing for character labels.")
     parser.add_argument("--report-path", default=str(REPO_ROOT / "evaluation" / "report.md"))
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for inference windows.")

@@ -5,6 +5,7 @@ and Weights & Biases logging.
 """
 from typing import Dict, Tuple, TYPE_CHECKING
 import os
+from pathlib import Path
 import random
 import numpy as np
 import jax
@@ -402,12 +403,14 @@ def _save_sankey_from_confusion(
     ax.text(0.5, 1.03, f"Step {step} • Width ∝ byte/token count • Node labels show byte counts",
             ha="center", va="top", fontsize=9.0, color=(0, 0, 0, 0.65), transform=ax.transAxes)
 
-    # Save — overwrite per run id
-    out_path = f"sankey_images/sankey_{run_id}_{step}.png"
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # Save — overwrite per run id (single latest diagram)
+    base_dir = Path("sankey_images")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    safe_run = run_id or "run"
+    out_path = base_dir / f"sankey_{safe_run}.png"
     fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
     fig.clear()
-    return out_path
+    return str(out_path)
 
 
 def wandb_log_metrics(
@@ -478,16 +481,36 @@ def wandb_log_metrics(
     fig = Figure(figsize=(6, 5))
     _ = FigureCanvas(fig)  # attach Agg canvas
     ax = fig.add_subplot(111)
-    cm_disp = conf_mat.copy()
+    cm_disp = conf_mat.copy().astype(np.float64)
     if ignore_class is not None and 0 <= ignore_class < num_classes:
         cm_disp[ignore_class, :] = 0
         cm_disp[:, ignore_class] = 0
-    im = ax.imshow(cm_disp, interpolation='nearest', aspect='auto')
-    ax.set_title("Validation Confusion Matrix")
-    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    row_sums = cm_disp.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0  # avoid division-by-zero for empty rows
+    cm_disp = cm_disp / row_sums
+    im = ax.imshow(cm_disp, interpolation="nearest", aspect="auto")
+    ax.set_title("Validation Confusion Matrix (row-normalized)")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+
+    tick_indices = [i for i in range(num_classes) if i != ignore_class]
+    tick_labels = [id2label.get(i, str(i)) for i in tick_indices]
+    ax.set_xticks(tick_indices)
+    ax.set_yticks(tick_indices)
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+    ax.set_yticklabels(tick_labels, fontsize=8)
+
+    for label in ax.get_xticklabels():
+        label.set_rotation_mode("anchor")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Per-class (row) normalization", rotation=270, labelpad=15)
     fig.tight_layout()
-    
-    #_wandb_safe_log({"val/confusion_matrix": wandb.Image(fig)}, step=step, commit=False)
+
+    cm_dir = Path("confusion_images")
+    cm_dir.mkdir(parents=True, exist_ok=True)
+    run_identifier = getattr(getattr(wandb, "run", None), "id", None) or "run"
+    cm_path = cm_dir / f"confusion_{run_identifier}.png"
+    fig.savefig(cm_path, dpi=250, bbox_inches="tight", facecolor="white")
     fig.clear()
 
     # 5) Sankey diagram (single file per run, overwritten) — fail on errors if any
