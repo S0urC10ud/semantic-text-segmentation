@@ -235,6 +235,90 @@ def _stitch_segments_with_validation(segments):
     return "".join(stitched)
 
 
+def _is_newline_only(text: str) -> bool:
+    return not text or set(text) <= {"\n", "\r"}
+
+
+def _locate_segment_position(segments, absolute_index: int) -> tuple[int, int]:
+    if absolute_index < 0:
+        raise ValueError("absolute_index must be non-negative")
+    running = 0
+    for idx, entry in enumerate(segments):
+        content = entry.get("content", "")
+        seg_len = len(content)
+        if absolute_index < running + seg_len:
+            return idx, absolute_index - running
+        running += seg_len
+    if absolute_index == running and segments:
+        return len(segments) - 1, len(segments[-1].get("content", ""))
+    raise ValueError(
+        f"absolute_index {absolute_index} out of range for segments with length {running}"
+    )
+
+
+def _remove_text_range_in_segments(segments, start: int, end: int) -> None:
+    if end <= start:
+        return
+    remaining = end - start
+    while remaining > 0:
+        seg_idx, offset = _locate_segment_position(segments, start)
+        content = segments[seg_idx]["content"]
+        take = min(remaining, len(content) - offset)
+        segments[seg_idx]["content"] = content[:offset] + content[offset + take :]
+        remaining -= take
+
+
+def _insert_text_at_pos(segments, pos: int, text: str) -> None:
+    if not text:
+        return
+    seg_idx, offset = _locate_segment_position(segments, pos)
+    content = segments[seg_idx]["content"]
+    segments[seg_idx]["content"] = content[:offset] + text + content[offset:]
+
+
+def _replace_text_range_in_segments(segments, start: int, end: int, replacement: str) -> None:
+    _remove_text_range_in_segments(segments, start, end)
+    _insert_text_at_pos(segments, start, replacement)
+
+
+def _heal_newline_discrepancies(source_text: str, segments) -> dict[str, Any]:
+    stitched_text = "".join(entry.get("content", "") for entry in segments)
+    if stitched_text == source_text:
+        return {"applied_patches": 0}
+    matcher = SequenceMatcher(a=source_text, b=stitched_text, autojunk=False)
+    newline_blocks: list[tuple[str, int, int, int, int]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        src_fragment = source_text[i1:i2]
+        seg_fragment = stitched_text[j1:j2]
+        if _is_newline_only(src_fragment) and _is_newline_only(seg_fragment):
+            newline_blocks.append((tag, i1, i2, j1, j2))
+    if not newline_blocks:
+        return {"applied_patches": 0}
+
+    newline_blocks.sort(key=lambda block: (block[3], block[4]), reverse=True)
+    for tag, i1, i2, j1, j2 in newline_blocks:
+        replacement = source_text[i1:i2]
+        _replace_text_range_in_segments(segments, j1, j2, replacement)
+
+    total_delta = 0
+    for tag, i1, i2, j1, j2 in newline_blocks:
+        total_delta += (i2 - i1) - (j2 - j1)
+    return {
+        "applied_patches": len(newline_blocks),
+        "char_delta": total_delta,
+        "blocks": [
+            {
+                "tag": tag,
+                "source_range": [i1, i2],
+                "segments_range": [j1, j2],
+            }
+            for tag, i1, i2, j1, j2 in reversed(newline_blocks)
+        ],
+    }
+
+
 def _assert_segments_cover_source(source_text, segments):
     if not isinstance(source_text, str):
         raise TypeError("SOURCE_TEXT must be a string copy of the <INPUT> contents.")
@@ -473,6 +557,10 @@ Rules:
 - map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85; if nothing fits, use discovered_<lang> or "other" as a last resort.
 - be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
 - text or comments belong to the wrapping/adjacent content type.
+- IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes).
+  - Emit exactly one literal assignment 'segments = [ {{...}}, ... ]'. Build every entry directly inside that literal. Do not call segments.append, loops, helper functions, or reassignment. My tooling parses the AST and only sees literal lists, so any procedural construction fails.
+  - Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly
+- also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types
 - preserve every character exactly as provided (including trailing spaces or backslashes) so SOURCE_TEXT matches the original input.
 - output only executable Python: define SOURCE_TEXT with the literal data between <INPUT> tags and create a single `segments` list. Do not emit <OUTPUT> tags.
 - after defining `segments`, run `_assert_segments_cover_source(SOURCE_TEXT, segments)` using the coverage verifier below via the code-execution tool. Do not modify that verifier; just execute it.
@@ -491,13 +579,22 @@ Rules:
 - map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85; if nothing fits, use discovered_<lang> or "other" as a last resort.
 - be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
 - text or comments belong to the wrapping/adjacent content type.
-- preserve every character exactly as provided (including trailing spaces or backslashes).
+- IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes).
+  - Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly
+- also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types
 - output only executable Python (but do not execute it): create a single `segments` list. Do not emit <OUTPUT> tags.
 - after defining `segments`, do NOT run anything; my client runs the verifier locally, so ensure your code passes without modification and do not call any tools.
 Coverage verifier shown for reference (do not execute it in this mode):
 {COVERAGE_VERIFIER_FUNCTION_CODE}
 {PROMPT_EXAMPLE_BLOCK}
 """
+
+
+SYSTEM_PROMPT = (
+    "You are a meticulous text-segmentation and coverage assistant. "
+    "Follow every rule literally, preserve SOURCE_TEXT bytes, emit only the "
+    "required Python artifacts, and never add commentary or extra output."
+)
 
 
 def build_prompt(use_code_execution: bool) -> str:
@@ -569,8 +666,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-input-length",
         type=int,
-        default=5_000,
-        help="Maximum number of characters from any input source to send to Gemini (default: 5000).",
+        default=10_000,
+        help="Maximum number of characters from any input source to send to Gemini (default: 10000).",
     )
     parser.add_argument(
         "--code-exectution",
@@ -781,6 +878,7 @@ def segment(
 
     config_kwargs = {
         "thinking_config": types.ThinkingConfig(thinking_budget=-1),
+        "system_instruction": SYSTEM_PROMPT,
     }
     if use_code_execution:
         config_kwargs["tools"] = [types.Tool(code_execution=types.ToolCodeExecution)]
@@ -1042,6 +1140,17 @@ def main() -> None:
             print("Successfully extracted 'segments' array:")
             print(segments_result)
             pretty_print_segments(segments_result)
+            newline_healing_info = None
+            if not args.code_exectution:
+                newline_healing_info = _heal_newline_discrepancies(content, segments_result)
+                if newline_healing_info.get("applied_patches"):
+                    metadata["newline_healing"] = newline_healing_info
+                    console.print(
+                        (
+                            "Normalized {count} newline-only diff(s) before local verification."
+                        ).format(count=newline_healing_info["applied_patches"]),
+                        style="dim",
+                    )
             if not args.code_exectution:
                 try:
                     verification_details = verify_segments_locally(
