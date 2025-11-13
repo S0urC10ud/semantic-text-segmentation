@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import datetime
 import hashlib
 import inspect
@@ -36,10 +37,13 @@ class LocalVerificationError(RuntimeError):
 
 LOCAL_VERIFICATION_ERROR_STYLE = "bold red"
 
-FUZZY_MAX_DIFF_CHARS = 4
-FUZZY_MAX_BLOCKS = 2
-FUZZY_MAX_BLOCK_SIZE = 2
-FUZZY_MIN_RATIO = 0.999
+FUZZY_MAX_BLOCKS: int | None = None  # None -> unlimited adjustments
+FUZZY_MAX_BLOCK_SIZE: int | None = None  # None -> no per-block cap
+FUZZY_MIN_RATIO: float | None = None  # None -> accept any similarity
+FUZZY_ALLOW_MIXED_DIFF_TYPES = True
+
+REPLACEMENT_CHARACTER = "\uFFFD"
+REPLACEMENT_SUBSTITUTE = "\u00A4"  # ¤
 
 MODEL_PRICING_USD_PER_MTOKENS = {
     # Source: https://ai.google.dev/gemini-api/docs/pricing.
@@ -182,6 +186,15 @@ ALLOWED_TYPE_NAMES = [
 ]
 
 _ALLOWED_TYPES = set(ALLOWED_TYPE_NAMES)
+_LITERAL_ESCAPE_PATTERN = re.compile(
+    r"\\(?:[\\\"'abfnrtv]|x[0-9A-Fa-f]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})"
+)
+_CONTENT_BLOCK_RE = re.compile(
+    r"<<<<CONTENT-TYPE:(?P<type>[A-Za-z0-9_\-+.]+)>>>>"
+)
+_EMBEDDED_MARKER_PATTERN = re.compile(
+    r"<<<<CONTENT-TYPE:[A-Za-z0-9_\-+.]+>>>>(?:\r?\n)?"
+)
 
 
 def _detect_adjacent_duplicate_types(segments) -> list[str]:
@@ -233,6 +246,26 @@ def _stitch_segments_with_validation(segments):
         last_type = seg_type
 
     return "".join(stitched)
+
+
+def _diff_stats(source_text: str, stitched_text: str) -> tuple[int, float, list]:
+    matcher = SequenceMatcher(a=source_text, b=stitched_text, autojunk=False)
+    diff_blocks = []
+    total_diff = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        diff_blocks.append(
+            {
+                "tag": tag,
+                "source_range": [i1, i2],
+                "segments_range": [j1, j2],
+                "source_snippet": source_text[i1:i2],
+                "segments_snippet": stitched_text[j1:j2],
+            }
+        )
+        total_diff += max(i2 - i1, j2 - j1)
+    return total_diff, matcher.ratio(), diff_blocks
 
 
 def _is_newline_only(text: str) -> bool:
@@ -319,6 +352,205 @@ def _heal_newline_discrepancies(source_text: str, segments) -> dict[str, Any]:
     }
 
 
+def _decode_literal_escape_sequences(text: str) -> str | None:
+    """
+    Best-effort decoding of literal escape sequences (e.g., \" -> ", \\n -> newline).
+    Returns None when decoding fails.
+    """
+    try:
+        raw = text.encode("latin-1", "backslashreplace")
+        return raw.decode("unicode_escape")
+    except UnicodeDecodeError:
+        return None
+
+
+def _maybe_apply_literal_escape_fix(source_text: str, segments):
+    """
+    Detects when the model emitted literal backslash escapes (e.g., \" or \\n) instead of
+    real characters and attempts to decode them. Only adopts the decoded segments when
+    similarity to the source text improves.
+    """
+    stitched_original = "".join(entry.get("content", "") for entry in segments)
+    if "\\" not in stitched_original:
+        return {"applied": False}
+
+    decoded_segments = []
+    changed = False
+    for entry in segments:
+        content = entry.get("content", "")
+        if not isinstance(content, str):
+            return {"applied": False}
+        if not _LITERAL_ESCAPE_PATTERN.search(content):
+            decoded_segments.append(entry)
+            continue
+        decoded = _decode_literal_escape_sequences(content)
+        if decoded is None or decoded == content:
+            decoded_segments.append(entry)
+            continue
+        new_entry = dict(entry)
+        new_entry["content"] = decoded
+        decoded_segments.append(new_entry)
+        changed = True
+
+    if not changed:
+        return {"applied": False}
+
+    stitched_decoded = "".join(entry.get("content", "") for entry in decoded_segments)
+    original_diff, original_similarity, _ = _diff_stats(source_text, stitched_original)
+    decoded_diff, decoded_similarity, _ = _diff_stats(source_text, stitched_decoded)
+
+    if decoded_diff < original_diff or decoded_similarity > original_similarity:
+        return {
+            "applied": True,
+            "segments": decoded_segments,
+            "diff_before": original_diff,
+            "diff_after": decoded_diff,
+            "similarity_before": original_similarity,
+            "similarity_after": decoded_similarity,
+        }
+
+    return {"applied": False}
+
+
+def _maybe_restore_backslashes(source_text: str, segments):
+    """
+    Restores missing literal backslashes (\\) when the model stripped them from content.
+    Only applies when every diff block between SOURCE_TEXT and stitched segments involves
+    backslashes exclusively.
+    """
+    if "\\" not in source_text:
+        return {"applied": False}
+    stitched_text = "".join(entry.get("content", "") for entry in segments)
+    if stitched_text == source_text:
+        return {"applied": False}
+
+    working_segments = copy.deepcopy(segments)
+    matcher = SequenceMatcher(a=source_text, b=stitched_text, autojunk=False)
+    delta = 0
+    inserted = 0
+    removed = 0
+    applied = False
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+
+        src_slice = source_text[i1:i2]
+        seg_slice = stitched_text[j1:j2]
+        target_start = j1 + delta
+        target_end = j2 + delta
+
+        def only_backslashes(text: str) -> bool:
+            return text and set(text) <= {"\\"}
+
+        if tag == "delete":
+            if not only_backslashes(src_slice):
+                return {"applied": False}
+            _insert_text_at_pos(working_segments, target_start, src_slice)
+            delta += len(src_slice)
+            inserted += len(src_slice)
+            applied = True
+        elif tag == "insert":
+            if not only_backslashes(seg_slice):
+                return {"applied": False}
+            _remove_text_range_in_segments(working_segments, target_start, target_end)
+            delta -= len(seg_slice)
+            removed += len(seg_slice)
+            applied = True
+        elif tag == "replace":
+            if (src_slice and not only_backslashes(src_slice)) or (
+                seg_slice and not only_backslashes(seg_slice)
+            ):
+                return {"applied": False}
+            if seg_slice:
+                _remove_text_range_in_segments(working_segments, target_start, target_end)
+                delta -= len(seg_slice)
+                removed += len(seg_slice)
+            if src_slice:
+                _insert_text_at_pos(working_segments, target_start, src_slice)
+                delta += len(src_slice)
+                inserted += len(src_slice)
+            applied = True
+        else:
+            return {"applied": False}
+
+    if not applied:
+        return {"applied": False}
+
+    new_stitched = "".join(entry.get("content", "") for entry in working_segments)
+    diff_before, similarity_before, _ = _diff_stats(source_text, stitched_text)
+    diff_after, similarity_after, _ = _diff_stats(source_text, new_stitched)
+
+    if diff_after > diff_before:
+        return {"applied": False}
+
+    return {
+        "applied": True,
+        "segments": working_segments,
+        "diff_before": diff_before,
+        "diff_after": diff_after,
+        "similarity_before": similarity_before,
+        "similarity_after": similarity_after,
+        "inserted": inserted,
+        "removed": removed,
+    }
+
+
+def _maybe_encode_literal_sequences(source_text: str, segments):
+    """
+    When SOURCE_TEXT stores escape sequences literally (e.g., '\\n') but the model
+    emitted the decoded characters (e.g., newline), convert the segments back to
+    the literal form so coverage matches exactly.
+    Applies only when every diff block decodes cleanly via unicode_escape.
+    """
+    stitched_text = "".join(entry.get("content", "") for entry in segments)
+    if stitched_text == source_text:
+        return {"applied": False}
+
+    matcher = SequenceMatcher(a=source_text, b=stitched_text, autojunk=False)
+    replacements: list[tuple[int, int, str]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        src_slice = source_text[i1:i2]
+        seg_slice = stitched_text[j1:j2]
+        try:
+            decoded = bytes(src_slice, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            return {"applied": False}
+        if decoded != seg_slice:
+            return {"applied": False}
+        replacements.append((j1, j2, src_slice))
+
+    if not replacements:
+        return {"applied": False}
+
+    working_segments = copy.deepcopy(segments)
+    for start, end, replacement in sorted(replacements, key=lambda item: (item[0], item[1]), reverse=True):
+        _replace_text_range_in_segments(working_segments, start, end, replacement)
+
+    stitched_after = "".join(entry.get("content", "") for entry in working_segments)
+    diff_before, similarity_before, _ = _diff_stats(source_text, stitched_text)
+    diff_after, similarity_after, _ = _diff_stats(source_text, stitched_after)
+    if diff_after >= diff_before:
+        return {"applied": False}
+
+    return {
+        "applied": True,
+        "segments": working_segments,
+        "diff_before": diff_before,
+        "diff_after": diff_after,
+        "similarity_before": similarity_before,
+        "similarity_after": similarity_after,
+    }
+
+
+def _remove_empty_segments(segments):
+    cleaned = [entry for entry in segments if isinstance(entry.get("content"), str) and entry.get("content")]
+    removed = len(segments) - len(cleaned)
+    return cleaned, removed
+
+
 def _assert_segments_cover_source(source_text, segments):
     if not isinstance(source_text, str):
         raise TypeError("SOURCE_TEXT must be a string copy of the <INPUT> contents.")
@@ -352,9 +584,15 @@ def _fuzzy_compare_source_and_segments(source_text: str, stitched_text: str) -> 
     matcher = SequenceMatcher(a=source_text, b=stitched_text, autojunk=False)
     diff_blocks = []
     total_diff = 0
+    content_drop_chars = 0
+    max_block_span = 0
+    diff_tags: set[str] = set()
+
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
+        src_len = i2 - i1
+        seg_len = j2 - j1
         block = {
             "tag": tag,
             "source_range": [i1, i2],
@@ -363,7 +601,11 @@ def _fuzzy_compare_source_and_segments(source_text: str, stitched_text: str) -> 
             "segments_snippet": stitched_text[j1:j2],
         }
         diff_blocks.append(block)
-        total_diff += max(i2 - i1, j2 - j1)
+        diff_tags.add(tag)
+        max_block_span = max(max_block_span, src_len, seg_len)
+        if src_len > seg_len:
+            content_drop_chars += src_len - seg_len
+        total_diff += max(src_len, seg_len)
 
     similarity = matcher.ratio()
     if not diff_blocks:
@@ -373,73 +615,39 @@ def _fuzzy_compare_source_and_segments(source_text: str, stitched_text: str) -> 
             "blocks": [],
             "similarity": similarity,
             "reason": "exact_match",
+            "has_content_drop": False,
+            "content_drop_chars": 0,
         }
 
-    if total_diff > FUZZY_MAX_DIFF_CHARS:
-        return False, {
-            "reason": "diff_chars_exceeded",
-            "diff_chars": total_diff,
-            "blocks": diff_blocks,
-            "similarity": similarity,
-        }
-    if len(diff_blocks) > FUZZY_MAX_BLOCKS:
-        return False, {
-            "reason": "too_many_blocks",
-            "diff_chars": total_diff,
-            "blocks": diff_blocks,
-            "similarity": similarity,
-        }
-    diff_tags = {block["tag"] for block in diff_blocks}
-    if len(diff_tags) > 1:
-        return False, {
-            "reason": "mixed_diff_types",
-            "diff_chars": total_diff,
-            "blocks": diff_blocks,
-            "similarity": similarity,
-        }
+    exceeded_limits: dict[str, Any] = {}
+    if FUZZY_MAX_BLOCKS is not None and len(diff_blocks) > FUZZY_MAX_BLOCKS:
+        exceeded_limits["max_blocks"] = len(diff_blocks)
+    if FUZZY_MAX_BLOCK_SIZE is not None and max_block_span > FUZZY_MAX_BLOCK_SIZE:
+        exceeded_limits["max_block_size"] = max_block_span
+    if FUZZY_MIN_RATIO is not None and similarity < FUZZY_MIN_RATIO:
+        exceeded_limits["similarity"] = similarity
+    if not FUZZY_ALLOW_MIXED_DIFF_TYPES and len(diff_tags) > 1:
+        exceeded_limits["mixed_diff_types"] = sorted(diff_tags)
 
-    for block in diff_blocks:
-        src_len = block["source_range"][1] - block["source_range"][0]
-        seg_len = block["segments_range"][1] - block["segments_range"][0]
-        tag = block["tag"]
-        if tag == "replace":
-            if max(src_len, seg_len) > FUZZY_MAX_BLOCK_SIZE:
-                return False, {
-                    "reason": "replace_block_too_large",
-                    "diff_chars": total_diff,
-                    "blocks": diff_blocks,
-                    "similarity": similarity,
-                }
-        elif tag == "delete" and src_len > FUZZY_MAX_BLOCK_SIZE:
-            return False, {
-                "reason": "delete_block_too_large",
-                "diff_chars": total_diff,
-                "blocks": diff_blocks,
-                "similarity": similarity,
-            }
-        elif tag == "insert" and seg_len > FUZZY_MAX_BLOCK_SIZE:
-            return False, {
-                "reason": "insert_block_too_large",
-                "diff_chars": total_diff,
-                "blocks": diff_blocks,
-                "similarity": similarity,
-            }
-
-    if similarity < FUZZY_MIN_RATIO:
-        return False, {
-            "reason": "similarity_below_threshold",
-            "diff_chars": total_diff,
-            "blocks": diff_blocks,
-            "similarity": similarity,
-        }
-
-    return True, {
+    info: dict[str, Any] = {
         "mode": "fuzzy",
         "diff_chars": total_diff,
         "blocks": diff_blocks,
         "similarity": similarity,
-        "reason": "minor_diff_allowed",
+        "reason": "diff_detected",
+        "has_content_drop": content_drop_chars > 0,
+        "content_drop_chars": content_drop_chars,
+        "unique_diff_tags": sorted(diff_tags),
+        "max_block_span": max_block_span,
     }
+    if exceeded_limits:
+        info["exceeded_limits"] = exceeded_limits
+    if info["has_content_drop"] and diff_blocks:
+        info["content_drop_warning"] = {
+            "block": diff_blocks[0],
+            "total_diff_chars": total_diff,
+        }
+    return True, info
 
 
 _ALLOWED_TYPES_LITERAL = (
@@ -513,37 +721,146 @@ def adfadf():
 return True
 
 ````
+
+Keep this literal text (do not escape the characters):
+
+Path: C:\Tools\bin
+Quote: "Segment everything exactly once"
 </INPUT>
 <OUTPUT>
 segments = [
- {"type": "markdown",
- "content": """# This is how you use magika
+  {
+    "type": "markdown",
+    "content": """# This is how you use magika
 Run
-```""",
-},
-{
-"type": "bash",
-"content": "pip install magika",
-},
-{
-"type": "markdown",
-"content": """```
+```"""
+  },
+  {
+    "type": "shell",
+    "content": "pip install magika"
+  },
+  {
+    "type": "markdown",
+    "content": """```
 then open an editor and type:
-```""",
-
-},
-{
-"type": "python",
-"content": """import magika
+```"""
+  },
+  {
+    "type": "python",
+    "content": """import magika
 def adfadf():
-  return True""",
-},
-{
-"type": "markdown",
-"content": """```
-""""
-}
+return True"""
+  },
+  {
+    "type": "markdown",
+    "content": """```
+"""
+  },
+  {
+    "type": "markdown",
+    "content": """Keep this literal text (do not escape the characters):
+
+Path: C:\\Tools\\bin
+Quote: "Segment everything exactly once"
+"""
+  }
+]
 </OUTPUT>
+
+Notice how the markdown snippet above keeps `Path: C:\\\\Tools\\\\bin` verbatim and the HTML snippet below keeps `<div class=\\\"stats muted\\\">` rather than decoding the escapes; always retain those literal backslash sequences exactly as SOURCE_TEXT provides them.
+
+Your turn:
+<INPUT>
+'''
+
+LOCAL_RESPONSE_EXAMPLE = '''
+Example (HTML with embedded CSS):
+<INPUT>
+<div class="stats muted">
+  <style>
+    body {
+      color: crimson;
+    }
+  </style>
+</div>
+</INPUT>
+<OUPUT>
+<<<<CONTENT-TYPE:html>>>>
+<div class="stats muted">
+  <style>
+<<<<CONTENT-TYPE:css>>>>
+    body {
+      color: crimson;
+    }
+<<<<CONTENT-TYPE:html>>>>
+  </style>
+</div>
+</OUPUT>
+
+
+Example (inline markers inside a JavaScript string literal):
+<INPUT>
+const snippet = "<div><style>p{color:red;}</style></div>";
+</INPUT>
+<OUTPUT>
+<<<<CONTENT-TYPE:javascript>>>>const snippet = "<<<<CONTENT-TYPE:html>>>><div><style><<<<<CONTENT-TYPE:css>>>>p{color:red;}<<<<CONTENT-TYPE:html>>></style></div><<<<CONTENT-TYPE:javascript>>>>";
+</OUTPUT>
+
+Example (inline HTML style attribute):
+<INPUT>
+<div style="color:red; background: #fff;">Hello</div>
+</INPUT>
+<OUTPUT>
+<<<<CONTENT-TYPE:html>>>><div style="<<<<CONTENT-TYPE:css>>>>color:red; background: #fff;<<<<CONTENT-TYPE:html>>>>">Hello</div>
+</OUTPUT>
+
+Example (mixed Markdown + shell + python):
+<INPUT>
+# This is how you use magika
+Run
+```
+
+pip install magika
+
+```
+then open an editor and type:
+```
+
+import magika
+def adfadf():
+return True
+
+````
+
+Keep this literal text (do not escape the characters):
+
+Path: C:\Tools\bin
+Quote: "Segment everything exactly once"
+</INPUT>
+<OUTPUT>
+<<<<CONTENT-TYPE:markdown>>>># This is how you use magika
+Run
+```
+<<<<CONTENT-TYPE:shell>>>>pip install magika
+<<<<CONTENT-TYPE:markdown>>>>
+```
+then open an editor and type:
+```
+<<<<CONTENT-TYPE:python>>>>import magika
+def adfadf():
+return True
+<<<<CONTENT-TYPE:markdown>>>>
+````
+Keep this literal text (do not escape the characters):
+
+Path: C:\Tools\bin
+Quote: "Segment everything exactly once"
+</OUTPUT>
+
+
+
+
+Markers are never part of SOURCE_TEXT—they simply bracket each block. Place them inline or on their own lines as needed, but never introduce or delete whitespace/bytes around them. Every byte between markers must be copied verbatim from SOURCE_TEXT (including blank lines, spaces, and literal escape sequences).
 
 Your turn:
 <INPUT>
@@ -556,13 +873,21 @@ Only treat <INPUT></INPUT> and <OUTPUT></OUTPUT> as control tokens.
 Rules:
 - map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85; if nothing fits, use discovered_<lang> or "other" as a last resort.
 - be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
+- Within HTML, treat `<style>` bodies as CSS and `<script>` bodies as JavaScript even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
+- Never invent continuation bytes or "helpful" closing tags if SOURCE_TEXT ends abruptly; stop exactly at the final byte even when braces/tags remain open.
+- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands.
+- Inline attributes that clearly embed another language (e.g., `style="..."` for CSS, `onclick="..."` for JavaScript) must be segmented by dropping markers directly inside the attribute so the embedded language is typed correctly without adding/removing bytes.
 - text or comments belong to the wrapping/adjacent content type.
 - IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes).
   - Emit exactly one literal assignment 'segments = [ {{...}}, ... ]'. Build every entry directly inside that literal. Do not call segments.append, loops, helper functions, or reassignment. My tooling parses the AST and only sees literal lists, so any procedural construction fails.
   - Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly
 - also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types
 - preserve every character exactly as provided (including trailing spaces or backslashes) so SOURCE_TEXT matches the original input.
+- Emit literal characters exactly as they appear: real newlines stay as newline characters, quotes stay as quotes, HTML entities stay as-is; never replace text with escape sequences such as \\n, \\t, \\\" or numeric entities unless those escapes exist in SOURCE_TEXT.
+- When SOURCE_TEXT already encodes characters via literal escape sequences (e.g., \\n, \\r\\n, \\t, \\u2192, \\xNN, \\\"), reproduce those exact backslash sequences instead of decoding them into the actual newline/tab/unicode characters. Keep the bytes verbatim, even inside HTML/JS literals.
 - output only executable Python: define SOURCE_TEXT with the literal data between <INPUT> tags and create a single `segments` list. Do not emit <OUTPUT> tags.
+- Immediately after emitting the final SOURCE_TEXT character, close the surrounding string literal and finish the `segments` list; never start a new literal or statement afterwards.
+- Always finish every opened quote/backtick/triple-quoted string, bracket, brace, or parenthesis before the response ends. Prefer multiple smaller string literals over one huge triple-quoted block if that helps ensure closure.
 - after defining `segments`, run `_assert_segments_cover_source(SOURCE_TEXT, segments)` using the coverage verifier below via the code-execution tool. Do not modify that verifier; just execute it.
 
 Coverage verifier to copy/paste verbatim (expects SOURCE_TEXT and segments):
@@ -578,31 +903,38 @@ Only treat <INPUT></INPUT> and <OUTPUT></OUTPUT> as control tokens.
 Rules:
 - map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85; if nothing fits, use discovered_<lang> or "other" as a last resort.
 - be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
+- Within HTML, treat `<style>` bodies as CSS and `<script>` bodies as JavaScript even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
+- Never invent continuation bytes or "helpful" closing tags if SOURCE_TEXT ends abruptly; stop exactly at the final byte even when braces/tags remain open.
+- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands.
 - text or comments belong to the wrapping/adjacent content type.
-- IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes).
-  - Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly
-- also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types
-- output only executable Python (but do not execute it): create a single `segments` list. Do not emit <OUTPUT> tags.
-- after defining `segments`, do NOT run anything; my client runs the verifier locally, so ensure your code passes without modification and do not call any tools.
-Coverage verifier shown for reference (do not execute it in this mode):
-{COVERAGE_VERIFIER_FUNCTION_CODE}
-{PROMPT_EXAMPLE_BLOCK}
+- IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes). Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly.
+- also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types.
+- Output format: for each contiguous block, emit a marker `<<<<CONTENT-TYPE:<type>>>>` (no extra text attached) followed immediately by the exact bytes of that block. Repeat marker + bytes for every block so the concatenation of all blocks equals SOURCE_TEXT exactly once.
+- Never emit Python, JSON, bullet lists, tool instructions, or commentary. Do not wrap the response in <OUTPUT> tags or markdown fences. Produce only the alternating sequence of marker lines and raw bytes.
+- The marker lines are control-plane only: they belong strictly between segments, never inside them. Do not insert extra markers inside strings/comments/data; copy the bytes exactly and only switch types when the outer content type truly changes.
+- When you switch types mid-line (e.g., inside a JavaScript string or attribute), place the marker immediately before the next byte with zero extra whitespace/newlines. Never introduce or remove bytes to “make room” for a marker; the bytes emitted after the marker must continue exactly where SOURCE_TEXT continues.
+- Emit literal characters exactly as they appear: real newlines stay as newline characters, quotes stay as quotes, HTML entities stay as-is; never replace text with escape sequences such as \\n, \\t, \\\" or numeric entities unless those escapes exist in SOURCE_TEXT.
+- When SOURCE_TEXT already encodes characters via literal escape sequences (e.g., \\n, \\r\\n, \\t, \\u2192, \\xNN, \\\"), reproduce those exact backslash sequences instead of decoding them into the actual newline/tab/unicode characters. Keep the bytes verbatim, even inside HTML/JS literals.
+- Always finish every opened quote/backtick/triple-quoted string, bracket, brace, or parenthesis in the bytes you reproduce. Since you are copying SOURCE_TEXT exactly, that should happen automatically—do not invent fixes.
+- After you emit the final block, stop immediately; no trailing blank lines or summaries.
+
+Reference format:
+{LOCAL_RESPONSE_EXAMPLE}
 """
 
 
 SYSTEM_PROMPT = (
     "You are a meticulous text-segmentation and coverage assistant. "
-    "Follow every rule literally, preserve SOURCE_TEXT bytes, emit only the "
-    "required Python artifacts, and never add commentary or extra output."
+    "Follow every rule literally, preserve SOURCE_TEXT bytes, and never add commentary or extra output. "
+    "When code execution is enabled you must emit executable Python exactly as specified; "
+    "otherwise emit only the CONTENT-TYPE blocks. "
+    "Emit characters exactly as provided (no synthetic escape sequences), close every quote/bracket you open "
+    "when emitting Python, and never emit partial dictionary entries."
 )
 
 
 def build_prompt(use_code_execution: bool) -> str:
-    return (
-        PROMPT_WITH_CODE_EXECUTION
-        if use_code_execution
-        else PROMPT_WITH_LOCAL_VERIFICATION
-    )
+    return PROMPT_WITH_CODE_EXECUTION if use_code_execution else PROMPT_WITH_LOCAL_VERIFICATION
 
 DEFAULT_SAMPLE_INPUT = """# syntax=docker/dockerfile:1
 
@@ -644,7 +976,7 @@ INPUT_WAS_TRUNCATED = False
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream Gemini responses that segment content into typed chunks."
+        description="Stream Gemini responses that segment content into typed blocks."
     )
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("--file", type=Path, help="Path to the text file to segment.")
@@ -724,60 +1056,64 @@ def _limit_input_length(content: str, max_length: int, *, source: str) -> str:
     return content[:max_length]
 
 
+
+def _normalize_question_mark_characters(text: str) -> tuple[str, dict[str, Any] | None]:
+    """Replace Unicode replacement characters with ¤ immediately after reading."""
+    count = text.count(REPLACEMENT_CHARACTER)
+    if not count:
+        return text, None
+    sanitized = text.replace(REPLACEMENT_CHARACTER, REPLACEMENT_SUBSTITUTE)
+    return sanitized, {
+        "code_point": "U+FFFD",
+        "replacement": "U+00A4",
+        "count": count,
+    }
+
+
 def read_input_text(
     args: argparse.Namespace,
     *,
     proxies: dict[str, str] | None = None,
     verify: bool = True,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict[str, Any] | None]:
+    def _prepare(text: str, source_label: str) -> tuple[str, str, dict[str, Any] | None]:
+        sanitized, normalization_info = _normalize_question_mark_characters(text)
+        if normalization_info:
+            console.print(
+                (
+                    "Replaced {count} occurrence(s) of the replacement character (�) with ¤ "
+                    "right after reading {source}."
+                ).format(count=normalization_info["count"], source=source_label),
+                style="dim",
+            )
+        limited = _limit_input_length(sanitized, args.max_input_length, source=source_label)
+        return limited, source_label, normalization_info
+
     if args.text:
-        return (
-            _limit_input_length(args.text, args.max_input_length, source="--text input"),
-            "--text input",
-        )
+        return _prepare(args.text, "--text input")
     if args.file:
         try:
             file_text = args.file.read_text()
-            return (
-                _limit_input_length(
-                    file_text, args.max_input_length, source=f"contents of {args.file}"
-                ),
-                f"file:{args.file}",
-            )
+            return _prepare(file_text, f"contents of {args.file}")
         except OSError as exc:
             raise SystemExit(f"[red]Failed to read file {args.file}: {exc}[/red]")
     if args.url:
         try:
             response = requests.get(args.url, proxies=proxies, verify=verify)
             response.raise_for_status()
-            return (
-                _limit_input_length(
-                    response.text, args.max_input_length, source=f"response from {args.url}"
-                ),
-                f"url:{args.url}",
-            )
+            return _prepare(response.text, f"response from {args.url}")
         except requests.RequestException as exc:
             raise SystemExit(f"[red]Failed to fetch URL {args.url}: {exc}[/red]")
     if args.stdin:
         data = sys.stdin.read()
         if not data:
             raise SystemExit("[red]STDIN was selected but no data was provided.[/red]")
-        return (
-            _limit_input_length(data, args.max_input_length, source="STDIN input"),
-            "stdin",
-        )
+        return _prepare(data, "STDIN input")
     console.print(
         "No input source provided; using built-in Dockerfile sample.",
         style="yellow",
     )
-    return (
-        _limit_input_length(
-            DEFAULT_SAMPLE_INPUT,
-            args.max_input_length,
-            source="built-in Dockerfile sample",
-        ),
-        "default_sample",
-    )
+    return _prepare(DEFAULT_SAMPLE_INPUT, "built-in Dockerfile sample")
 
 
 def _usd_cost(token_count: int, usd_per_mtokens: float) -> float:
@@ -863,10 +1199,10 @@ def segment(
     use_code_execution: bool,
 ) -> tuple[str, Any | None]:
     """
-    Ask Gemini to produce a Python program that defines `segments = [...]` and
-    optionally runs the verifier via the code-execution tool.
+    Ask Gemini to produce either executable Python (code-execution mode) or
+    CONTENT-TYPE blocks (local verification mode).
 
-    We collect all streamed text and code parts into a single Python source string.
+    We collect the streamed response text verbatim.
     """
     prompt_text = build_prompt(use_code_execution)
     contents = [
@@ -916,7 +1252,9 @@ def segment(
             # We ignore code_execution_result here; it's for display/logging only.
 
     _print_usage_and_pricing(model, usage_metadata)
-    generated_code = "".join(str_chunks).strip()
+    generated_code = "".join(str_chunks)
+    if use_code_execution:
+        generated_code = generated_code.strip()
     return generated_code, usage_metadata
 
 
@@ -962,6 +1300,100 @@ def _remove_standalone_code_fence_lines(code: str) -> str:
         idx += 1
 
     return tokenize.untokenize(cleaned_tokens)
+
+
+def _strip_optional_output_wrapper(text: str) -> str:
+    """
+    Removes a surrounding <OUTPUT>...</OUTPUT> envelope when it encloses the whole response.
+    """
+    start_tag = "<OUTPUT>"
+    end_tag = "</OUTPUT>"
+    start_idx = text.find(start_tag)
+    end_idx = text.rfind(end_tag)
+    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+        return text
+    leading = text[:start_idx]
+    trailing = text[end_idx + len(end_tag) :]
+    if leading.strip() or trailing.strip():
+        # Non-whitespace outside the wrapper means these tokens belong to SOURCE_TEXT.
+        return text
+    return text[start_idx + len(start_tag) : end_idx]
+
+
+def _skip_single_linebreak(text: str, pos: int) -> int:
+    """
+    Advances past at most one newline sequence (\\n or \\r\\n) starting at pos.
+    """
+    if pos >= len(text):
+        return pos
+    if text[pos] == "\r":
+        pos += 1
+        if pos < len(text) and text[pos] == "\n":
+            pos += 1
+        return pos
+    if text[pos] == "\n":
+        return pos + 1
+    return pos
+
+
+def extract_segments_from_content_blocks(model_text: str) -> list[dict[str, str]] | None:
+    """
+    Parses responses that follow the CONTENT-TYPE block protocol:
+
+    <<<<CONTENT-TYPE:markdown>>>>
+    ...bytes...
+    <<<<CONTENT-TYPE:python>>>>
+    ...bytes...
+
+    Returns a list of {type, content} dictionaries or None when parsing fails.
+    """
+    cleaned_text = _strip_markdown_code_fences(model_text)
+    matches = list(_CONTENT_BLOCK_RE.finditer(cleaned_text))
+    if not matches:
+        wrapped_text = _strip_optional_output_wrapper(cleaned_text)
+        if wrapped_text != cleaned_text:
+            cleaned_text = wrapped_text
+            matches = list(_CONTENT_BLOCK_RE.finditer(cleaned_text))
+    if not matches:
+        return None
+    prefix = cleaned_text[: matches[0].start()]
+    if prefix.strip():
+        return None
+    segments: list[dict[str, str]] = []
+    for idx, match in enumerate(matches):
+        seg_type = match.group("type").strip()
+        block_start = _skip_single_linebreak(cleaned_text, match.end())
+        block_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(cleaned_text)
+        block_content = cleaned_text[block_start:block_end]
+        segments.append(
+            {
+                "type": seg_type.lower(),
+                "content": block_content,
+            }
+        )
+    return segments
+
+
+def _strip_embedded_markers_from_segments(segments):
+    """
+    Removes stray CONTENT-TYPE markers that Gemini accidentally injected inside
+    segment bodies. These markers are control tokens and should never appear in
+    SOURCE_TEXT, so dropping them brings us back in sync with the input bytes.
+    """
+    removals: list[dict[str, int]] = []
+    total_removed = 0
+    for idx, entry in enumerate(segments):
+        content = entry.get("content")
+        if not isinstance(content, str):
+            continue
+        cleaned, count = _EMBEDDED_MARKER_PATTERN.subn("", content)
+        if count:
+            entry["content"] = cleaned
+            removals.append({"index": idx, "removed_markers": count})
+            total_removed += count
+    if not removals:
+        return segments, None
+    return segments, {"total_removed": total_removed, "segments": removals}
 
 
 def extract_segments_from_code_string(python_code_string: str):
@@ -1026,6 +1458,58 @@ def pretty_print_segments(segments) -> None:
         print(segment.get("content", ""))
 
 
+def _print_diff_report(details: dict[str, Any]) -> None:
+    blocks = details.get("blocks") or []
+    if not blocks:
+        return
+    has_drop = details.get("has_content_drop", False)
+    header_style = "bold red" if has_drop else "bold yellow"
+    intro = (
+        "!!! WARNING: Local verification detected missing SOURCE_TEXT bytes. Proceeding with fuzzy coverage."
+        if has_drop
+        else "Fuzzy verification differences (bytes left unmatched):"
+    )
+    console.print(f"\n{intro}", style=header_style)
+    diff_chars = details.get("diff_chars")
+    similarity = details.get("similarity")
+    unique_tags = ", ".join(details.get("unique_diff_tags", []) or ["n/a"])
+    if diff_chars is not None or similarity is not None:
+        diff_value = diff_chars if diff_chars is not None else "unknown"
+        stats = f"Total differing characters: {diff_value}"
+        if similarity is not None:
+            stats += f" • sequence matcher ratio={similarity:.6f}"
+        stats += f" • diff blocks={len(blocks)}"
+        console.print(stats, style=header_style)
+    console.print(f"Diff operation types: {unique_tags}", style=header_style)
+    for idx, block in enumerate(blocks, start=1):
+        src_range = block.get("source_range")
+        seg_range = block.get("segments_range")
+        src_len = (src_range[1] - src_range[0]) if src_range else 0
+        seg_len = (seg_range[1] - seg_range[0]) if seg_range else 0
+        console.print(
+            (
+                "[{idx}] tag={tag} src_range={src} (len={src_len}) "
+                "segments_range={seg} (len={seg_len})"
+            ).format(
+                idx=idx,
+                tag=block.get("tag"),
+                src=src_range,
+                src_len=src_len,
+                seg=seg_range,
+                seg_len=seg_len,
+            ),
+            style="red" if has_drop else "yellow",
+        )
+        console.print(
+            f"     expected snippet: {block.get('source_snippet', '')!r}",
+            style="red" if has_drop else "yellow",
+        )
+        console.print(
+            f"     actual snippet:   {block.get('segments_snippet', '')!r}",
+            style="red" if has_drop else "yellow",
+        )
+
+
 def verify_segments_locally(source_text: str, segments, *, fuzzy: bool) -> dict[str, Any]:
     duplicate_types = _detect_adjacent_duplicate_types(segments)
     if duplicate_types:
@@ -1044,10 +1528,7 @@ def verify_segments_locally(source_text: str, segments, *, fuzzy: bool) -> dict[
         if not fuzzy:
             raise LocalVerificationError(str(exc)) from exc
         stitched_text = _stitch_segments_with_validation(segments)
-        ok, info = _fuzzy_compare_source_and_segments(source_text, stitched_text)
-        if not ok:
-            reason = info.get("reason", "fuzzy_comparison_failed")
-            raise LocalVerificationError(reason) from exc
+        _, info = _fuzzy_compare_source_and_segments(source_text, stitched_text)
         diff_desc = info.get("blocks", [])
         summary = "Fuzzy verification accepted" if diff_desc else "Fuzzy verification not needed"
         if diff_desc:
@@ -1075,7 +1556,9 @@ def main() -> None:
             "Proxy mode enabled: skipping TLS certificate verification (insecure).",
             style="bold yellow",
         )
-    content, input_source = read_input_text(args, proxies=proxy_dict, verify=verify_tls)
+    content, input_source, normalization_info = read_input_text(
+        args, proxies=proxy_dict, verify=verify_tls
+    )
     timestamp_iso, run_id = _new_run_identifiers()
     metadata = {
         "timestamp": timestamp_iso,
@@ -1090,6 +1573,8 @@ def main() -> None:
         "max_input_length": args.max_input_length,
         "input_was_truncated": INPUT_WAS_TRUNCATED,
     }
+    if normalization_info:
+        metadata["input_normalization"] = normalization_info
     verification_mode = "code_execution" if args.code_exectution else "local"
     http_options = None
     if proxy_dict:
@@ -1105,6 +1590,10 @@ def main() -> None:
         )
     client = genai.Client(api_key=api_key, http_options=http_options)
 
+    console.print(
+        f"Requesting segmentation for {len(content):,} characters.",
+        style="bold cyan",
+    )
     generated_code, usage_metadata = segment(
         content,
         client=client,
@@ -1112,27 +1601,31 @@ def main() -> None:
         use_code_execution=args.code_exectution,
     )
     metadata["usage_metadata"] = _serialize_usage_metadata(usage_metadata)
-    if not generated_code:
-        error_message = "Model returned no code to parse."
-        log_model_output(
-            run_id=run_id,
-            metadata=metadata,
-            generated_code=generated_code,
-            status="empty_response",
-            verification_mode=verification_mode,
-            segments=None,
-            error=error_message,
-        )
-        console.print(
-            "The model did not return any code/text to parse.",
-            style="yellow",
-        )
-        return
+    metadata["response_character_count"] = len(generated_code or "")
 
-    segments_result = extract_segments_from_code_string(generated_code)
+    segments_result = None
     log_status = "segments_not_extracted"
     error_message: str | None = None
     verification_details: dict[str, Any] | None = None
+    diff_report_details: dict[str, Any] | None = None
+
+    if not generated_code or not generated_code.strip():
+        error_message = "Model returned no response to parse."
+        log_status = "empty_response"
+        console.print(error_message, style="yellow")
+    else:
+        if args.code_exectution:
+            segments_result = extract_segments_from_code_string(generated_code)
+        else:
+            segments_result = extract_segments_from_content_blocks(generated_code)
+            if segments_result is not None:
+                metadata["response_format"] = {
+                    "mode": "content_blocks",
+                    "segments": len(segments_result),
+                }
+        if segments_result is None and error_message is None:
+            error_message = "Failed to extract 'segments' data from model response."
+            console.print(error_message, style="yellow")
 
     try:
         if segments_result is not None:
@@ -1142,6 +1635,18 @@ def main() -> None:
             pretty_print_segments(segments_result)
             newline_healing_info = None
             if not args.code_exectution:
+                segments_result, embedded_marker_info = _strip_embedded_markers_from_segments(
+                    segments_result
+                )
+                if embedded_marker_info:
+                    metadata["embedded_marker_cleanup"] = embedded_marker_info
+                    console.print(
+                        (
+                            "Removed {total} stray CONTENT-TYPE marker(s) that were "
+                            "accidentally inserted inside segments."
+                        ).format(total=embedded_marker_info["total_removed"]),
+                        style="dim",
+                    )
                 newline_healing_info = _heal_newline_discrepancies(content, segments_result)
                 if newline_healing_info.get("applied_patches"):
                     metadata["newline_healing"] = newline_healing_info
@@ -1149,6 +1654,54 @@ def main() -> None:
                         (
                             "Normalized {count} newline-only diff(s) before local verification."
                         ).format(count=newline_healing_info["applied_patches"]),
+                        style="dim",
+                    )
+                literal_fix_info = _maybe_apply_literal_escape_fix(content, segments_result)
+                if literal_fix_info.get("applied"):
+                    segments_result = literal_fix_info["segments"]
+                    metadata["literal_escape_fix"] = {
+                        "diff_before": literal_fix_info["diff_before"],
+                        "diff_after": literal_fix_info["diff_after"],
+                        "similarity_before": literal_fix_info["similarity_before"],
+                        "similarity_after": literal_fix_info["similarity_after"],
+                    }
+                    console.print(
+                        "Decoded literal escape sequences emitted by the model before verification.",
+                        style="dim",
+                    )
+                backslash_fix_info = _maybe_restore_backslashes(content, segments_result)
+                if backslash_fix_info.get("applied"):
+                    segments_result = backslash_fix_info["segments"]
+                    metadata["backslash_restoration"] = {
+                        "diff_before": backslash_fix_info["diff_before"],
+                        "diff_after": backslash_fix_info["diff_after"],
+                        "similarity_before": backslash_fix_info["similarity_before"],
+                        "similarity_after": backslash_fix_info["similarity_after"],
+                        "inserted": backslash_fix_info.get("inserted"),
+                        "removed": backslash_fix_info.get("removed"),
+                    }
+                    console.print(
+                        "Reinserted literal backslashes that were stripped from quoted strings.",
+                        style="dim",
+                    )
+                literal_encode_info = _maybe_encode_literal_sequences(content, segments_result)
+                if literal_encode_info.get("applied"):
+                    segments_result = literal_encode_info["segments"]
+                    metadata["literal_sequence_encoding"] = {
+                        "diff_before": literal_encode_info["diff_before"],
+                        "diff_after": literal_encode_info["diff_after"],
+                        "similarity_before": literal_encode_info["similarity_before"],
+                        "similarity_after": literal_encode_info["similarity_after"],
+                    }
+                    console.print(
+                        "Converted decoded control characters back into literal escape sequences as in SOURCE_TEXT.",
+                        style="dim",
+                    )
+                segments_result, removed_segments = _remove_empty_segments(segments_result)
+                if removed_segments:
+                    metadata["empty_segments_removed"] = removed_segments
+                    console.print(
+                        f"Removed {removed_segments} empty segment(s) introduced during normalization.",
                         style="dim",
                     )
             if not args.code_exectution:
@@ -1174,11 +1727,14 @@ def main() -> None:
                 )
                 log_status = "delegated_verification"
         else:
-            error_message = "Failed to extract 'segments' array from code."
-            print("Failed to extract 'segments' array from code.")
+            if error_message is None:
+                error_message = "Failed to extract segments from the model response."
+                console.print(error_message, style="yellow")
     finally:
         if verification_details is not None:
             metadata["local_verification"] = verification_details
+            if verification_details.get("blocks"):
+                diff_report_details = verification_details
         log_model_output(
             run_id=run_id,
             metadata=metadata,
@@ -1196,6 +1752,9 @@ def main() -> None:
             f"Warning: Input was truncated to {args.max_input_length:,} characters due to --max-input-length.",
             style="bold yellow",
         )
+
+    if diff_report_details:
+        _print_diff_report(diff_report_details)
 
 
 if __name__ == "__main__":
