@@ -11,7 +11,10 @@ downloader/stack*/**
 downloader/arrow*/**
 train/wandb/**
 train/checkpoints/**
+downloader/gemini_eval/**
 train/sankey_images/**
+gemini_output_logs/**
+gemini_segmentations/**
 # Virtual environment directories
 # These are managed by tools like venv, uv, or conda and should not be committed.
 venv/

@@ -1,47 +1,8 @@
 """
-End-to-end The Stack → filtered windows → Arrow datasets (per label) with 70/20/10 splits
+End-to-end The Stack → filtered windows → Arrow datasets (per label) with 70/10/10/10 splits
 
-This version ALWAYS writes three disjoint datasets per content type (label) to:
+This version ALWAYS writes four disjoint datasets per content type (label) to:
   <out-root>/<split>/<label>/dataset
-    - e.g., arrow_out/train/php/dataset
-            arrow_out/val/php/dataset
-            arrow_out/test/php/dataset
-
-What this does (single pass per label, no temp raw files):
-  • Streams from BigCode "bigcode/the-stack" per language folder (no full download) — for real languages.
-  • Strict license filter: keeps permissive families only (MIT/Apache/BSD/Unlicense).
-  • Windows content to fixed-size byte chunks (default: 1536 bytes).
-  • Magika pre-filtering in batches (in-process; no multiprocessing issues).
-  • PHP: strips all non-PHP blocks via regex.
-  • HTML: strips <script>/<style> blocks and risky event handlers before windowing.
-  • Writes **only** final Arrow datasets to disk (train/val/test per label).
-  • Default cap: **1,000,000 kept windows per label** (post-filter). `--demo` → 100 per label (total).
-  • Robust streaming controls: shard/offset/skip to jump ahead in huge sorted datasets.
-  • Detailed progress bars & summaries (tqdm) and periodic logging.
-
-Resume, dedupe & splits:
-  • Each window gets a stable content hash `uid`.
-  • Split assignment is a pure function of `uid` → deterministic 70/20/10 buckets.
-  • Resume loads existing train/val/test datasets, unions their UIDs, and skips dups on the fly.
-  • New data are written to a temporary directory, then atomically swapped in per split.
-
-Also supported (derived transforms):
-  • Labels starting with `encoding_` or `encryption_`:
-      encodings:  hex, base64, base32, base58, base85
-      encryptions: aes, des, blowfish, rc4, chacha20
-    - Names: encoding_<method> / encryption_<method> (e.g., encoding_base64, encryption_aes)
-    - Each window reuses plaintext from existing non-derived labels in the SAME split,
-      then applies the requested transform deterministically (encode/encrypt).
-    - Deterministic selection per split → no cross-split leakage and stable resumes.
-
-Example:
-  python build_stack_windows_arrow_splits.py \
-      --out-root arrow_out \
-      --langs html,css,javascript_typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,shell,powershell,visual_basic,php,sql,yaml,dockerfile,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85 \
-      --max-windows-per-label 200000 \
-      --window-bytes 1536 --magika-batch 1024 --threshold 0.82 \
-      --shard-count 64 --shard-index 17 \
-      --skip-per-lang php=500000,css=200000 --use-auth-token
 """
 
 from __future__ import annotations
@@ -70,7 +31,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # 3rd-party deps expected:
 #   datasets>=2.14, magika==0.6.*, numpy, tqdm
-#   For encryption transforms: pycryptodome (Crypto)
 from datasets import Dataset, Features, Value, load_dataset, load_from_disk, concatenate_datasets
 from datasets.exceptions import DatasetGenerationError
 from tqdm import tqdm
@@ -118,6 +78,12 @@ def canonical_label(name: str) -> str:
         return "batchfile"
     if s in {"docker", "dockerfile"}:
         return "dockerfile"
+    if s in {"gettext-catalog", "gettext_catalog"}:
+        return "gettext_catalog"
+    if s in {"latex"}:
+        return "tex"
+    if s in {"rst", "restructured_text", "restructured-text", "restructuredtext"}:
+        return "restructuredtext"
     return s
 
 
@@ -139,6 +105,16 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "json": {"json"},
     "css": {"css"},
     "html": {"html", "xhtml"},
+    "dart": {"dart"},
+    "gettext_catalog": {"gettext-catalog", "gettext_catalog", "gettext"},
+    "kotlin": {"kotlin"},
+    "markdown": {"markdown", "md"},
+    "restructuredtext": {"restructuredtext", "rst"},
+    "scala": {"scala"},
+    "swift": {"swift"},
+    "svg": {"svg"},
+    "tex": {"tex", "latex"},
+    "xml": {"xml"},
     "shell": {"shell", "bash", "sh", "zsh", "fish", "batchfile", "bat", "cmd", "shell_batchfile"},
     "powershell": {"powershell", "ps1"},
     "visual_basic": {"visual_basic", "visual-basic", "vb", "vba", "vb.net", "visualbasic"},
@@ -396,7 +372,7 @@ def gen_text_windows_from_madlad(
     rng.shuffle(fallback_langs)
 
     kept_total = 0
-    kept_per_split = {"train": 0, "val": 0, "test": 0}
+    kept_per_split = {s: 0 for s in WINDOW_SPLITS}
     rejected = 0
     lang_id = np.int16(LANG2ID.get("text", -1)).item()
     last_postfix = time.time()
@@ -476,7 +452,6 @@ def gen_text_windows_from_madlad(
                     rej=rejected,
                     k_train=kept_per_split["train"],
                     k_val=kept_per_split["val"],
-                    k_test=kept_per_split["test"],
                 )
                 last_postfix = now
 
@@ -516,7 +491,6 @@ def gen_text_windows_from_madlad(
         rej=rejected,
         k_train=kept_per_split["train"],
         k_val=kept_per_split["val"],
-        k_test=kept_per_split["test"],
     )
     pbar.close()
 
@@ -927,14 +901,23 @@ LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     "c_family": ["c", "c++", "cpp"],
     "json": ["json"],
     "css": ["css"],
-    "html": ["html", "xhtml", "xml", "svg"],
+    "html": ["html", "xhtml"],
     "text": ["text"],
-    # new language buckets requested
     "shell": ["shell", "bash", "sh", "zsh", "fish"],
     "powershell": ["powershell", "ps1"],
     "batchfile": ["batchfile", "batch", "bat", "cmd"],
     "visual_basic": ["visual-basic", "visualbasic", "vb", "vb.net", "vba"],
     "dockerfile": ["dockerfile", "docker"],
+    "dart": ["dart"],
+    "gettext_catalog": ["gettext-catalog"],
+    "kotlin": ["kotlin"],
+    "markdown": ["markdown", "md"],
+    "restructuredtext": ["restructuredtext", "rst"],
+    "scala": ["scala"],
+    "swift": ["swift"],
+    "svg": ["svg"],
+    "tex": ["latex", "tex"],
+    "xml": ["xml"],
     # derived enc/enc are generated locally and do not map to The Stack
 }
 
@@ -997,10 +980,13 @@ def _stream_single_language_iterable(
     shard_count: int,
     shard_index: int,
     skip_first_n: int,
+    prefer_stack: bool,
 ) -> Optional[Any]:
     label = canonical_label(logical_label)
+    source_tag = label
     if label == "text":
         ds = stream_madlad_iterable(shuffle_buffer=shuffle_buffer)
+        source_tag = "madlad"
     else:
         cands = LANG_CANDIDATE_DIRS.get(label, [label])
         token_val: Optional[bool] = None
@@ -1015,6 +1001,7 @@ def _stream_single_language_iterable(
         for d in cands:
             ds = try_load_streaming_dir(d, shuffle_buffer=shuffle_buffer, token=token_val)
             if ds is not None:
+                source_tag = d
                 break
     if ds is None:
         return None
@@ -1038,7 +1025,13 @@ def _stream_single_language_iterable(
                     yield ex
             ds = _drop(ds)
 
-    return ds
+    def _attach_source() -> Iterator[Dict[str, Any]]:
+        for ex in ds:
+            if isinstance(ex, dict):
+                ex["_stack_src"] = source_tag
+            yield ex
+
+    return _attach_source()
 
 def stream_language_iterable(
     logical_label: str,
@@ -1048,6 +1041,7 @@ def stream_language_iterable(
     shard_count: int,
     shard_index: int,
     skip_first_n: int,
+    prefer_stack: bool = False,
 ) -> Optional[Any]:
     label = canonical_label(logical_label)
 
@@ -1076,6 +1070,7 @@ def stream_language_iterable(
                 shard_count=shard_count,
                 shard_index=shard_index,
                 skip_first_n=skip_alloc[idx] if idx < len(skip_alloc) else 0,
+                prefer_stack=prefer_stack,
             )
             if ds is None:
                 missing.append(src)
@@ -1111,6 +1106,7 @@ def stream_language_iterable(
         shard_count=shard_count,
         shard_index=shard_index,
         skip_first_n=skip_first_n,
+        prefer_stack=prefer_stack,
     )
 
 
@@ -1131,16 +1127,102 @@ def byte_windows(b: bytes, window_bytes: int) -> Iterator[Tuple[int, bytes]]:
 def stable_uid_for_window(raw: bytes) -> str:
     return hashlib.blake2s(raw, digest_size=16).hexdigest()
 
+# Split configuration: train/val use windowed samples, monitor/test keep raw files.
+WINDOW_SPLITS = ("train", "val")
+RAW_SPLITS = ("monitor", "test")
+ALL_SPLITS = WINDOW_SPLITS + RAW_SPLITS
+DEFAULT_RATIOS = {
+    "train": 0.70,
+    "val": 0.10,
+    "monitor": 0.10,
+    "test": 0.10,
+}
+RAW_FILE_MAX_BYTES = 10_000
+
 def split_for_uid(uid: str) -> str:
     # 32-bit digest for quick modulo
     h = hashlib.blake2s(uid.encode("utf-8"), digest_size=4).digest()
-    v = int.from_bytes(h, byteorder="big") % 100
+    v = int.from_bytes(h, byteorder="big") % 80
     if v < 70:
         return "train"
-    elif v < 90:
+    else:
         return "val"
+
+
+def compute_ideal_split_counts(total_cap: int) -> Dict[str, int]:
+    total_cap = max(0, int(total_cap))
+    counts: Dict[str, int] = {}
+    assigned = 0
+    for split in ALL_SPLITS:
+        ratio = DEFAULT_RATIOS.get(split, 0.0)
+        target = int(total_cap * ratio)
+        counts[split] = target
+        assigned += target
+    remainder = total_cap - assigned
+    while remainder > 0:
+        # distribute leftover counts deterministically in split order
+        for split in ALL_SPLITS:
+            if remainder <= 0:
+                break
+            counts[split] += 1
+            remainder -= 1
+    return counts
+
+
+def compute_split_shortfall(
+    target_counts: Dict[str, int], existing_counts: Dict[str, int], splits: Sequence[str]
+) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for split in splits:
+        target = max(0, target_counts.get(split, 0))
+        current = max(0, existing_counts.get(split, 0))
+        out[split] = max(0, target - current)
+    return out
+
+
+def _source_identity_for_split(ex: Dict[str, Any], label: str) -> str:
+    parts: List[str] = [label or ""]
+    candidate_keys = (
+        "hexsha",
+        "id",
+        "sha",
+        "path",
+        "max_stars_repo_path",
+        "max_forks_repo_path",
+        "max_issues_repo_path",
+    )
+    for key in candidate_keys:
+        val = ex.get(key)
+        if val:
+            parts.append(str(val))
+            break
+    stack_src = ex.get("_stack_src")
+    if stack_src:
+        parts.append(str(stack_src))
+    if len(parts) == 1:
+        raw_text = ex.get("content") or ex.get("text")
+        if isinstance(raw_text, str) and raw_text:
+            parts.append(raw_text[:256])
+    return "|".join(parts)
+
+
+def route_for_example(ex: Dict[str, Any], label: str) -> str:
+    ident = _source_identity_for_split(ex, label)
+    h = hashlib.blake2s(ident.encode("utf-8"), digest_size=4).digest()
+    v = int.from_bytes(h, byteorder="big") % 100
+    if v < int((DEFAULT_RATIOS["train"] + DEFAULT_RATIOS["val"]) * 100):
+        return "window"
+    elif v < int((DEFAULT_RATIOS["train"] + DEFAULT_RATIOS["val"] + DEFAULT_RATIOS["monitor"]) * 100):
+        return "monitor"
     else:
         return "test"
+
+
+def stack_source_label(ex: Dict[str, Any], fallback: str) -> str:
+    src = ex.get("_stack_src")
+    if isinstance(src, str) and src:
+        return src
+    return fallback
 
 @dataclass
 class MagikaResult:
@@ -1174,18 +1256,15 @@ class MagikaBatcher:
 
 
 # ============================================================
-#               Derived data (encodings/encryptions)
+#               Derived data (encodings only)
 # ============================================================
 
 ENCODING_METHODS = {"hex", "base64", "base32", "base58", "base85"}
-ENCRYPTION_METHODS = {"aes", "des", "blowfish", "rc4", "chacha20"}
 
 def is_derived_label(lbl: str) -> bool:
     c = canonical_label(lbl)
     if c.startswith("encoding_"):
         return c.split("encoding_", 1)[1] in ENCODING_METHODS
-    if c.startswith("encryption_"):
-        return c.split("encryption_", 1)[1] in ENCRYPTION_METHODS
     return False
 
 # Deterministic pseudo-random bytes (PRF) based on base_seed, split, method tag, and index.
@@ -1240,7 +1319,7 @@ def build_plaintext_pool(out_root: Path, split: str, exclude_label: str) -> Plai
         lbl = canonical_label(child.name)
         if lbl == exclude_label:
             continue
-        if lbl.startswith("encryption_") or lbl.startswith("encoding_"):
+        if lbl.startswith("encoding_"):
             continue
         ds_dir = child / "dataset"
         if not ds_dir.exists():
@@ -1268,7 +1347,7 @@ class PlaintextSampler:
         self.base_seed = base_seed
         self.split = split
         self.method = method
-        self._tag = f"encrypt_src::{method}"
+        self._tag = f"encode_src::{method}"
         if total > 1 and total >= need:
             start = _prf_int(base_seed, split, f"{method}_start", 0, total)
             step = _prf_int(base_seed, split, f"{method}_step", 0, total)
@@ -1364,57 +1443,6 @@ def max_input_bytes_for_encoding(method: str, window_bytes: int) -> int:
         return _max_base58_raw_bytes(window_bytes)
     raise ValueError(f"Unknown encoding method: {method}")
 
-def encrypt_bytes(method: str, base_seed: int, split: str, idx: int, raw: bytes) -> bytes:
-    m = method.lower()
-    # keys/nonces derived deterministically from (seed, split, method, idx)
-    if m == "aes":
-        key = _prf_bytes(base_seed, split, "aes_key", idx, 32)   # AES-256
-        iv = _prf_bytes(base_seed, split, "aes_iv", idx, 16)
-        try:
-            from Crypto.Cipher import AES
-        except Exception as e:
-            raise RuntimeError("PyCryptodome is required for AES encryption") from e
-        cipher = AES.new(key, AES.MODE_CFB, iv=iv, segment_size=128)
-        return iv + cipher.encrypt(raw)
-    elif m == "des":
-        key = bytearray(_prf_bytes(base_seed, split, "des_key", idx, 8))
-        # Ensure DES key has odd parity (PyCryptodome adjusts if needed)
-        try:
-            from Crypto.Cipher import DES
-        except Exception as e:
-            raise RuntimeError("PyCryptodome is required for DES encryption") from e
-        iv = _prf_bytes(base_seed, split, "des_iv", idx, 8)
-        cipher = DES.new(bytes(key), DES.MODE_CFB, iv=iv, segment_size=64)
-        return iv + cipher.encrypt(raw)
-    elif m == "blowfish":
-        try:
-            from Crypto.Cipher import Blowfish
-        except Exception as e:
-            raise RuntimeError("PyCryptodome is required for Blowfish encryption") from e
-        key = _prf_bytes(base_seed, split, "bf_key", idx, 32)
-        iv = _prf_bytes(base_seed, split, "bf_iv", idx, 8)
-        cipher = Blowfish.new(key, Blowfish.MODE_CFB, iv=iv, segment_size=64)
-        return iv + cipher.encrypt(raw)
-    elif m == "rc4":
-        try:
-            from Crypto.Cipher import ARC4
-        except Exception as e:
-            raise RuntimeError("PyCryptodome is required for RC4 encryption") from e
-        key = _prf_bytes(base_seed, split, "rc4_key", idx, 32)
-        cipher = ARC4.new(key, drop=3072)  # drop initial keystream for safety
-        return cipher.encrypt(raw)
-    elif m == "chacha20":
-        try:
-            from Crypto.Cipher import ChaCha20
-        except Exception as e:
-            raise RuntimeError("PyCryptodome is required for ChaCha20 encryption") from e
-        key = _prf_bytes(base_seed, split, "chacha_key", idx, 32)
-        nonce = _prf_bytes(base_seed, split, "chacha_nonce", idx, 8)  # PyCryptodome uses 8-byte nonce
-        cipher = ChaCha20.new(key=key, nonce=nonce)
-        return nonce + cipher.encrypt(raw)
-    else:
-        raise ValueError(f"Unknown encryption method: {method}")
-
 def gen_transformed_for_label(
     *,
     label_c: str,
@@ -1439,20 +1467,18 @@ def gen_transformed_for_label(
 
     encoding_input_limit: Optional[int] = None
     if label_c.startswith("encoding_"):
-        family = "encoding"
         method = label_c.split("encoding_", 1)[1]
         encoding_input_limit = max_input_bytes_for_encoding(method, window_bytes)
     else:
-        family = "encryption"
-        method = label_c.split("encryption_", 1)[1]
+        raise ValueError(f"Unsupported derived label '{label_c}'")
 
     kept_total = 0
-    kept_per_split = {"train": 0, "val": 0, "test": 0}
+    kept_per_split = {s: 0 for s in WINDOW_SPLITS}
     lang_id = LANG2ID.get(label_c, -1)
     out_root = Path(out_root)
     pool_cache: Dict[str, PlaintextPool] = {}
 
-    for split in SPLITS:
+    for split in WINDOW_SPLITS:
         target = budget_per_split.get(split, 0)
         if target <= 0:
             continue
@@ -1508,26 +1534,19 @@ def gen_transformed_for_label(
 
             for pos in positions:
                 raw_plain, base_label = plaintext_by_position.get(pos, (b"", ""))
-                if family == "encoding":
-                    raw_for_encoding = raw_plain
-                    if encoding_input_limit is not None and len(raw_for_encoding) > encoding_input_limit:
-                        raw_for_encoding = raw_for_encoding[:encoding_input_limit]
-                    try:
+                raw_for_encoding = raw_plain
+                if encoding_input_limit is not None and len(raw_for_encoding) > encoding_input_limit:
+                    raw_for_encoding = raw_for_encoding[:encoding_input_limit]
+                try:
+                    content_str = encode_bytes(method, raw_for_encoding)
+                except Exception as e:
+                    raise RuntimeError(f"Encoding failed for method '{method}'") from e
+                if len(content_str) > window_bytes:
+                    trim_len = len(raw_for_encoding)
+                    while trim_len > 0 and len(content_str) > window_bytes:
+                        trim_len -= 1
+                        raw_for_encoding = raw_for_encoding[:trim_len]
                         content_str = encode_bytes(method, raw_for_encoding)
-                    except Exception as e:
-                        raise RuntimeError(f"Encoding failed for method '{method}'") from e
-                    if len(content_str) > window_bytes:
-                        trim_len = len(raw_for_encoding)
-                        while trim_len > 0 and len(content_str) > window_bytes:
-                            trim_len -= 1
-                            raw_for_encoding = raw_for_encoding[:trim_len]
-                            content_str = encode_bytes(method, raw_for_encoding)
-                else:
-                    try:
-                        ct = encrypt_bytes(method, base_seed, split, pos, raw_plain)
-                    except Exception as e:
-                        raise RuntimeError(f"Encryption failed for method '{method}'") from e
-                    content_str = ct.hex()
 
                 uid = stable_uid_for_window(content_str.encode("utf-8", errors="ignore"))
                 if seen_uids is not None and uid in seen_uids:
@@ -1542,10 +1561,10 @@ def gen_transformed_for_label(
                 if add_meta:
                     ex.update({
                         "win_idx": np.int64(0).item(),
-                        "source_ext": f"{family}:{method}",
+                        "source_ext": f"encoding:{method}",
                         "source_hexsha": "",
                         "source_repo": "derived",
-                        "source_repo_path": f"{base_label}->{family}:{method}",
+                        "source_repo_path": f"{base_label}->encoding:{method}",
                         "license": "derived",
                     })
                 if seen_uids is not None:
@@ -1558,8 +1577,7 @@ def gen_transformed_for_label(
             produced += batch_count
 
     pbar.set_postfix(k_train=kept_per_split["train"],
-                     k_val=kept_per_split["val"],
-                     k_test=kept_per_split["test"])
+                     k_val=kept_per_split["val"])
     pbar.close()
 
 
@@ -1696,6 +1714,10 @@ def gen_windows_for_label(
         if kept_total >= total_budget and total_budget > 0:
             break
 
+        route = route_for_example(ex, label_c)
+        if route in RAW_SPLITS:
+            continue
+
         raw_text = extract_primary_text(ex)
         if not raw_text:
             continue
@@ -1786,8 +1808,7 @@ def gen_windows_for_label(
         if (now - last_postfix) >= 0.3:
             pbar.set_postfix(kept_total=kept_total, rej=rejected,
                              k_train=kept_per_split["train"],
-                             k_val=kept_per_split["val"],
-                             k_test=kept_per_split["test"])
+                             k_val=kept_per_split["val"])
             last_postfix = now
 
         raw_text = ""
@@ -1798,13 +1819,146 @@ def gen_windows_for_label(
         yield out
     pbar.set_postfix(kept_total=kept_total, rej=rejected,
                      k_train=kept_per_split["train"],
-                     k_val=kept_per_split["val"],
-                     k_test=kept_per_split["test"])
+                     k_val=kept_per_split["val"])
+    pbar.close()
+
+
+def gen_raw_files_for_label(
+    *,
+    logical_label: str,
+    add_meta: bool,
+    shuffle_buffer: int,
+    use_auth_token: bool,
+    shard_count: int,
+    shard_index: int,
+    skip_first_n: int,
+    progress_mode: str,
+    budget_per_split: Dict[str, int],
+    seen_uids: Optional[Set[str]],
+    max_bytes: int,
+) -> Iterator[dict]:
+    label_c = canonical_label(logical_label)
+    if is_derived_label(label_c):
+        return
+
+    is_tty = sys.stderr.isatty()
+    show_progress = ((progress_mode == "always") or (progress_mode == "auto" and is_tty))
+    total_budget = sum(max(0, b) for b in budget_per_split.values())
+    pbar = tqdm(
+        total=total_budget if total_budget > 0 else None,
+        unit="file",
+        desc=f"{logical_label} (raw)",
+        disable=not show_progress,
+    )
+
+    ds = stream_language_iterable(
+        logical_label,
+        shuffle_buffer=shuffle_buffer,
+        use_auth_token=use_auth_token,
+        shard_count=shard_count,
+        shard_index=shard_index,
+        skip_first_n=skip_first_n,
+        prefer_stack=True,
+    )
+    if ds is None:
+        pbar.close()
+        raise RuntimeError(f"Could not open streaming dataset for '{logical_label}' (raw mode)")
+
+    kept_total = 0
+    kept_per_split = {s: 0 for s in RAW_SPLITS}
+    rejected = 0
+    lang_id = LANG2ID.get(label_c, -1)
+    last_postfix = time.time()
+
+    for ex in ds:
+        if total_budget > 0 and kept_total >= total_budget:
+            break
+
+        split = route_for_example(ex, label_c)
+        if split not in RAW_SPLITS:
+            continue
+        if budget_per_split.get(split, 0) <= 0:
+            continue
+
+        ok, _reason = license_is_allowed(ex)
+        if not ok:
+            rejected += 1
+            continue
+
+        raw_text = extract_primary_text(ex)
+        if not raw_text:
+            rejected += 1
+            continue
+
+        trimmed_text, trimmed_bytes = clamp_utf8_bytes(raw_text, max_bytes)
+        if not trimmed_bytes:
+            rejected += 1
+            continue
+
+        uid_material = trimmed_bytes + split.encode("utf-8")
+        uid = stable_uid_for_window(uid_material)
+        if seen_uids is not None and uid in seen_uids:
+            rejected += 1
+            continue
+
+        ext = ex.get("ext")
+        hexsha = ex.get("hexsha")
+        repo_name = ex.get("max_stars_repo_name") or ex.get("repo_name")
+        repo_path_raw = ex.get("max_stars_repo_path") or ex.get("path")
+        if repo_path_raw is None:
+            repo_path = None
+        elif isinstance(repo_path_raw, str):
+            repo_path = repo_path_raw
+        else:
+            repo_path = str(repo_path_raw)
+        license_str = ex.get("max_stars_repo_license") or ex.get("license")
+
+        payload = {
+            "content": trimmed_text,
+            "lang_id": np.int16(lang_id).item(),
+            "uid": uid,
+            "split": split,
+            "stack_label": stack_source_label(ex, label_c),
+        }
+        if add_meta:
+            payload.update({
+                "win_idx": np.int64(0).item(),
+                "source_ext": str(ext or ""),
+                "source_hexsha": str(hexsha or ""),
+                "source_repo": str(repo_name or ""),
+                "source_repo_path": str(repo_path or ""),
+                "license": str(license_str or ""),
+            })
+
+        if seen_uids is not None:
+            seen_uids.add(uid)
+        budget_per_split[split] = max(0, budget_per_split[split] - 1)
+        kept_per_split[split] += 1
+        kept_total += 1
+        pbar.update(1)
+        yield payload
+
+        now = time.time()
+        if (now - last_postfix) >= 0.3:
+            pbar.set_postfix(
+                kept_total=kept_total,
+                rej=rejected,
+                monitor=kept_per_split["monitor"],
+                test=kept_per_split["test"],
+            )
+            last_postfix = now
+
+    pbar.set_postfix(
+        kept_total=kept_total,
+        rej=rejected,
+        monitor=kept_per_split["monitor"],
+        test=kept_per_split["test"],
+    )
     pbar.close()
 
 
 # ============================================================
-#               Building (train/val/test per label)
+#    Building (train/val windows + monitor/test raw per label)
 # ============================================================
 
 LANG2ID: Dict[str, int] = {
@@ -1829,22 +1983,23 @@ LANG2ID: Dict[str, int] = {
     "powershell": 17,
     "visual_basic": 18,
     "dockerfile": 19,
+    "dart": 20,
+    "gettext_catalog": 21,
+    "kotlin": 22,
+    "markdown": 23,
+    "restructuredtext": 24,
+    "scala": 25,
+    "svg": 26,
+    "swift": 27,
+    "tex": 28,
+    "xml": 29,
     # derived encodings
     "encoding_hex": 100,
     "encoding_base64": 101,
     "encoding_base32": 102,
     "encoding_base58": 103,
     "encoding_base85": 104,
-    # derived encryptions
-    "encryption_aes": 120,
-    "encryption_des": 121,
-    "encryption_blowfish": 122,
-    "encryption_rc4": 123,
-    "encryption_chacha20": 124,
 }
-
-SPLITS = ("train", "val", "test")
-DEFAULT_RATIOS = {"train": 0.70, "val": 0.20, "test": 0.10}
 
 def ensure_recovery_dirs(out_dir: Path) -> None:
     backup_dir = out_dir.with_name(out_dir.name + ".bak")
@@ -1906,26 +2061,17 @@ def dir_for_label_split(out_root: Path, label: str, split: str) -> Path:
     """
     return out_root / split / canonical_label(label) / "dataset"
 
-def compute_split_targets(total_cap: int, existing_counts: Dict[str, int]) -> Dict[str, int]:
-    total_cap = max(0, int(total_cap))
-    ideal = {
-        "train": int(total_cap * DEFAULT_RATIOS["train"]),
-        "val": int(total_cap * DEFAULT_RATIOS["val"]),
-    }
-    ideal["test"] = total_cap - ideal["train"] - ideal["val"]
-
-    remaining = {}
-    for s in SPLITS:
-        need = ideal[s] - existing_counts.get(s, 0)
-        remaining[s] = max(0, need)
-    return remaining
-
-def load_existing_splits(out_root: Path, label: str, rebuild: bool) -> Tuple[Dict[str, Optional[Dataset]], Dict[str, int], Set[str]]:
+def load_existing_splits(
+    out_root: Path,
+    label: str,
+    splits: Sequence[str],
+    rebuild: bool,
+) -> Tuple[Dict[str, Optional[Dataset]], Dict[str, int], Set[str]]:
     existing_ds: Dict[str, Optional[Dataset]] = {}
     existing_counts: Dict[str, int] = {}
     seen_union: Set[str] = set()
 
-    for split in SPLITS:
+    for split in splits:
         out_dir = dir_for_label_split(out_root, label, split)
         ensure_recovery_dirs(out_dir)
         if rebuild and out_dir.exists():
@@ -1949,7 +2095,8 @@ def build_arrow_for_label_with_splits(
     window_bytes: int,
     magika_batch: int,
     threshold: float,
-    max_windows_total: int,
+    total_cap: int,
+    target_counts: Dict[str, int],
     add_meta: bool,
     shuffle_buffer: int,
     use_auth_token: bool,
@@ -1966,31 +2113,22 @@ def build_arrow_for_label_with_splits(
     if label_c not in LANG2ID:
         raise ValueError(f"Unknown/unsupported label '{label}'")
 
-    existing_ds, existing_counts, seen_uids = load_existing_splits(out_root, label_c, rebuild)
+    existing_ds, existing_counts, seen_uids = load_existing_splits(
+        out_root, label_c, WINDOW_SPLITS, rebuild
+    )
 
-    total_cap = 100 if demo else max_windows_total
+    cap_value = 100 if demo else total_cap
+    total_target = sum(target_counts.get(s, 0) for s in WINDOW_SPLITS)
     total_existing = sum(existing_counts.values())
 
-    if total_cap > 0 and total_existing >= total_cap:
-        out_dirs = {s: dir_for_label_split(out_root, label_c, s) for s in SPLITS}
+    if cap_value > 0 and total_existing >= total_target and total_target > 0:
+        out_dirs = {s: dir_for_label_split(out_root, label_c, s) for s in WINDOW_SPLITS}
         return existing_counts, out_dirs
 
-    per_split_budget = compute_split_targets(total_cap, existing_counts)
-
-    if total_cap == 0:
-        per_split_budget = {s: 2**63 - 1 for s in SPLITS}
+    if cap_value == 0:
+        per_split_budget = {s: 2**63 - 1 for s in WINDOW_SPLITS}
     else:
-        shortfall = total_cap - total_existing
-        sum_budgets = sum(per_split_budget.values())
-        if sum_budgets > shortfall:
-            if sum_budgets > 0:
-                scale = shortfall / sum_budgets
-                per_split_budget = {s: int(per_split_budget[s] * scale) for s in SPLITS}
-            while sum(per_split_budget.values()) < shortfall:
-                for s in SPLITS:
-                    if sum(per_split_budget.values()) >= shortfall:
-                        break
-                    per_split_budget[s] += 1
+        per_split_budget = compute_split_shortfall(target_counts, existing_counts, WINDOW_SPLITS)
 
     features = {
         "content": Value("string"),
@@ -2053,7 +2191,7 @@ def build_arrow_for_label_with_splits(
         ) from e
 
     new_by_split: Dict[str, Optional[Dataset]] = {}
-    for s in SPLITS:
+    for s in WINDOW_SPLITS:
         if len(ds_new_total) > 0:
             part = ds_new_total.filter(lambda ex, _s=None: ex["split"] == _s, fn_kwargs={"_s": s})
             if "split" in part.column_names:
@@ -2065,7 +2203,145 @@ def build_arrow_for_label_with_splits(
     kept_after_run: Dict[str, int] = dict(existing_counts)
     out_dirs: Dict[str, Path] = {}
 
-    for s in SPLITS:
+    for s in WINDOW_SPLITS:
+        out_dir = dir_for_label_split(out_root, label_c, s)
+        ensure_recovery_dirs(out_dir)
+        out_dirs[s] = out_dir
+
+        ds_new = new_by_split[s]
+        ds_exist = existing_ds[s]
+
+        if ds_new is None or len(ds_new) == 0:
+            continue
+
+        if ds_exist is not None:
+            full = concatenate_datasets([ds_exist, ds_new])
+        else:
+            full = ds_new
+
+        tmp_dir = out_dir.with_name(out_dir.name + ".tmp_write")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.parent.mkdir(parents=True, exist_ok=True)
+        full.save_to_disk(str(tmp_dir))
+        atomic_replace_dir(tmp_dir, out_dir)
+
+        kept_after_run[s] = (existing_counts.get(s, 0) + len(ds_new))
+
+    return kept_after_run, out_dirs
+
+
+def build_raw_monitor_test_for_label(
+    *,
+    label: str,
+    out_root: Path,
+    total_cap: int,
+    target_counts: Dict[str, int],
+    add_meta: bool,
+    shuffle_buffer: int,
+    use_auth_token: bool,
+    shard_count: int,
+    shard_index: int,
+    skip_first_n: int,
+    progress_mode: str,
+    demo: bool,
+    writer_batch_size: int,
+    rebuild: bool,
+) -> Tuple[Dict[str, int], Dict[str, Path]]:
+    label_c = canonical_label(label)
+    if is_derived_label(label_c):
+        counts = {s: 0 for s in RAW_SPLITS}
+        dirs = {s: dir_for_label_split(out_root, label_c, s) for s in RAW_SPLITS}
+        return counts, dirs
+
+    existing_ds, existing_counts, seen_uids = load_existing_splits(
+        out_root, label_c, RAW_SPLITS, rebuild
+    )
+
+    cap_value = 100 if demo else total_cap
+    total_target = sum(target_counts.get(s, 0) for s in RAW_SPLITS)
+    total_existing = sum(existing_counts.values())
+
+    if total_target == 0 and cap_value > 0:
+        out_dirs = {s: dir_for_label_split(out_root, label_c, s) for s in RAW_SPLITS}
+        return existing_counts, out_dirs
+
+    if cap_value > 0 and total_existing >= total_target and total_target > 0:
+        out_dirs = {s: dir_for_label_split(out_root, label_c, s) for s in RAW_SPLITS}
+        return existing_counts, out_dirs
+
+    if cap_value == 0:
+        per_split_budget = {s: 2**63 - 1 for s in RAW_SPLITS}
+    else:
+        per_split_budget = compute_split_shortfall(target_counts, existing_counts, RAW_SPLITS)
+
+    features = {
+        "content": Value("string"),
+        "lang_id": Value("int16"),
+        "uid": Value("string"),
+        "split": Value("string"),
+        "stack_label": Value("string"),
+    }
+    if add_meta:
+        features.update({
+            "win_idx": Value("int64"),
+            "source_ext": Value("string"),
+            "source_hexsha": Value("string"),
+            "source_repo": Value("string"),
+            "source_repo_path": Value("string"),
+            "license": Value("string"),
+        })
+    feats = Features(features)
+
+    local_cache_dir = out_root / ".hf_cache"
+    local_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ds_new_total = Dataset.from_generator(
+            gen_raw_files_for_label,
+            gen_kwargs=dict(
+                logical_label=label_c,
+                add_meta=add_meta,
+                shuffle_buffer=shuffle_buffer,
+                use_auth_token=use_auth_token,
+                shard_count=shard_count,
+                shard_index=shard_index,
+                skip_first_n=skip_first_n,
+                progress_mode=progress_mode,
+                budget_per_split=dict(per_split_budget),
+                seen_uids=seen_uids,
+                max_bytes=RAW_FILE_MAX_BYTES,
+            ),
+            features=feats,
+            cache_dir=str(local_cache_dir),
+            keep_in_memory=False,
+            writer_batch_size=writer_batch_size,
+        )
+    except DatasetGenerationError as e:
+        root = e.__cause__ or e.__context__
+        detail = describe_exc(root) if root else describe_exc(e)
+        raise RuntimeError(
+            f"Raw dataset generation failed for label '{label_c}': {detail}"
+        ) from (root if root else e)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to build raw dataset for label '{label_c}': {describe_exc(e)}"
+        ) from e
+
+    new_by_split: Dict[str, Optional[Dataset]] = {}
+    for s in RAW_SPLITS:
+        if len(ds_new_total) > 0:
+            part = ds_new_total.filter(lambda ex, _s=None: ex["split"] == _s, fn_kwargs={"_s": s})
+            if "split" in part.column_names:
+                part = part.remove_columns(["split"])
+        else:
+            part = None
+        new_by_split[s] = part
+
+    kept_after_run: Dict[str, int] = dict(existing_counts)
+    out_dirs: Dict[str, Path] = {}
+
+    for s in RAW_SPLITS:
         out_dir = dir_for_label_split(out_root, label_c, s)
         ensure_recovery_dirs(out_dir)
         out_dirs[s] = out_dir
@@ -2107,6 +2383,8 @@ def parse_skip_map(s: Optional[str]) -> Dict[str, int]:
             continue
         k, v = item.split("=", 1)
         k = canonical_label(k.strip())
+        if k in {"javascript", "typescript"}:
+            k = "javascript_typescript"
         try:
             out[k] = int(v.strip())
         except Exception:
@@ -2117,14 +2395,14 @@ def parse_skip_map(s: Optional[str]) -> Dict[str, int]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
-            "Stream The Stack and build Arrow datasets of windowed code per label with train/val/test splits.\n"
+            "Stream The Stack and build Arrow datasets of windowed code per label with train/val + raw monitor/test splits.\n"
             "• Writes to <out-root>/<split>/<label>/dataset\n"
             "• Filters licenses (permissive only)\n"
             "• PHP: strips foreign (HTML/etc.) content via regex\n"
             "• HTML: strips <script>/<style> blocks, event handlers, and drops framework-heavy samples\n"
             "• In-process Magika prefilter (no temp files)\n"
-            "• Resume-safe, duplicate-proof with per-window uid and deterministic splits (70/20/10)\n"
-            "• Derived families: encoding_*/encryption_* reuse existing splits and apply deterministic transforms"
+            "• Resume-safe, duplicate-proof with per-window uid and deterministic splits (70/10 train/val + 10/10 raw monitor/test)\n"
+            "• Derived families: encoding_* reuse existing splits and apply deterministic transforms"
         )
     )
     # Core IO
@@ -2134,7 +2412,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--langs", type=str,
                     default=(
                         "html,css,javascript_typescript,c_family,csharp,go,rust,csv,java,json,python,ruby,text,"
-                        "shell,powershell,visual_basic,php,sql,yaml,dockerfile,"
+                        "shell,powershell,visual_basic,php,sql,yaml,dockerfile,dart,gettext_catalog,kotlin,"
+                        "markdown,restructuredtext,scala,swift,svg,tex,xml,"
                         "encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85"
                     ),
                     help="Comma-separated labels to process (logical names).")
@@ -2151,7 +2430,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--magika-batch", type=int, default=1024,
                     help="How many windows to run through Magika per batch")
     ap.add_argument("--max-windows-per-label", type=int, default=100_000,
-                    help="TOTAL cap of kept windows per label (post-filter) across splits. Default: 100,000")
+                    help="TOTAL cap of kept samples per label (train/val windows + monitor/test raw). Default: 100,000")
     ap.add_argument("--writer-batch-size", type=int, default=8192,
                     help="HF writer batch size to Arrow (bigger = fewer flushes)")
 
@@ -2192,6 +2471,13 @@ def main() -> None:
         if label not in seen_labels:
             labels.append(label)
             seen_labels.add(label)
+    if "javascript" in seen_labels or "typescript" in seen_labels:
+        labels = [lbl for lbl in labels if lbl not in {"javascript", "typescript"}]
+        seen_labels.discard("javascript")
+        seen_labels.discard("typescript")
+        if "javascript_typescript" not in seen_labels:
+            labels.append("javascript_typescript")
+            seen_labels.add("javascript_typescript")
     if not labels:
         raise SystemExit("[fatal] No labels provided via --langs")
 
@@ -2204,13 +2490,13 @@ def main() -> None:
 
     skip_map = parse_skip_map(args.skip_per_lang)
 
-    print("⚙️  The Stack → Arrow (windowed, Magika-filtered, resume-safe) with 70/20/10 splits")
+    print("⚙️  The Stack → Arrow (windowed + raw monitor/test, deterministic 70/10/10/10 splits)")
     print(f"   Out root:        {out_root}  (layout: <split>/<label>/dataset)")
     print(f"   Labels:          {', '.join(labels)}")
     print(f"   Window bytes:    {args.window_bytes}")
     print(f"   Magika batch:    {args.magika_batch}")
     print(f"   Threshold:       {args.threshold:.2f}")
-    print(f"   Max/label:       {max_per_label_total} {'(DEMO)' if args.demo else ''}  [split 70/20/10]")
+    print(f"   Max/label:       {max_per_label_total} {'(DEMO)' if args.demo else ''}  [70% train, 10% val, 10% monitor, 10% test]")
     print(f"   Shuffle buffer:  {args.shuffle_buffer}")
     print(f"   Shard:           count={args.shard_count}, index={args.shard_index}")
     if skip_map:
@@ -2219,39 +2505,71 @@ def main() -> None:
     print(f"   Rebuild:         {'yes' if args.rebuild else 'no'}")
     print("")
 
-    grand_kept_per_split = {"train": 0, "val": 0, "test": 0}
+    grand_kept_per_split = {s: 0 for s in ALL_SPLITS}
     failures: List[str] = []
 
     t0 = time.time()
     for lbl in labels:
         print(f"— Building label: {lbl}")
         try:
+            target_counts = compute_ideal_split_counts(max_per_label_total)
+            skip_extra = int(skip_map.get(canonical_label(lbl), 0))
             kept_map, out_dirs = build_arrow_for_label_with_splits(
                 label=lbl,
                 out_root=out_root,
                 window_bytes=args.window_bytes,
                 magika_batch=args.magika_batch,
                 threshold=args.threshold,
-                max_windows_total=max_per_label_total,
+                total_cap=max_per_label_total,
+                target_counts=target_counts,
                 add_meta=args.add_meta,
                 shuffle_buffer=args.shuffle_buffer,
                 use_auth_token=args.use_auth_token,
                 shard_count=args.shard_count,
                 shard_index=args.shard_index,
-                skip_first_n=int(skip_map.get(canonical_label(lbl), 0)),
+                skip_first_n=skip_extra,
                 progress_mode=args.progress,
                 demo=args.demo,
                 writer_batch_size=args.writer_batch_size,
                 rebuild=args.rebuild,
                 base_seed=args.seed,
             )
-            grand_kept_per_split["train"] += kept_map.get("train", 0)
-            grand_kept_per_split["val"] += kept_map.get("val", 0)
-            grand_kept_per_split["test"] += kept_map.get("test", 0)
+            raw_kept = {s: 0 for s in RAW_SPLITS}
+            if not is_derived_label(canonical_label(lbl)):
+                raw_kept, _ = build_raw_monitor_test_for_label(
+                    label=lbl,
+                    out_root=out_root,
+                    total_cap=max_per_label_total,
+                    target_counts=target_counts,
+                    add_meta=args.add_meta,
+                    shuffle_buffer=args.shuffle_buffer,
+                    use_auth_token=args.use_auth_token,
+                    shard_count=args.shard_count,
+                    shard_index=args.shard_index,
+                    skip_first_n=skip_extra,
+                    progress_mode=args.progress,
+                    demo=args.demo,
+                    writer_batch_size=args.writer_batch_size,
+                    rebuild=args.rebuild,
+                )
+
+            for split in WINDOW_SPLITS:
+                grand_kept_per_split[split] += kept_map.get(split, 0)
+            for split in RAW_SPLITS:
+                grand_kept_per_split[split] += raw_kept.get(split, 0)
+
             base = out_root / "train" / canonical_label(lbl)
-            print(f"  ✓ Totals now: train={kept_map.get('train',0):,}  "
-                  f"val={kept_map.get('val',0):,}  test={kept_map.get('test',0):,}  "
-                  f"→ {base.parent.parent} / <train|val|test> / {canonical_label(lbl)}/dataset\n")
+            print(
+                "  ✓ Totals now: train={train:,}  val={val:,}  monitor={monitor:,}  test={test:,}  → {root} / <train|val|monitor|test> / {lbl_c}/dataset".format(
+                    train=kept_map.get("train", 0),
+                    val=kept_map.get("val", 0),
+                    monitor=raw_kept.get("monitor", 0),
+                    test=raw_kept.get("test", 0),
+                    root=base.parent.parent,
+                    lbl_c=canonical_label(lbl),
+                )
+                + "\n"
+            )
         except KeyboardInterrupt:
             print("\n[!] Interrupted by user.", file=sys.stderr)
             raise
@@ -2263,14 +2581,15 @@ def main() -> None:
         gc.collect()
 
     elapsed = time.time() - t0
-    total = grand_kept_per_split["train"] + grand_kept_per_split["val"] + grand_kept_per_split["test"]
+    total = sum(grand_kept_per_split.values())
     rate = total / elapsed if elapsed > 0 else 0.0
     print("🎯 Summary")
     print(f"  Labels processed: {len(labels)}")
-    print(f"  Total kept (train): {grand_kept_per_split['train']:,}")
-    print(f"  Total kept (val):   {grand_kept_per_split['val']:,}")
-    print(f"  Total kept (test):  {grand_kept_per_split['test']:,}")
-    print(f"  Elapsed:            {elapsed/60.0:.1f} min  ({rate:.1f} win/s)")
+    print(f"  Total kept (train):   {grand_kept_per_split['train']:,}")
+    print(f"  Total kept (val):     {grand_kept_per_split['val']:,}")
+    print(f"  Total kept (monitor): {grand_kept_per_split['monitor']:,}")
+    print(f"  Total kept (test):    {grand_kept_per_split['test']:,}")
+    print(f"  Elapsed:            {elapsed/60.0:.1f} min  ({rate:.1f} samples/s)")
     if failures:
         print("  Failures:")
         for f in failures:
