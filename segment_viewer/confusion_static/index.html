@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Confusion Matrix Viewer</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">Segmenter <span>Confusion</span></div>
+      <div class="status">
+        <span id="deviceLabel">Loading device…</span>
+        <span id="sampleCount">0 samples</span>
+      </div>
+    </header>
+
+    <main class="container">
+      <section class="panel matrix-panel">
+        <div class="panel-head">
+          <h2>Confusion Matrix</h2>
+          <div class="metrics" id="aggMetrics"></div>
+        </div>
+        <div class="legend" id="labelLegend"></div>
+        <div class="matrix-wrapper">
+          <div id="matrix" class="matrix loading">Loading confusion matrix…</div>
+        </div>
+      </section>
+
+      <section class="panel sample-panel">
+        <div class="panel-head">
+          <h2>Cell Explorer</h2>
+          <div class="cell-meta" id="cellMeta">Select any cell to view examples.</div>
+        </div>
+        <div class="sample-body">
+          <div class="sample-stats" id="sampleStats"></div>
+          <div class="sample-loading" id="sampleLoading" hidden>
+            <div class="spinner"></div>
+            <span>Loading example…</span>
+          </div>
+          <div class="sample-render" id="samplePred">Nothing selected.</div>
+          <div class="sample-render ground" id="sampleTruth">No ground truth.</div>
+          <div class="sample-meta" id="sampleMeta"></div>
+        </div>
+      </section>
+    </main>
+
+    <div id="tooltip" class="tooltip"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
