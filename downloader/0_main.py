@@ -78,7 +78,7 @@ def canonical_label(name: str) -> str:
         return "batchfile"
     if s in {"docker", "dockerfile"}:
         return "dockerfile"
-    if s in {"gettext-catalog", "gettext_catalog"}:
+    if s in {"gettext-catalog", "gettext_catalog", "gettext", "po"}:
         return "gettext_catalog"
     if s in {"latex"}:
         return "tex"
@@ -106,7 +106,7 @@ LABEL_ACCEPTS: Dict[str, set] = {
     "css": {"css"},
     "html": {"html", "xhtml"},
     "dart": {"dart"},
-    "gettext_catalog": {"gettext-catalog", "gettext_catalog", "gettext"},
+    "gettext_catalog": {"gettext-catalog", "gettext_catalog", "gettext", "po"},
     "kotlin": {"kotlin"},
     "markdown": {"markdown", "md"},
     "restructuredtext": {"restructuredtext", "rst"},
