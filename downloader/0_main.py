@@ -921,23 +921,36 @@ LANG_CANDIDATE_DIRS: Dict[str, List[str]] = {
     # derived enc/enc are generated locally and do not map to The Stack
 }
 
-def stream_madlad_iterable(*, shuffle_buffer: int) -> Optional[Any]:
+def stream_madlad_iterable(*, shuffle_buffer: int, use_auth_token: bool) -> Optional[Any]:
     """
     Streaming loader for allenai/MADLAD-400 (clean split) backing the 'text' label.
     """
-    load_attempts: List[Dict[str, Any]] = [
-        {"path": "allenai/MADLAD-400", "name": "clean", "split": "train"},
-        {"path": "allenai/MADLAD-400", "split": "clean"},
-    ]
-    last_exc: Optional[BaseException] = None
-    for kwargs in load_attempts:
-        try:
-            ds = load_dataset(streaming=True, **kwargs)
-            break
-        except Exception as e:  # log only if all attempts fail
-            last_exc = e
-    else:
-        sys.stderr.write(f"[warn] failed to open MADLAD-400 (clean split): {last_exc}\n")
+    token_str, token_arg = resolve_hf_token_pair(use_auth_token)
+    try:
+        languages = madlad_list_languages(token=token_str)
+    except Exception as e:
+        sys.stderr.write(f"[warn] failed to enumerate MADLAD-400 languages: {e}\n")
+        return None
+    if not languages:
+        sys.stderr.write("[warn] failed to enumerate MADLAD-400 languages: none found\n")
+        return None
+
+    load_kwargs: Dict[str, Any] = {
+        "path": "allenai/madlad-400",
+        "split": "clean",
+        "streaming": True,
+        "languages": languages,
+    }
+    if token_arg is not None:
+        load_kwargs["token"] = token_arg
+
+    try:
+        ds = load_dataset(**load_kwargs)
+    except TypeError:
+        load_kwargs.pop("token", None)
+        ds = load_dataset(**load_kwargs)
+    except Exception as e:
+        sys.stderr.write(f"[warn] failed to open MADLAD-400 (clean split): {e}\n")
         return None
     if shuffle_buffer > 0:
         try:
@@ -985,7 +998,10 @@ def _stream_single_language_iterable(
     label = canonical_label(logical_label)
     source_tag = label
     if label == "text":
-        ds = stream_madlad_iterable(shuffle_buffer=shuffle_buffer)
+        ds = stream_madlad_iterable(
+            shuffle_buffer=shuffle_buffer,
+            use_auth_token=use_auth_token,
+        )
         source_tag = "madlad"
     else:
         cands = LANG_CANDIDATE_DIRS.get(label, [label])
@@ -1182,6 +1198,7 @@ def compute_split_shortfall(
 
 def _source_identity_for_split(ex: Dict[str, Any], label: str) -> str:
     parts: List[str] = [label or ""]
+    have_unique = False
     candidate_keys = (
         "hexsha",
         "id",
@@ -1195,11 +1212,12 @@ def _source_identity_for_split(ex: Dict[str, Any], label: str) -> str:
         val = ex.get(key)
         if val:
             parts.append(str(val))
+            have_unique = True
             break
     stack_src = ex.get("_stack_src")
     if stack_src:
         parts.append(str(stack_src))
-    if len(parts) == 1:
+    if not have_unique:
         raw_text = ex.get("content") or ex.get("text")
         if isinstance(raw_text, str) and raw_text:
             parts.append(raw_text[:256])
@@ -1581,6 +1599,182 @@ def gen_transformed_for_label(
     pbar.close()
 
 
+def gen_transformed_raw_for_label(
+    *,
+    label_c: str,
+    add_meta: bool,
+    progress_mode: str,
+    budget_per_split: Dict[str, int],
+    seen_uids: Optional[Set[str]],
+    base_seed: int,
+    out_root: str,
+    max_bytes: int,
+) -> Iterator[dict]:
+    lbl = canonical_label(label_c)
+    if not is_derived_label(lbl):
+        raise ValueError(f"Derived raw generator expected encoding_* label, got '{label_c}'")
+
+    method = lbl.split("encoding_", 1)[1]
+    encoding_input_limit = max_input_bytes_for_encoding(method, max_bytes)
+    out_root_path = Path(out_root)
+
+    is_tty = sys.stderr.isatty()
+    show_progress = ((progress_mode == "always") or (progress_mode == "auto" and is_tty))
+    total_budget = sum(max(0, b) for b in budget_per_split.values())
+    pbar = tqdm(
+        total=total_budget if total_budget > 0 else None,
+        unit="file",
+        desc=f"{lbl} (derived raw)",
+        disable=not show_progress,
+    )
+
+    lang_id = LANG2ID.get(lbl, -1)
+    kept_total = 0
+    kept_per_split = {s: 0 for s in RAW_SPLITS}
+    pool_cache: Dict[str, PlaintextPool] = {}
+
+    def _value_from(seq: Optional[Sequence[Any]], idx: int, default: str = "") -> str:
+        if not seq:
+            return default
+        if idx < 0 or idx >= len(seq):
+            return default
+        val = seq[idx]
+        if val is None:
+            return default
+        return str(val)
+
+    for split in RAW_SPLITS:
+        target = budget_per_split.get(split, 0)
+        if target <= 0:
+            continue
+
+        pool = pool_cache.get(split)
+        if pool is None:
+            pool = build_plaintext_pool(out_root_path, split, lbl)
+            pool_cache[split] = pool
+        if pool.total == 0:
+            raise RuntimeError(
+                f"No base samples available in split '{split}' under {out_root_path} to build '{lbl}'. "
+                "Ensure base language monitor/test datasets exist before derived transforms."
+            )
+
+        sampler = PlaintextSampler(total=pool.total, need=target, base_seed=base_seed, split=split, method=method)
+        produced = 0
+        while produced < target:
+            batch_count = min(4096, target - produced)
+            positions = list(range(produced, produced + batch_count))
+            per_dataset_rows: Dict[int, List[int]] = {}
+            per_dataset_positions: Dict[int, List[int]] = {}
+            for pos in positions:
+                global_idx = sampler.index_for(pos)
+                ds_idx, local_idx = pool.locate(global_idx)
+                per_dataset_rows.setdefault(ds_idx, []).append(local_idx)
+                per_dataset_positions.setdefault(ds_idx, []).append(pos)
+
+            plaintext_by_position: Dict[int, Tuple[bytes, str, Optional[Tuple[str, str, str, str, str]]]] = {}
+            for ds_idx, rows in per_dataset_rows.items():
+                ds = pool.datasets[ds_idx]
+                try:
+                    subset = ds[rows]
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to retrieve raw rows for split '{split}' (dataset index {ds_idx})"
+                    ) from e
+
+                contents = subset["content"]
+                stack_labels = subset.get("stack_label")
+                meta_fields: Dict[str, Optional[Sequence[Any]]] = {}
+                if add_meta:
+                    meta_fields = {
+                        "source_ext": subset.get("source_ext"),
+                        "source_hexsha": subset.get("source_hexsha"),
+                        "source_repo": subset.get("source_repo"),
+                        "source_repo_path": subset.get("source_repo_path"),
+                        "license": subset.get("license"),
+                    }
+
+                for idx, pos in enumerate(per_dataset_positions[ds_idx]):
+                    content = contents[idx]
+                    if isinstance(content, str):
+                        raw = content.encode("utf-8", errors="ignore")
+                    elif isinstance(content, bytes):
+                        raw = content
+                    elif isinstance(content, bytearray):
+                        raw = bytes(content)
+                    elif isinstance(content, memoryview):
+                        raw = content.tobytes()
+                    elif content is None:
+                        raw = b""
+                    else:
+                        raw = str(content).encode("utf-8", errors="ignore")
+
+                    base_label = pool.labels[ds_idx] if ds_idx < len(pool.labels) else ""
+                    stack_lbl = _value_from(stack_labels, idx, base_label)
+                    meta_tuple: Optional[Tuple[str, str, str, str, str]] = None
+                    if add_meta:
+                        meta_tuple = tuple(
+                            _value_from(meta_fields.get(key), idx, "")
+                            for key in ("source_ext", "source_hexsha", "source_repo", "source_repo_path", "license")
+                        )
+                    plaintext_by_position[pos] = (raw, stack_lbl, meta_tuple)
+
+            for pos in positions:
+                raw_plain, stack_lbl, meta_tuple = plaintext_by_position.get(pos, (b"", "", None))
+                raw_for_encoding = raw_plain
+                if encoding_input_limit is not None and len(raw_for_encoding) > encoding_input_limit:
+                    raw_for_encoding = raw_for_encoding[:encoding_input_limit]
+                try:
+                    content_str = encode_bytes(method, raw_for_encoding)
+                except Exception as e:
+                    raise RuntimeError(f"Encoding failed for method '{method}' (raw split)") from e
+
+                if len(content_str) > max_bytes:
+                    trim_len = len(raw_for_encoding)
+                    while trim_len > 0 and len(content_str) > max_bytes:
+                        trim_len -= 1
+                        raw_for_encoding = raw_for_encoding[:trim_len]
+                        content_str = encode_bytes(method, raw_for_encoding)
+                if not content_str:
+                    continue
+
+                uid = stable_uid_for_window(content_str.encode("utf-8", errors="ignore"))
+                if seen_uids is not None and uid in seen_uids:
+                    continue
+
+                payload = {
+                    "content": content_str,
+                    "lang_id": np.int16(lang_id).item(),
+                    "uid": uid,
+                    "split": split,
+                    "stack_label": stack_lbl or lbl,
+                }
+                if add_meta:
+                    source_ext, source_hexsha, source_repo, source_repo_path, license_val = meta_tuple or ("", "", "", "", "")
+                    payload.update({
+                        "win_idx": np.int64(0).item(),
+                        "source_ext": source_ext or f"encoding:{method}",
+                        "source_hexsha": source_hexsha or "",
+                        "source_repo": source_repo or "derived",
+                        "source_repo_path": source_repo_path or f"derived::{method}",
+                        "license": license_val or "derived",
+                    })
+
+                if seen_uids is not None:
+                    seen_uids.add(uid)
+                budget_per_split[split] = max(0, budget_per_split[split] - 1)
+                kept_total += 1
+                kept_per_split[split] += 1
+                pbar.update(1)
+                yield payload
+            produced += batch_count
+
+    pbar.set_postfix(
+        monitor=kept_per_split.get("monitor", 0),
+        test=kept_per_split.get("test", 0),
+    )
+    pbar.close()
+
+
 # ============================================================
 #                 Generator: one pass per label
 # ============================================================
@@ -1880,7 +2074,10 @@ def gen_raw_files_for_label(
         if budget_per_split.get(split, 0) <= 0:
             continue
 
-        ok, _reason = license_is_allowed(ex)
+        if label_c == "text":
+            ok = True
+        else:
+            ok, _reason = license_is_allowed(ex)
         if not ok:
             rejected += 1
             continue
@@ -2247,12 +2444,9 @@ def build_raw_monitor_test_for_label(
     demo: bool,
     writer_batch_size: int,
     rebuild: bool,
+    base_seed: int,
 ) -> Tuple[Dict[str, int], Dict[str, Path]]:
     label_c = canonical_label(label)
-    if is_derived_label(label_c):
-        counts = {s: 0 for s in RAW_SPLITS}
-        dirs = {s: dir_for_label_split(out_root, label_c, s) for s in RAW_SPLITS}
-        return counts, dirs
 
     existing_ds, existing_counts, seen_uids = load_existing_splits(
         out_root, label_c, RAW_SPLITS, rebuild
@@ -2297,26 +2491,45 @@ def build_raw_monitor_test_for_label(
     local_cache_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        ds_new_total = Dataset.from_generator(
-            gen_raw_files_for_label,
-            gen_kwargs=dict(
-                logical_label=label_c,
-                add_meta=add_meta,
-                shuffle_buffer=shuffle_buffer,
-                use_auth_token=use_auth_token,
-                shard_count=shard_count,
-                shard_index=shard_index,
-                skip_first_n=skip_first_n,
-                progress_mode=progress_mode,
-                budget_per_split=dict(per_split_budget),
-                seen_uids=seen_uids,
-                max_bytes=RAW_FILE_MAX_BYTES,
-            ),
-            features=feats,
-            cache_dir=str(local_cache_dir),
-            keep_in_memory=False,
-            writer_batch_size=writer_batch_size,
-        )
+        if is_derived_label(label_c):
+            ds_new_total = Dataset.from_generator(
+                gen_transformed_raw_for_label,
+                gen_kwargs=dict(
+                    label_c=label_c,
+                    add_meta=add_meta,
+                    progress_mode=progress_mode,
+                    budget_per_split=dict(per_split_budget),
+                    seen_uids=seen_uids,
+                    base_seed=base_seed,
+                    out_root=str(out_root),
+                    max_bytes=RAW_FILE_MAX_BYTES,
+                ),
+                features=feats,
+                cache_dir=str(local_cache_dir),
+                keep_in_memory=False,
+                writer_batch_size=writer_batch_size,
+            )
+        else:
+            ds_new_total = Dataset.from_generator(
+                gen_raw_files_for_label,
+                gen_kwargs=dict(
+                    logical_label=label_c,
+                    add_meta=add_meta,
+                    shuffle_buffer=shuffle_buffer,
+                    use_auth_token=use_auth_token,
+                    shard_count=shard_count,
+                    shard_index=shard_index,
+                    skip_first_n=skip_first_n,
+                    progress_mode=progress_mode,
+                    budget_per_split=dict(per_split_budget),
+                    seen_uids=seen_uids,
+                    max_bytes=RAW_FILE_MAX_BYTES,
+                ),
+                features=feats,
+                cache_dir=str(local_cache_dir),
+                keep_in_memory=False,
+                writer_batch_size=writer_batch_size,
+            )
     except DatasetGenerationError as e:
         root = e.__cause__ or e.__context__
         detail = describe_exc(root) if root else describe_exc(e)
@@ -2534,24 +2747,23 @@ def main() -> None:
                 rebuild=args.rebuild,
                 base_seed=args.seed,
             )
-            raw_kept = {s: 0 for s in RAW_SPLITS}
-            if not is_derived_label(canonical_label(lbl)):
-                raw_kept, _ = build_raw_monitor_test_for_label(
-                    label=lbl,
-                    out_root=out_root,
-                    total_cap=max_per_label_total,
-                    target_counts=target_counts,
-                    add_meta=args.add_meta,
-                    shuffle_buffer=args.shuffle_buffer,
-                    use_auth_token=args.use_auth_token,
-                    shard_count=args.shard_count,
-                    shard_index=args.shard_index,
-                    skip_first_n=skip_extra,
-                    progress_mode=args.progress,
-                    demo=args.demo,
-                    writer_batch_size=args.writer_batch_size,
-                    rebuild=args.rebuild,
-                )
+            raw_kept, _ = build_raw_monitor_test_for_label(
+                label=lbl,
+                out_root=out_root,
+                total_cap=max_per_label_total,
+                target_counts=target_counts,
+                add_meta=args.add_meta,
+                shuffle_buffer=args.shuffle_buffer,
+                use_auth_token=args.use_auth_token,
+                shard_count=args.shard_count,
+                shard_index=args.shard_index,
+                skip_first_n=skip_extra,
+                progress_mode=args.progress,
+                demo=args.demo,
+                writer_batch_size=args.writer_batch_size,
+                rebuild=args.rebuild,
+                base_seed=args.seed,
+            )
 
             for split in WINDOW_SPLITS:
                 grand_kept_per_split[split] += kept_map.get(split, 0)
