@@ -106,6 +106,11 @@ class SampleRecord:
     length: int = 0
 
 
+IGNORED_WHITESPACE_CHARS: Tuple[str, ...] = (" ", "\t", "\n")
+IGNORED_WHITESPACE_CHAR_SET = frozenset(IGNORED_WHITESPACE_CHARS)
+IGNORED_WHITESPACE_BYTE_VALUES = np.array([ord(ch) for ch in IGNORED_WHITESPACE_CHARS], dtype=np.int32)
+
+
 def _tokens_to_text(tokens: np.ndarray) -> str:
     arr = np.asarray(tokens, dtype=np.int32)
     if arr.size == 0:
@@ -331,6 +336,19 @@ def _remap_colors_for_active_classes(
     return color_map
 
 
+def _generate_window_palette(count: int) -> List[str]:
+    if count <= 0:
+        return []
+    import colorsys
+
+    hues = [idx / max(count, 1) for idx in range(count)]
+    palette = []
+    for hue in hues:
+        r, g, b = colorsys.hls_to_rgb(hue % 1.0, 0.55, 0.7)
+        palette.append("#{0:02x}{1:02x}{2:02x}".format(int(r * 255), int(g * 255), int(b * 255)))
+    return palette
+
+
 def _build_window_color_map(
     pred_char_labels: List[int],
     true_char_labels: List[int],
@@ -352,7 +370,10 @@ def _build_window_color_map(
         label_id for label_id, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
     subset_names = [id2canon[label_id] for label_id in ordered_ids]
-    subset_colors = _resolve_colors(subset_names, colors_arg, allow_unknown_named=True)
+    if colors_arg:
+        subset_colors = _resolve_colors(subset_names, colors_arg, allow_unknown_named=True)
+    else:
+        subset_colors = _generate_window_palette(len(ordered_ids))
     color_map = {label_id: subset_colors[idx] for idx, label_id in enumerate(ordered_ids)}
     return ordered_ids, color_map
 
@@ -399,8 +420,12 @@ def _collect_confusion_samples(
             valid_mask = mask[i]
             if not valid_mask.any():
                 continue
-            true_flat = yb[i][valid_mask]
-            pred_flat = preds[i][valid_mask]
+            ignored_mask = np.isin(xb[i], IGNORED_WHITESPACE_BYTE_VALUES)
+            effective_mask = valid_mask & (~ignored_mask)
+            if not effective_mask.any():
+                continue
+            true_flat = yb[i][effective_mask]
+            pred_flat = preds[i][effective_mask]
             accumulate_confusion(conf_mat, true_flat, pred_flat)
             combos = np.stack([true_flat, pred_flat], axis=1)
             unique_pairs = np.unique(combos, axis=0)
@@ -471,10 +496,18 @@ def _build_sample_payload(
     text = _normalize_input_text(sample.text)
     pred_char_labels, char_probs = predictor._byte_labels_to_char_labels(text, preds, probs_np)
     true_char_labels, _ = predictor._byte_labels_to_char_labels(text, byte_true, None)
-    highlight = [
-        (true_char_labels[i] == true_id) and (pred_char_labels[i] == pred_id)
-        for i in range(len(pred_char_labels))
-    ]
+    highlight: List[bool] = []
+    text_len = len(text)
+    true_len = len(true_char_labels)
+    for idx, pred_label in enumerate(pred_char_labels):
+        true_label = true_char_labels[idx] if idx < true_len else None
+        ch = text[idx] if idx < text_len else ""
+        should_highlight = (
+            ch not in IGNORED_WHITESPACE_CHAR_SET
+            and true_label == true_id
+            and pred_label == pred_id
+        )
+        highlight.append(should_highlight)
     palette_ids, window_colors = _build_window_color_map(
         pred_char_labels=pred_char_labels,
         true_char_labels=true_char_labels,

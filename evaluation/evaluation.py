@@ -26,12 +26,7 @@ from urllib.parse import urlparse
 import re
 
 import numpy as np
-
-# Optional dependencies -----------------------------------------------------
-try:  # pragma: no cover - psutil is optional
-    import psutil
-except Exception:  # pragma: no cover
-    psutil = None
+import psutil
 
 DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
 DEFAULT_CHUNK_SIZE: int  # populated after importing train.config
