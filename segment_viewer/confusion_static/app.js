@@ -12,17 +12,6 @@ function formatPct(value){
   return (value * 100).toFixed(value >= 0.1 ? 1 : 2) + '%';
 }
 
-function buildLegend(labels){
-  const holder = el('#labelLegend');
-  holder.innerHTML = '';
-  labels.forEach(l => {
-    const div = document.createElement('div');
-    div.className = 'chip';
-    div.innerHTML = `<span class="dot" style="background:${l.color||'#999'}"></span>${esc(shortLabel(l.name))}`;
-    holder.appendChild(div);
-  });
-}
-
 function buildMetrics(aggregates){
   const holder = el('#aggMetrics');
   holder.innerHTML = '';
@@ -141,6 +130,24 @@ function updateSample(data){
     span.textContent = text;
     stats.appendChild(span);
   });
+  const paletteEl = el('#samplePalette');
+  if (paletteEl){
+    paletteEl.innerHTML = '';
+    const palette = Array.isArray(data.palette) ? data.palette : [];
+    if (palette.length){
+      paletteEl.hidden = false;
+      palette.forEach(entry => {
+        const chip = document.createElement('div');
+        chip.className = 'chip';
+        const color = entry.color || '#999';
+        const label = entry.name || entry.id || '?';
+        chip.innerHTML = `<span class="dot" style="background:${color}"></span>${esc(label)}`;
+        paletteEl.appendChild(chip);
+      });
+    }else{
+      paletteEl.hidden = true;
+    }
+  }
   const predEl = el('#samplePred');
   predEl.innerHTML = data.html || '<em>No renderable text.</em>';
   attachTooltip(predEl);
@@ -225,7 +232,6 @@ async function init(){
     LABELS = data.labels;
     el('#deviceLabel').textContent = data.device || 'Device n/a';
     el('#sampleCount').textContent = `${data.total_windows || 0} windows`;
-    buildLegend(data.labels);
     buildMetrics(data.aggregates);
     renderMatrix(data);
     setSampleLoading(false);
