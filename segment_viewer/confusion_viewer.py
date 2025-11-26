@@ -15,6 +15,7 @@ import bisect
 import collections
 import json
 import random
+import importlib.util
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -69,6 +70,23 @@ except ImportError:  # pragma: no cover
 
 MAX_EXAMPLES_PER_CELL = 64
 DEFAULT_DATA_ROOT = (REPO_ROOT / "downloader" / "arrow_out").resolve()
+
+
+def _load_training_label_order() -> List[str]:
+    spec = importlib.util.spec_from_file_location(
+        "confusion_viewer_config_snapshot", REPO_ROOT / "train" / "config.py"
+    )
+    if spec is None or spec.loader is None:
+        return []
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    mapping = getattr(module, "LANG2ID", {})
+    if not isinstance(mapping, dict):
+        return []
+    return [name for name, _ in sorted(mapping.items(), key=lambda kv: kv[1])]
+
+
+TRAINING_LABEL_ORDER: List[str] = _load_training_label_order()
 
 
 def _sync_config_with_labels(label_order: List[str]) -> None:
@@ -624,6 +642,7 @@ effective_eval_batches = max(1, int(args.eval_batches) * 10)
 label_names = auto_hparams.get("label_names")
 if label_names:
     _apply_label_mapping(label_names)
+    TRAINING_LABEL_ORDER = list(label_names)
 
 model_dim_value, model_dim_source = _resolve_hparam(
     args.model_dim,
@@ -670,6 +689,14 @@ if auto_hparams or ckpt_inferred:
 
 try:
     canonical_label_names, display_label_names = _resolve_langs_and_display(args.lang)
+    display_overrides = {
+        canonical: display
+        for canonical, display in zip(canonical_label_names, display_label_names)
+        if display != canonical
+    }
+    if not args.lang:
+        canonical_label_names = list(TRAINING_LABEL_ORDER or canonical_label_names)
+        display_label_names = [display_overrides.get(name, name) for name in canonical_label_names]
     colors = _resolve_colors(canonical_label_names, args.colors)
 except (RuntimeError, ValueError) as exc:
     parser.error(str(exc))
@@ -725,7 +752,42 @@ if load_error is None and predictor is not None:
         data_root=args.data_root,
         use_train_windows=args.use_train_windows,
         include_languages=include_langs,
+        preserve_lang_order=True,
+        preferred_order=canonical_label_names,
     )
+    source_lang2id = dict(cfg.LANG2ID)
+    cfg.update_lang_mappings()
+    canonical_label_names = [name for _, name in sorted(cfg.ID2LANG.items(), key=lambda kv: kv[0])]
+    display_label_names = [display_overrides.get(name, name) for name in canonical_label_names]
+    colors = _resolve_colors(canonical_label_names, args.colors)
+    _sync_config_with_labels(canonical_label_names)
+    num_classes = len(canonical_label_names)
+    ckpt_classes = ckpt_inferred.get("num_classes")
+    if ckpt_classes is not None and ckpt_classes != num_classes:
+        print(
+            f"⚠️  Checkpoint expects {ckpt_classes} classes but resolved {num_classes}.",
+            flush=True,
+        )
+    ID2CANONICAL = {i: canonical_label_names[i] for i in range(num_classes)}
+    ID2NAME = {i: display_label_names[i] for i in range(num_classes)}
+    ID2COLOR = {i: colors[i] for i in range(num_classes)}
+    ID2SLUG = {i: make_slug(ID2CANONICAL[i]) for i in range(num_classes)}
+    print(f"✅ Final label order: {canonical_label_names}", flush=True)
+
+    inv_source = {idx: name for name, idx in source_lang2id.items()}
+    def _remap_split_dict(original: Dict[int, Any]) -> Dict[int, Any]:
+        remapped: Dict[int, Any] = {}
+        for old_id, ds in original.items():
+            lang_name = inv_source.get(old_id)
+            if lang_name is None:
+                continue
+            new_id = cfg.LANG2ID.get(lang_name)
+            if new_id is None:
+                continue
+            remapped[new_id] = ds
+        return remapped
+    splits = {split_name: _remap_split_dict(mapping) for split_name, mapping in splits.items()}
+
     val_dsets = splits["val"]
     if not val_dsets:
         load_error = "Validation datasets not found for the requested languages."

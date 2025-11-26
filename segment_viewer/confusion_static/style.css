@@ -86,6 +86,7 @@ body{
   border-radius:12px;
   overflow:hidden;
   max-width:100%;
+  --cell-size:34px;
 }
 .matrix.loading{
   padding:80px 120px;
@@ -93,8 +94,9 @@ body{
   color:var(--subtle);
 }
 .matrix .cell{
-  width:32px;
-  height:36px;
+  width:var(--cell-size);
+  min-width:var(--cell-size);
+  height:calc(var(--cell-size) + 2px);
   display:flex;
   flex-direction:column;
   justify-content:center;

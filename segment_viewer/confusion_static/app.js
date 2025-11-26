@@ -1,8 +1,9 @@
 let CONFUSION = null;
 let LABELS = [];
 let tooltip = null;
-const CELL_WIDTH = 34;
-const TRUE_AXIS_WIDTH = 78;
+const DEFAULT_CELL_WIDTH = 34;
+const MIN_CELL_WIDTH = 22;
+const TRUE_AXIS_WIDTH = 70;
 
 function el(sel){ return document.querySelector(sel); }
 function esc(str){ return (str || '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
@@ -29,6 +30,28 @@ function buildMetrics(aggregates){
   });
 }
 
+function getMatrixWrapperWidth(){
+  const wrapper = document.querySelector('.matrix-wrapper');
+  if (!wrapper){
+    return window.innerWidth || 1200;
+  }
+  const style = getComputedStyle(wrapper);
+  const padding = parseFloat(style.paddingLeft || '0') + parseFloat(style.paddingRight || '0');
+  return Math.max(0, wrapper.clientWidth - padding);
+}
+
+function computeCellWidth(columnCount){
+  if (!columnCount){
+    return DEFAULT_CELL_WIDTH;
+  }
+  const available = getMatrixWrapperWidth() - TRUE_AXIS_WIDTH - 8;
+  if (available <= 0){
+    return MIN_CELL_WIDTH;
+  }
+  const width = Math.floor(available / columnCount);
+  return Math.max(MIN_CELL_WIDTH, Math.min(DEFAULT_CELL_WIDTH, width));
+}
+
 function renderMatrix(data){
   const matrixEl = el('#matrix');
   matrixEl.classList.remove('loading');
@@ -36,7 +59,9 @@ function renderMatrix(data){
     matrixEl.previousElementSibling.remove();
   }
   const n = data.labels.length;
-  matrixEl.style.gridTemplateColumns = `${TRUE_AXIS_WIDTH}px repeat(${n}, ${CELL_WIDTH}px)`;
+  const cellWidth = computeCellWidth(n);
+  matrixEl.style.setProperty('--cell-size', `${cellWidth}px`);
+  matrixEl.style.gridTemplateColumns = `${TRUE_AXIS_WIDTH}px repeat(${n}, ${cellWidth}px)`;
   matrixEl.innerHTML = '';
   matrixEl.appendChild(makeAxisCell('True ↓ / Pred →', 'corner'));
   data.labels.forEach(lbl => {
@@ -110,7 +135,14 @@ async function loadExample(trueId, predId){
 }
 
 function updateSample(data){
+  if (!data || !data.cell){
+    console.warn('updateSample received invalid payload', data);
+    return;
+  }
   const meta = el('#cellMeta');
+  if (!meta){
+    return;
+  }
   const cell = data.cell;
   meta.innerHTML = `
     <strong>${esc(cell.true.name)}</strong>
@@ -119,7 +151,9 @@ function updateSample(data){
     &nbsp;• ${cell.count} hits (${(cell.row_pct * 100).toFixed(2)}% of row, pool ${cell.pool})
   `;
   const stats = el('#sampleStats');
-  stats.innerHTML = '';
+  if (stats){
+    stats.innerHTML = '';
+  }
   [
     `chars ${data.char_count || 0}`,
     `highlight ${data.highlighted_chars || 0}`,
@@ -128,7 +162,9 @@ function updateSample(data){
     const span = document.createElement('span');
     span.className = 'badge';
     span.textContent = text;
-    stats.appendChild(span);
+    if (stats){
+      stats.appendChild(span);
+    }
   });
   const paletteEl = el('#samplePalette');
   if (paletteEl){
@@ -149,13 +185,20 @@ function updateSample(data){
     }
   }
   const predEl = el('#samplePred');
-  predEl.innerHTML = data.html || '<em>No renderable text.</em>';
-  attachTooltip(predEl);
+  if (predEl){
+    predEl.innerHTML = data.html || '<em>No renderable text.</em>';
+    attachTooltip(predEl);
+  }
 
   const truthEl = el('#sampleTruth');
-  truthEl.innerHTML = data.truth_html || '<em>No ground truth sample.</em>';
+  if (truthEl){
+    truthEl.innerHTML = data.truth_html || '<em>No ground truth sample.</em>';
+  }
 
   const metaBox = el('#sampleMeta');
+  if (!metaBox){
+    return;
+  }
   const metaItems = [];
   const summary = data.meta || {};
   if (summary.mode){
@@ -243,3 +286,11 @@ async function init(){
 }
 
 window.addEventListener('DOMContentLoaded', init);
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!CONFUSION){
+    return;
+  }
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => renderMatrix(CONFUSION), 120);
+});

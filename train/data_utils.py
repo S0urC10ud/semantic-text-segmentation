@@ -115,6 +115,9 @@ def prepare_dsets_by_lang_with_splits(
     data_root: str,
     use_train_windows: bool = True,
     include_languages: Optional[List[str]] = None,
+    *,
+    preserve_lang_order: bool = False,
+    preferred_order: Optional[List[str]] = None,
 ) -> Dict[str, Dict[int, hfds.Dataset]]:
     """
     Returns a nested dict: splits['train'|'val'|'test'][lang_id] -> dataset
@@ -128,6 +131,10 @@ def prepare_dsets_by_lang_with_splits(
         raise ValueError(f"❌ DATA ROOT NOT FOUND: {data_root}")
 
     configured_langs = list(cfg.LANG2ID.keys())
+    if preferred_order:
+        configured_order = list(preferred_order)
+    else:
+        configured_order = [name for name, _ in sorted(cfg.LANG2ID.items(), key=lambda kv: kv[1])]
     canonical_map = {lang.lower(): lang for lang in configured_langs}
     for canonical, aliases in LANG_ALIASES.items():
         for alias in aliases:
@@ -153,11 +160,11 @@ def prepare_dsets_by_lang_with_splits(
             )
         # Deduplicate while preserving the configured order
         deduped = list(dict.fromkeys(requested_langs))
-        requested_langs = [lang for lang in configured_langs if lang in deduped]
+        requested_langs = [lang for lang in configured_order if lang in deduped]
         if not requested_langs:
             requested_langs = None
     
-    target_langs = requested_langs if requested_langs is not None else configured_langs
+    target_langs = requested_langs if requested_langs is not None else configured_order
 
     # First scan: check existence and sample counts
     splits = {"train": {}, "val": {}, "test": {}}
@@ -243,7 +250,11 @@ def prepare_dsets_by_lang_with_splits(
     
     # Rebuild LANG2ID with only available languages
     cfg.LANG2ID.clear()
-    for i, lang in enumerate(sorted(available_langs)):
+    if preserve_lang_order:
+        ordered_langs = [lang for lang in configured_order if lang in available_langs]
+    else:
+        ordered_langs = sorted(available_langs)
+    for i, lang in enumerate(ordered_langs):
         cfg.LANG2ID[lang] = i
     
     print("\n" + "="*80)
