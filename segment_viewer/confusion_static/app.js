@@ -4,6 +4,7 @@ let tooltip = null;
 const DEFAULT_CELL_WIDTH = 34;
 const MIN_CELL_WIDTH = 22;
 const TRUE_AXIS_WIDTH = 70;
+const LONG_RUN_THRESHOLD = 60;
 
 function el(sel){ return document.querySelector(sel); }
 function esc(str){ return (str || '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
@@ -145,9 +146,11 @@ function updateSample(data){
   }
   const cell = data.cell;
   meta.innerHTML = `
-    <strong>${esc(cell.true.name)}</strong>
-    <span aria-hidden="true">→</span>
-    <strong>${esc(cell.pred.name)}</strong>
+    <span class="cell-heading">
+      <strong>${esc(cell.true.name)}</strong>
+      <span aria-hidden="true">→</span>
+      <strong>${esc(cell.pred.name)}</strong>
+    </span>
     &nbsp;• ${cell.count} hits (${(cell.row_pct * 100).toFixed(2)}% of row, pool ${cell.pool})
   `;
   const stats = el('#sampleStats');
@@ -188,11 +191,14 @@ function updateSample(data){
   if (predEl){
     predEl.innerHTML = data.html || '<em>No renderable text.</em>';
     attachTooltip(predEl);
+    applyWrapIndicator(predEl);
   }
 
   const truthEl = el('#sampleTruth');
   if (truthEl){
     truthEl.innerHTML = data.truth_html || '<em>No ground truth sample.</em>';
+    attachTooltip(truthEl, {mode: 'label'});
+    applyWrapIndicator(truthEl);
   }
 
   const metaBox = el('#sampleMeta');
@@ -235,7 +241,8 @@ function setSampleLoading(active){
   });
 }
 
-function attachTooltip(container){
+function attachTooltip(container, options = {}){
+  const mode = options.mode || 'probs';
   tooltip = el('#tooltip');
   container.onmousemove = event => {
     const target = event.target;
@@ -243,16 +250,39 @@ function attachTooltip(container){
       tooltip.style.display = 'none';
       return;
     }
-    const probs = JSON.parse(target.dataset.probs || '{}');
-    const entries = Object.entries(probs).map(([label, prob]) => {
-      return {label, prob};
-    }).sort((a,b)=>b.prob - a.prob);
-    tooltip.innerHTML = entries.map(e => `
-      <div class="prob-bar">
-        <div class="label">${esc(e.label)}</div>
-        <div class="bar"><div class="fill" style="width:${(e.prob*100).toFixed(1)}%"></div></div>
-        <div class="value">${(e.prob*100).toFixed(1)}%</div>
-      </div>`).join('') || '<div class="prob-bar"><div class="label">No data</div></div>';
+    if (mode === 'label'){
+      const label = esc(target.dataset.true || target.dataset.label || target.textContent || 'Content');
+      tooltip.innerHTML = `
+        <div class="prob-bar label-only">
+          <div class="label">Content type</div>
+          <div class="value">${label}</div>
+        </div>`;
+    }else{
+      let probs = {};
+      try{
+        probs = JSON.parse(target.dataset.probs || '{}') || {};
+      }catch(err){
+        probs = {};
+      }
+      const entries = Object.entries(probs).map(([label, prob]) => {
+        return {label, prob: Number(prob)};
+      }).filter(item => !Number.isNaN(item.prob)).sort((a,b)=>b.prob - a.prob);
+      if (entries.length){
+        tooltip.innerHTML = entries.map(e => `
+          <div class="prob-bar">
+            <div class="label">${esc(e.label)}</div>
+            <div class="bar"><div class="fill" style="width:${(e.prob*100).toFixed(1)}%"></div></div>
+            <div class="value">${(e.prob*100).toFixed(1)}%</div>
+          </div>`).join('');
+      }else{
+        const fallbackLabel = esc(target.dataset.label || target.dataset.true || target.textContent || 'No data');
+        tooltip.innerHTML = `
+          <div class="prob-bar label-only">
+            <div class="label">Prediction</div>
+            <div class="value">${fallbackLabel}</div>
+          </div>`;
+      }
+    }
     tooltip.style.display = 'block';
     const rect = target.getBoundingClientRect();
     tooltip.style.left = rect.left + 'px';
@@ -261,6 +291,28 @@ function attachTooltip(container){
   container.onmouseleave = () => {
     tooltip.style.display = 'none';
   };
+}
+
+function applyWrapIndicator(container){
+  if (!container){
+    return;
+  }
+  container.classList.remove('wrapped');
+  container.querySelectorAll('.wrap-indicator').forEach(node => node.remove());
+  const text = (container.textContent || '').trim();
+  if (!text){
+    return;
+  }
+  const longest = text.split(/\s+/).reduce((max, part) => Math.max(max, part.length), 0);
+  if (longest < LONG_RUN_THRESHOLD){
+    return;
+  }
+  const badge = document.createElement('div');
+  badge.className = 'wrap-indicator';
+  badge.textContent = '↪ wrap';
+  badge.title = 'Long line wrapped automatically';
+  container.appendChild(badge);
+  container.classList.add('wrapped');
 }
 
 async function init(){
