@@ -137,10 +137,15 @@ def _tokens_to_text(tokens: np.ndarray) -> str:
     if not mask.any():
         return ""
     byte_arr = arr[mask].astype(np.uint8)
-    try:
-        return byte_arr.tobytes().decode("utf-8", "ignore")
-    except Exception:
-        return byte_arr.tobytes().decode("latin-1", "ignore")
+    # Use a 1:1 byte-to-char mapping so label alignment cannot drift when
+    # sanitised bytes (e.g., 0xA4) are present. Non-ASCII bytes become '?'.
+    chars: List[str] = []
+    for val in byte_arr.tolist():
+        if (0x20 <= val <= 0x7E) or val in (0x09, 0x0A, 0x0D):
+            chars.append(chr(val))
+        else:
+            chars.append("?")
+    return "".join(chars)
 
 
 def _summarize_meta(meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
