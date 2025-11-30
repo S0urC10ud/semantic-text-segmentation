@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 import re
 
@@ -233,6 +233,24 @@ def _resolve_backend(device_name: Optional[str]) -> Optional[str]:
     raise ValueError(f"Unknown device name '{device_name}'. Use cpu/gpu/cuda/auto.")
 
 
+def _available_backends() -> Set[str]:
+    """Return the set of platforms exposed by the current JAX build."""
+    platforms: Set[str] = set()
+    try:
+        for dev in jax.devices():
+            platforms.add(dev.platform)
+    except Exception:
+        pass
+    for candidate in ("cpu", "gpu", "tpu"):
+        try:
+            devices = jax.devices(candidate)
+        except Exception:
+            continue
+        if devices:
+            platforms.add(devices[0].platform)
+    return platforms
+
+
 def _window_weights(length: int) -> np.ndarray:
     if length <= 1:
         return np.ones((length,), dtype=np.float32)
@@ -319,7 +337,7 @@ class SegmenterRunner:
         batch_size: int = 16,
     ):
         backend = _resolve_backend(device)
-        available = {dev.platform for dev in jax.devices()}
+        available = _available_backends()
         if backend is not None and backend not in available:
             raise RuntimeError(
                 f"Requested backend '{backend}' not available. Available: {sorted(available)}"
@@ -1504,12 +1522,15 @@ def measure_throughput(
             )
         )
 
-    devices = jax.devices()
-    device = devices[0]
+    devices: List[jax.Device] = []
     if runner.backend:
-        matched = [d for d in devices if d.platform == runner.backend]
-        if matched:
-            device = matched[0]
+        try:
+            devices = jax.devices(runner.backend)
+        except Exception:
+            devices = []
+    if not devices:
+        devices = jax.devices()
+    device = devices[0]
 
     rss_before = _process_rss_mb()
     dev_before = _device_mem_mb(device)

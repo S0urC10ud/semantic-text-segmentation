@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini Ground Truth Viewer</title>
+  <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+  <header class="topbar">
+    <div class="branding">
+      <span class="brand-primary">Gemini</span>
+      <span class="brand-secondary">Ground Truth</span>
+    </div>
+    <div class="topbar-meta">
+      <span id="snapshotDirectory"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="runs-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Runs</h2>
+          <p>Snapshots stored in <strong id="runCount">0</strong> files.</p>
+        </div>
+        <input id="runSearch" type="search" placeholder="Filter by run id or source…">
+      </div>
+      <div id="runsList" class="runs-list">
+        <div class="placeholder">Loading runs…</div>
+      </div>
+    </aside>
+
+    <section class="detail-panel" id="detailPanel">
+      <div class="detail-placeholder">
+        Select a run from the left to view the ground-truth segments Gemini produced.
+      </div>
+    </section>
+  </main>
+
+  <template id="runCardTemplate">
+    <article class="run-card">
+      <div class="run-card-header">
+        <div class="run-card-id"></div>
+        <div class="run-card-timestamp"></div>
+      </div>
+      <div class="run-card-dir"></div>
+      <div class="run-card-meta">
+        <div>
+          <span class="label">Segments</span>
+          <span class="value run-card-segments"></span>
+        </div>
+        <div>
+          <span class="label">Characters</span>
+          <span class="value run-card-characters"></span>
+        </div>
+        <div>
+          <span class="label">Model</span>
+          <span class="value run-card-model"></span>
+        </div>
+      </div>
+      <div class="run-card-source"></div>
+    </article>
+  </template>
+
+  <script src="/static/app.js?v=3"></script>
+</body>
+</html>

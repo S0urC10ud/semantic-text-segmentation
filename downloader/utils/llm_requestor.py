@@ -166,6 +166,7 @@ ALLOWED_TYPE_NAMES = [
     "csv",
     "shell",
     "powershell",
+    "makefile",
     "visual_basic",
     "dockerfile",
     "xml",
@@ -190,10 +191,10 @@ _LITERAL_ESCAPE_PATTERN = re.compile(
     r"\\(?:[\\\"'abfnrtv]|x[0-9A-Fa-f]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})"
 )
 _CONTENT_BLOCK_RE = re.compile(
-    r"<<<<CONTENT-TYPE:(?P<type>[A-Za-z0-9_\-+.]+)>>>>"
+    r"<CONTENT-TYPE:(?P<type>[A-Za-z0-9_\-+.]+)>"
 )
 _EMBEDDED_MARKER_PATTERN = re.compile(
-    r"<<<<CONTENT-TYPE:[A-Za-z0-9_\-+.]+>>>>(?:\r?\n)?"
+    r"<CONTENT-TYPE:[A-Za-z0-9_\-+.]+>(?:\r?\n)?"
 )
 
 
@@ -234,7 +235,11 @@ def _stitch_segments_with_validation(segments):
         seg_content = entry.get("content")
         if not isinstance(seg_type, str) or not isinstance(seg_content, str):
             raise TypeError(f"Segment {idx} must define 'type' and 'content' strings.")
-        if seg_type not in _ALLOWED_TYPES and not seg_type.startswith("discovered_"):
+        if (
+            seg_type not in _ALLOWED_TYPES
+            and not seg_type.startswith("discovered_")
+            and not seg_type.startswith("other_")
+        ):
             raise ValueError(f"Segment {idx} has unsupported type {seg_type!r}.")
         if not seg_content:
             raise ValueError(f"Segment {idx} is empty; delete it or merge with neighbors.")
@@ -312,6 +317,39 @@ def _insert_text_at_pos(segments, pos: int, text: str) -> None:
 def _replace_text_range_in_segments(segments, start: int, end: int, replacement: str) -> None:
     _remove_text_range_in_segments(segments, start, end)
     _insert_text_at_pos(segments, start, replacement)
+
+
+def _strip_inserted_text(segments, diff_blocks):
+    """
+    Remove bytes that the model inserted which are not present in SOURCE_TEXT.
+    Returns a summary dictionary describing what was removed.
+    """
+    insert_blocks = [block for block in diff_blocks or [] if block.get("tag") == "insert"]
+    if not insert_blocks:
+        return {"removed_bytes": 0, "blocks": 0, "empty_segments_removed": 0}
+    removed_bytes = 0
+    # Remove from the end backward so offsets remain valid.
+    for block in sorted(
+        insert_blocks,
+        key=lambda b: (b.get("segments_range", [0, 0])[0], b.get("segments_range", [0, 0])[1]),
+        reverse=True,
+    ):
+        seg_range = block.get("segments_range") or [0, 0]
+        if not isinstance(seg_range, list) or len(seg_range) != 2:
+            continue
+        start, end = seg_range
+        if not isinstance(start, int) or not isinstance(end, int) or end <= start:
+            continue
+        _remove_text_range_in_segments(segments, start, end)
+        removed_bytes += end - start
+    cleaned_segments, empty_removed = _remove_empty_segments(segments)
+    if empty_removed:
+        segments[:] = cleaned_segments
+    return {
+        "removed_bytes": removed_bytes,
+        "blocks": len(insert_blocks),
+        "empty_segments_removed": empty_removed,
+    }
 
 
 def _heal_newline_discrepancies(source_text: str, segments) -> dict[str, Any]:
@@ -545,10 +583,86 @@ def _maybe_encode_literal_sequences(source_text: str, segments):
     }
 
 
+def _heal_small_replacements(source_text: str, segments, *, max_chars: int = 64) -> dict[str, Any]:
+    """
+    Repairs tiny replace/delete diffs by overwriting segments with the expected SOURCE_TEXT
+    bytes when the differing spans are short (≤ max_chars).
+    """
+    stitched_text = "".join(entry.get("content", "") for entry in segments)
+    matcher = SequenceMatcher(a=source_text, b=stitched_text, autojunk=False)
+    patches = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag not in ("replace", "delete"):
+            continue
+        src_len = i2 - i1
+        seg_len = j2 - j1
+        if max(src_len, seg_len) > max_chars:
+            continue
+        expected = source_text[i1:i2]
+        if tag == "replace":
+            _replace_text_range_in_segments(segments, j1, j2, expected)
+        elif tag == "delete":
+            _insert_text_at_pos(segments, j1, expected)
+        patches.append(
+            {
+                "tag": tag,
+                "source_range": [i1, i2],
+                "segments_range": [j1, j2],
+                "expected": expected,
+            }
+        )
+    if not patches:
+        return {"applied": False}
+    return {"applied": True, "patches": patches, "count": len(patches)}
+
+
 def _remove_empty_segments(segments):
     cleaned = [entry for entry in segments if isinstance(entry.get("content"), str) and entry.get("content")]
     removed = len(segments) - len(cleaned)
     return cleaned, removed
+
+
+def _require_exact_source_match(source_text: str, segments, *, diff_hint: dict[str, Any] | None = None) -> None:
+    """
+    Enforce that stitched segments reproduce SOURCE_TEXT exactly.
+    Raises LocalVerificationError with a brief diff summary on mismatch.
+    """
+    stitched_text = _stitch_segments_with_validation(segments)
+    if stitched_text == source_text:
+        return
+    _, info = _fuzzy_compare_source_and_segments(source_text, stitched_text)
+    diff_info = diff_hint or info or {}
+    blocks = diff_info.get("blocks") or []
+    first_block = blocks[0] if blocks else {}
+    tag = first_block.get("tag", "unknown")
+    src_range = first_block.get("source_range") or [0, 0]
+    seg_range = first_block.get("segments_range") or [0, 0]
+    src_snip = first_block.get("source_snippet", "")
+    seg_snip = first_block.get("segments_snippet", "")
+    detail: str
+    if tag == "delete":
+        detail = (
+            f"expected {src_snip!r} at source[{src_range[0]}:{src_range[1]}] "
+            f"but it is missing in segments (segments[{seg_range[0]}:{seg_range[1]}])"
+        )
+    elif tag == "insert":
+        detail = (
+            f"segments inserted {seg_snip!r} at segments[{seg_range[0]}:{seg_range[1]}] "
+            f"(no bytes exist at source[{src_range[0]}:{src_range[1]}])"
+        )
+    elif tag == "replace":
+        detail = (
+            f"expected {src_snip!r} at source[{src_range[0]}:{src_range[1]}] "
+            f"but segments have {seg_snip!r} at segments[{seg_range[0]}:{seg_range[1]}]"
+        )
+    else:
+        detail = (
+            f"mismatch tag={tag} source[{src_range[0]}:{src_range[1]}] "
+            f"segments[{seg_range[0]}:{seg_range[1]}] expected {src_snip!r} got {seg_snip!r}"
+        )
+    raise LocalVerificationError(
+        f"Exact coverage mismatch: {detail}; total_diff_chars={diff_info.get('diff_chars')}."
+    )
 
 
 def _assert_segments_cover_source(source_text, segments):
@@ -679,7 +793,7 @@ except (OSError, TypeError):
                     )
                 if seg_type not in _ALLOWED_TYPES and not seg_type.startswith(
                     "discovered_"
-                ):
+                ) and not seg_type.startswith("other_"):
                     raise ValueError(f"Segment {idx} has unsupported type {seg_type!r}.")
                 if not seg_content:
                     raise ValueError(
@@ -769,6 +883,175 @@ Quote: "Segment everything exactly once"
 
 Notice how the markdown snippet above keeps `Path: C:\\\\Tools\\\\bin` verbatim and the HTML snippet below keeps `<div class=\\\"stats muted\\\">` rather than decoding the escapes; always retain those literal backslash sequences exactly as SOURCE_TEXT provides them.
 
+Example (React JSX with custom component and inline JS/CSS):
+<INPUT>
+return <SomeView onClick="alert('hi')" style="color: red;">Save</SomeView>;
+</INPUT>
+<OUTPUT>
+segments = [
+  {
+    "type": "javascript",
+    "content": "return "
+  },
+  {
+    "type": "other_jsx",
+    "content": "<SomeView onClick=\\""
+  },
+  {
+    "type": "javascript",
+    "content": "alert('hi')"
+  },
+  {
+    "type": "other_jsx",
+    "content": "\\" style=\\""
+  },
+  {
+    "type": "css",
+    "content": "color: red;"
+  },
+  {
+    "type": "other_jsx",
+    "content": "\\">Save</SomeView>"
+  },
+  {
+    "type": "javascript",
+    "content": ";"
+  }
+]
+</OUTPUT>
+
+Example (Angular template string with Angular-only bits tagged as other_angular_template):
+<INPUT>
+const tpl = `
+<div class="card" *ngIf="hasCard">
+  <h1>{{ title }}</h1>
+  <button (click)="save()">Save</button>
+</div>`;
+</INPUT>
+<OUTPUT>
+segments = [
+  {
+    "type": "javascript",
+    "content": "const tpl = `\\n"
+  },
+  {
+    "type": "other_angular_template",
+    "content": "<div class=\\"card\\" *ngIf=\\""
+  },
+  {
+    "type": "javascript",
+    "content": "hasCard"
+  },
+  {
+    "type": "other_angular_template",
+    "content": "\\">\\n  <h1>{{ "
+  },
+  {
+    "type": "javascript",
+    "content": "title"
+  },
+  {
+    "type": "other_angular_template",
+    "content": " }}</h1>\\n  <button (click)=\\""
+  },
+  {
+    "type": "javascript",
+    "content": "save()"
+  },
+  {
+    "type": "other_angular_template",
+    "content": "\\">Save</button>\\n</div>`;"
+  }
+]
+</OUTPUT>
+
+Example (Django template with inline CSS; keep template syntax as other_django_template):
+<INPUT>
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="color: red;">
+  Hello {{ user.name|default:"Anonymous" }}
+</div>
+{% endblock %}
+</INPUT>
+<OUTPUT>
+segments = [
+  {
+    "type": "other_django_template",
+    "content": """{% extends "base.html" %}
+{% block content %}
+<div class="card" style=\\""""
+  },
+  {
+    "type": "css",
+    "content": "color: red;"
+  },
+  {
+    "type": "other_django_template",
+    "content": """\\">
+  Hello {{ user.name|default:"Anonymous" }}
+</div>
+{% endblock %}
+"""
+  }
+]
+</OUTPUT>
+
+Example (HTML page script + inline handlers):
+<INPUT>
+<script type="text/javascript">
+$(function() {
+  initMenu('',true,false,'search.php','Search');
+  $(document).ready(function() { init_search(); });
+});
+</script>
+<div id="MSearchSelectWindow"
+     onmouseover="return searchBox.OnSearchSelectShow()"
+     onmouseout="return searchBox.OnSearchSelectHide()"
+     onkeydown="return searchBox.OnSearchSelectKey(event)">
+</div>
+</INPUT>
+<OUTPUT>
+segments = [
+  {
+    "type": "html",
+    "content": "<script type=\\"text/javascript\\">\\n"
+  },
+  {
+    "type": "javascript",
+    "content": "$(function() {\\n  initMenu('',true,false,'search.php','Search');\\n  $(document).ready(function() { init_search(); });\\n});\\n"
+  },
+  {
+    "type": "html",
+    "content": "</script>\\n<div id=\\"MSearchSelectWindow\\"\\n     onmouseover=\\""
+  },
+  {
+    "type": "javascript",
+    "content": "return searchBox.OnSearchSelectShow()"
+  },
+  {
+    "type": "html",
+    "content": "\\"\\n     onmouseout=\\""
+  },
+  {
+    "type": "javascript",
+    "content": "return searchBox.OnSearchSelectHide()"
+  },
+  {
+    "type": "html",
+    "content": "\\"\\n     onkeydown=\\""
+  },
+  {
+    "type": "javascript",
+    "content": "return searchBox.OnSearchSelectKey(event)"
+  },
+  {
+    "type": "html",
+    "content": "\\">\\n</div>\\n"
+  }
+]
+</OUTPUT>
+
 Your turn:
 <INPUT>
 '''
@@ -784,26 +1067,23 @@ Example (HTML with embedded CSS):
   </style>
 </div>
 </INPUT>
-<OUPUT>
-<<<<CONTENT-TYPE:html>>>>
-<div class="stats muted">
+<OUTPUT>
+<CONTENT-TYPE:html><div class="stats muted">
   <style>
-<<<<CONTENT-TYPE:css>>>>
-    body {
+<CONTENT-TYPE:css>    body {
       color: crimson;
     }
-<<<<CONTENT-TYPE:html>>>>
-  </style>
+<CONTENT-TYPE:html>  </style>
 </div>
-</OUPUT>
+</OUTPUT>
 
 
-Example (inline markers inside a JavaScript string literal):
+Example (HTML/CSS inside a JavaScript string literal):
 <INPUT>
 const snippet = "<div><style>p{color:red;}</style></div>";
 </INPUT>
 <OUTPUT>
-<<<<CONTENT-TYPE:javascript>>>>const snippet = "<<<<CONTENT-TYPE:html>>>><div><style><<<<<CONTENT-TYPE:css>>>>p{color:red;}<<<<CONTENT-TYPE:html>>></style></div><<<<CONTENT-TYPE:javascript>>>>";
+<CONTENT-TYPE:javascript>const snippet = "<CONTENT-TYPE:html><div><style><CONTENT-TYPE:css>p{color:red;}<CONTENT-TYPE:html></style></div><CONTENT-TYPE:javascript>";
 </OUTPUT>
 
 Example (inline HTML style attribute):
@@ -811,7 +1091,93 @@ Example (inline HTML style attribute):
 <div style="color:red; background: #fff;">Hello</div>
 </INPUT>
 <OUTPUT>
-<<<<CONTENT-TYPE:html>>>><div style="<<<<CONTENT-TYPE:css>>>>color:red; background: #fff;<<<<CONTENT-TYPE:html>>>>">Hello</div>
+<CONTENT-TYPE:html><div style="<CONTENT-TYPE:css>color:red; background: #fff;<CONTENT-TYPE:html>">Hello</div>
+</OUTPUT>
+
+Example (Dockerfile RUN with inline shell):
+<INPUT>
+FROM python:3.11-slim
+RUN set -eux; \
+    apt-get update; \
+    pip install --no-cache-dir flask==3.0.2
+CMD ["python","app.py"]
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:dockerfile>FROM python:3.11-slim
+RUN <CONTENT-TYPE:shell>set -eux; \
+    apt-get update; \
+    pip install --no-cache-dir flask==3.0.2
+<CONTENT-TYPE:dockerfile>
+CMD ["python","app.py"]
+</OUTPUT>
+
+Example (HTML page script + inline handlers):
+<INPUT>
+<script type="text/javascript">
+$(function() {
+  initMenu('',true,false,'search.php','Search');
+  $(document).ready(function() { init_search(); });
+});
+</script>
+<div id="MSearchSelectWindow"
+     onmouseover="return searchBox.OnSearchSelectShow()"
+     onmouseout="return searchBox.OnSearchSelectHide()"
+     onkeydown="return searchBox.OnSearchSelectKey(event)">
+</div>
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:html><script type="text/javascript">
+<CONTENT-TYPE:javascript>$(function() {
+  initMenu('',true,false,'search.php','Search');
+  $(document).ready(function() { init_search(); });
+});
+<CONTENT-TYPE:html>
+</script>
+<div id="MSearchSelectWindow"
+     onmouseover="<CONTENT-TYPE:javascript>return searchBox.OnSearchSelectShow()<CONTENT-TYPE:html>"
+     onmouseout="<CONTENT-TYPE:javascript>return searchBox.OnSearchSelectHide()<CONTENT-TYPE:html>"
+     onkeydown="<CONTENT-TYPE:javascript>return searchBox.OnSearchSelectKey(event)<CONTENT-TYPE:html>">
+</div>
+</OUTPUT>
+
+Example (Makefile rule with inline shell):
+<INPUT>
+cmd_/tools/include/xen/.install := /bin/sh scripts/headers_install.sh; echo done
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:makefile>cmd_/tools/include/xen/.install := <CONTENT-TYPE:shell>/bin/sh scripts/headers_install.sh; echo done
+</OUTPUT>
+
+Example (HTML consecutive style blocks on one line):
+<INPUT>
+<style type="text/css">.a{color:red;}</style><style>.b{color:blue;}</style>
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:html><style type="text/css"><CONTENT-TYPE:css>.a{color:red;}<CONTENT-TYPE:html></style><style><CONTENT-TYPE:css>.b{color:blue;}<CONTENT-TYPE:html></style>
+</OUTPUT>
+
+Example (HTML table with inline style attributes):
+<INPUT>
+<td style="width:200px;"><strong>Parameter</strong></td><td style="width:500px;">Description</td>
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:html><td style="<CONTENT-TYPE:css>width:200px;<CONTENT-TYPE:html>"><strong>Parameter</strong></td><td style="<CONTENT-TYPE:css>width:500px;<CONTENT-TYPE:html>">Description</td>
+</OUTPUT>
+
+Example (Windows batch script → shell):
+<INPUT>
+@echo off
+set FOO=bar
+if defined FOO echo %FOO%
+goto :END
+:END
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:shell>@echo off
+set FOO=bar
+if defined FOO echo %FOO%
+goto :END
+:END
 </OUTPUT>
 
 Example (mixed Markdown + shell + python):
@@ -838,18 +1204,18 @@ Path: C:\Tools\bin
 Quote: "Segment everything exactly once"
 </INPUT>
 <OUTPUT>
-<<<<CONTENT-TYPE:markdown>>>># This is how you use magika
+<CONTENT-TYPE:markdown># This is how you use magika
 Run
 ```
-<<<<CONTENT-TYPE:shell>>>>pip install magika
-<<<<CONTENT-TYPE:markdown>>>>
+<CONTENT-TYPE:shell>pip install magika
+<CONTENT-TYPE:markdown>
 ```
 then open an editor and type:
 ```
-<<<<CONTENT-TYPE:python>>>>import magika
+<CONTENT-TYPE:python>import magika
 def adfadf():
 return True
-<<<<CONTENT-TYPE:markdown>>>>
+<CONTENT-TYPE:markdown>
 ````
 Keep this literal text (do not escape the characters):
 
@@ -857,7 +1223,46 @@ Path: C:\Tools\bin
 Quote: "Segment everything exactly once"
 </OUTPUT>
 
+Example (React JSX with custom component and inline JS/CSS):
+<INPUT>
+return <SomeView onClick="alert('hi')" style="color: red;">Save</SomeView>;
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:javascript>return <CONTENT-TYPE:other_jsx><SomeView onClick="<CONTENT-TYPE:javascript>alert('hi')<CONTENT-TYPE:other_jsx>" style="<CONTENT-TYPE:css>color: red;<CONTENT-TYPE:other_jsx>">Save</SomeView><CONTENT-TYPE:javascript>;
+</OUTPUT>
 
+Example (Angular template string with Angular-only bits tagged as other_angular_template):
+<INPUT>
+const tpl = `
+<div class="card" *ngIf="hasCard">
+  <h1>{{ title }}</h1>
+  <button (click)="save()">Save</button>
+</div>`;
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:javascript>const tpl = `
+<CONTENT-TYPE:other_angular_template><div class="card" *ngIf="<CONTENT-TYPE:javascript>hasCard<CONTENT-TYPE:other_angular_template>">
+  <h1>{{ <CONTENT-TYPE:javascript>title<CONTENT-TYPE:other_angular_template> }}</h1>
+  <button (click)="<CONTENT-TYPE:javascript>save()<CONTENT-TYPE:other_angular_template>">Save</button>
+</div>`;<CONTENT-TYPE:javascript>
+</OUTPUT>
+
+Example (Django template with inline CSS):
+<INPUT>
+{% block body %}
+<div class="card" style="color: red;">
+  Hello {{ user.name|default:"Anonymous" }}
+</div>
+{% endblock %}
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:other_django_template>{% block body %}
+<CONTENT-TYPE:html>
+<div class="card" style="<CONTENT-TYPE:css>color: red;<CONTENT-TYPE:html>">
+  Hello <CONTENT-TYPE:other_django_template>{{ user.name|default:"Anonymous" }}<CONTENT-TYPE:html>
+</div>
+<CONTENT-TYPE:other_django_template>{% endblock %}
+</OUTPUT>
 
 
 Markers are never part of SOURCE_TEXT—they simply bracket each block. Place them inline or on their own lines as needed, but never introduce or delete whitespace/bytes around them. Every byte between markers must be copied verbatim from SOURCE_TEXT (including blank lines, spaces, and literal escape sequences).
@@ -871,13 +1276,21 @@ Segment the file embedded between <INPUT> and </INPUT> into its constituent cont
 Only treat <INPUT></INPUT> and <OUTPUT></OUTPUT> as control tokens.
 
 Rules:
-- map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85; if nothing fits, use discovered_<lang> or "other" as a last resort.
+- map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,makefile; if nothing fits, use discovered_<lang> or better other_<best_guess> rather than plain "other".
 - be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
-- Within HTML, treat `<style>` bodies as CSS and `<script>` bodies as JavaScript even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
+- Within HTML, the `<script>`/`<style>` tags themselves are html wrappers but their bodies are javascript/css even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
+- Inline attributes that embed code are already that code: handlers like onClick/onmouseover/onkeydown are javascript; javascript: URLs (e.g., iframe src="javascript:void(0)") are javascript; inline `style="..."` is css. Drop markers inside the attribute so the embedded language is typed correctly without changing bytes.
+- VERY IMPORTANT: BE SUPER PRECISE FOR FOREIGN CODE INJECTIONS: For instance, inline style attributes must always be split: keep `style="` and closing quotes as html and put the style body in css; do this for every occurrence (no CSS may remain inside html segments).
+- Template languages: In React/JSX/TSX keep tag wrappers/custom components as other_jsx (never plain html); Angular templates that include Angular syntax (e.g., *ngIf, [(ngModel)], {{{{...}}}}, (click)) use other_angular_template for the tag/text wrappers while plain HTML without Angular stays html; Django/Jinja templates use other_django_template for their blocks/tags. Inline `style` stays css; handlers/expressions (e.g., `onClick=...`, `{{{{ title }}}}`, `(click)="save()"`, `{{% if %}}`) are javascript/typescript or template-language content.
+- Comments stay with their host language (e.g., `#` in Dockerfile/python); if a comment hides real executable code (like JS inside a CSS comment), segment that code as its true language while keeping the surrounding comment bytes.
 - Never invent continuation bytes or "helpful" closing tags if SOURCE_TEXT ends abruptly; stop exactly at the final byte even when braces/tags remain open.
-- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands.
-- Inline attributes that clearly embed another language (e.g., `style="..."` for CSS, `onclick="..."` for JavaScript) must be segmented by dropping markers directly inside the attribute so the embedded language is typed correctly without adding/removing bytes.
+- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands, and label them as encoding_base64/encoding_hex/etc rather than the surrounding language.
 - text or comments belong to the wrapping/adjacent content type.
+- Treat Windows cmd/batch scripts (cmd.exe syntax like @echo off, set VAR, goto/end labels) as shell, not powershell.
+- Key/value configuration files (e.g., spring.datasource.* application.properties) should be labeled as other_application_properties (not java/javascript/shell/etc.).
+- Within HTML, split tiny wrappers from bodies: the `<style>`/`</style>` tags stay html, the CSS inside is css. Even when `<style>...CSS...</style>` or `</style><style>` appear on one line, break into html→css→html so no CSS bytes remain in html segments and no html tags remain in css segments; closing fragments like `</style><` are html.
+- Makefile rule prefixes (targets/assignments like `cmd_foo :=`) are makefile, while the command after the assignment is shell; split them if they coexist on one line.
+- Markdown with YAML front matter: the block from the first `---` through the matching closing `---` is yaml; start markdown after that. Always split front matter out.
 - IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes).
   - Emit exactly one literal assignment 'segments = [ {{...}}, ... ]'. Build every entry directly inside that literal. Do not call segments.append, loops, helper functions, or reassignment. My tooling parses the AST and only sees literal lists, so any procedural construction fails.
   - Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly
@@ -901,22 +1314,42 @@ Segment the file embedded between <INPUT> and </INPUT> into its constituent cont
 Only treat <INPUT></INPUT> and <OUTPUT></OUTPUT> as control tokens.
 
 Rules:
-- map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85; if nothing fits, use discovered_<lang> or "other" as a last resort.
+- map to one of the following content types: php,csharp,javascript,typescript,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,makefile; if this is not suitable (for the later rules or as it is simply something else), use discovered_<lang> or better other_<best_guess> rather than plain "other".
 - be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
-- Within HTML, treat `<style>` bodies as CSS and `<script>` bodies as JavaScript even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
+- For React/JSX/TSX/Angular/Vue/Django..., tag wrappers/custom components as other_jsx (or other_angular, other_vue, ...), and reserve javascript/typescript for the code inside {{...}} / {{{{...}}}} expressions.
+- For React/JSX/TSX specifically, DO NOT over-split tiny scalar expressions in attributes. It is better to keep an entire attribute or attribute list as other_jsx than to insert many tiny markers around numbers like cx={{13.967}} cy={{13.967}} r={{13}}. You may keep:
+
+    <circle stroke="#FEAE16" cx={{13.967}} cy={{13.967}} r={{13}} />
+
+  entirely as other_jsx instead of splitting out the numeric values.
+- also small segments should be classified appropriately in general (for example, an alert(...) statement within onclick="alert(...)" is javascript, or HTML inside JS strings is html). This DOES NOT require splitting trivial numeric values or very short literals inside JSX attributes when that would introduce many markers inline.- Similarly for django or jinja templates - only the precise django or jinja code have to be tagged as other_django or other_jinja respectively and not as their surrounding context
+- Never label JSX tag wrappers (like <Square ... />) as javascript or html.
+- Within HTML, the `<script>`/`<style>` tags themselves are html wrappers but their bodies are javascript/css even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
+- Inline attributes that embed code are already that code: handlers like onClick/onmouseover/onkeydown are javascript; javascript: URLs (e.g., iframe src="javascript:void(0)") are javascript; inline `style="..."` is css. Drop markers inside the attribute so the embedded language is typed correctly without changing bytes.
+- VERY IMPORTANT: BE SUPER PRECISE FOR FOREIGN CODE INJECTIONS: Inline style attributes must always be split: keep `style="` and closing quotes as html and put the style body in css; do this for every occurrence (no CSS may remain inside html segments).
+- Template languages: In React/JSX/TSX keep tag wrappers/custom components as other_jsx (never plain html); Angular templates that include Angular syntax (e.g., *ngIf, [(ngModel)], {{...}}, (click)) use other_angular_template for the tag/text wrappers while plain HTML without Angular stays html; Django/Jinja templates use other_django_template for their blocks/tags. Inline `style` stays css; handlers/expressions (e.g., `onClick=...`, `{{{{ title }}}}`, `(click)="save()"`, `{{% if %}}`) are javascript/typescript or template-language content.
+- Comments stay with their host language (e.g., `#` in Dockerfile/python); if a comment hides real executable code (like JS inside a CSS comment), segment that code as its true language while keeping the surrounding comment bytes.
 - Never invent continuation bytes or "helpful" closing tags if SOURCE_TEXT ends abruptly; stop exactly at the final byte even when braces/tags remain open.
-- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands.
+- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands, and label them as encoding_base64/encoding_hex/etc rather than the surrounding language.
 - text or comments belong to the wrapping/adjacent content type.
+- Treat Windows cmd/batch scripts (cmd.exe syntax like @echo off, set VAR, goto/end labels) as shell, not powershell.
+- Key/value configuration files (e.g., spring.datasource.* application.properties) should be labeled as other_application_properties (not java/javascript/shell/etc.).
+- Within HTML, split tiny wrappers from bodies: the `<style>`/`</style>` tags stay html, the CSS inside is css; similarly keep closing tags like `</style><` as html, not css.
+- Makefile rule prefixes (targets/assignments like `cmd_foo :=`) are makefile, while the command after the assignment is shell; split them if they coexist on one line.
+- Markdown with YAML front matter: the block from the first `---` through the matching closing `---` is yaml; start markdown after that. Always split front matter out.
 - IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes). Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly.
 - also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types.
-- Output format: for each contiguous block, emit a marker `<<<<CONTENT-TYPE:<type>>>>` (no extra text attached) followed immediately by the exact bytes of that block. Repeat marker + bytes for every block so the concatenation of all blocks equals SOURCE_TEXT exactly once.
-- Never emit Python, JSON, bullet lists, tool instructions, or commentary. Do not wrap the response in <OUTPUT> tags or markdown fences. Produce only the alternating sequence of marker lines and raw bytes.
+- Output format: for each contiguous block, emit a marker `<CONTENT-TYPE:<type>` (no extra text attached) followed immediately by the exact bytes of that block. Repeat marker + bytes for every block so the concatenation of all blocks equals SOURCE_TEXT exactly once.
+- CRITICAL: The substring `<CONTENT-TYPE:` must NEVER appear inside the content bytes of any segment. The ONLY place you may output `<CONTENT-TYPE:` is at the start of a marker line. If SOURCE_TEXT itself contains `<CONTENT-TYPE:`, treat it as normal text and DO NOT try to segment around it.
+- Never execute code, give verbose outputs, tool instructions, or your own commentary. Do not wrap the response in <OUTPUT> tags or markdown fences --> IMPORTANT: Produce only the alternating sequence of marker lines and raw bytes.
 - The marker lines are control-plane only: they belong strictly between segments, never inside them. Do not insert extra markers inside strings/comments/data; copy the bytes exactly and only switch types when the outer content type truly changes.
 - When you switch types mid-line (e.g., inside a JavaScript string or attribute), place the marker immediately before the next byte with zero extra whitespace/newlines. Never introduce or remove bytes to “make room” for a marker; the bytes emitted after the marker must continue exactly where SOURCE_TEXT continues.
 - Emit literal characters exactly as they appear: real newlines stay as newline characters, quotes stay as quotes, HTML entities stay as-is; never replace text with escape sequences such as \\n, \\t, \\\" or numeric entities unless those escapes exist in SOURCE_TEXT.
 - When SOURCE_TEXT already encodes characters via literal escape sequences (e.g., \\n, \\r\\n, \\t, \\u2192, \\xNN, \\\"), reproduce those exact backslash sequences instead of decoding them into the actual newline/tab/unicode characters. Keep the bytes verbatim, even inside HTML/JS literals.
 - Always finish every opened quote/backtick/triple-quoted string, bracket, brace, or parenthesis in the bytes you reproduce. Since you are copying SOURCE_TEXT exactly, that should happen automatically—do not invent fixes.
 - After you emit the final block, stop immediately; no trailing blank lines or summaries.
+- Again, to illustrate how precise you should be: Any shell commands within dockerfiles should be classified as such. If there is a small inline JS snippet inside HTML it should be highlighted as that, even if it is only about a few bytes! 
+- Another purity checker has determined that the file you will be given is not pure, so likely there will be mixed content types for you to classify!
 
 Reference format:
 {LOCAL_RESPONSE_EXAMPLE}
@@ -1340,9 +1773,9 @@ def extract_segments_from_content_blocks(model_text: str) -> list[dict[str, str]
     """
     Parses responses that follow the CONTENT-TYPE block protocol:
 
-    <<<<CONTENT-TYPE:markdown>>>>
+    <CONTENT-TYPE:markdown>
     ...bytes...
-    <<<<CONTENT-TYPE:python>>>>
+    <CONTENT-TYPE:python>
     ...bytes...
 
     Returns a list of {type, content} dictionaries or None when parsing fails.
@@ -1530,6 +1963,27 @@ def verify_segments_locally(source_text: str, segments, *, fuzzy: bool) -> dict[
         stitched_text = _stitch_segments_with_validation(segments)
         _, info = _fuzzy_compare_source_and_segments(source_text, stitched_text)
         diff_desc = info.get("blocks", [])
+        insert_cleanup = None
+        if diff_desc:
+            insert_cleanup = _strip_inserted_text(segments, diff_desc)
+            if insert_cleanup.get("removed_bytes"):
+                console.print(
+                    (
+                        "Removed {removed} inserted byte(s) from model output before verification."
+                    ).format(removed=insert_cleanup["removed_bytes"]),
+                    style="yellow",
+                )
+                try:
+                    _assert_segments_cover_source(source_text, segments)
+                    info["mode"] = "strict_after_insert_trim"
+                    info.setdefault("postprocess", {})["insertions_removed"] = insert_cleanup
+                    return info
+                except Exception:
+                    stitched_text = _stitch_segments_with_validation(segments)
+                    _, info = _fuzzy_compare_source_and_segments(source_text, stitched_text)
+        if insert_cleanup is not None:
+            info.setdefault("postprocess", {})["insertions_removed"] = insert_cleanup
+        diff_desc = info.get("blocks", [])
         summary = "Fuzzy verification accepted" if diff_desc else "Fuzzy verification not needed"
         if diff_desc:
             block = diff_desc[0]
@@ -1538,6 +1992,7 @@ def verify_segments_locally(source_text: str, segments, *, fuzzy: bool) -> dict[
                 f"(tag={block['tag']}, source_range={block['source_range']}, diff_chars={info.get('diff_chars')})."
             )
         console.print(summary, style="yellow")
+        _require_exact_source_match(source_text, segments, diff_hint=info)
         return info
     except Exception as exc:  # pragma: no cover - surfaced to CLI
         raise LocalVerificationError(str(exc)) from exc
@@ -1697,6 +2152,15 @@ def main() -> None:
                         "Converted decoded control characters back into literal escape sequences as in SOURCE_TEXT.",
                         style="dim",
                     )
+                small_replace_info = _heal_small_replacements(content, segments_result)
+                if small_replace_info.get("applied"):
+                    metadata["small_replacement_healing"] = small_replace_info
+                    console.print(
+                        (
+                            "Repaired {count} tiny diff(s) by restoring SOURCE_TEXT bytes."
+                        ).format(count=small_replace_info.get("count")),
+                        style="dim",
+                    )
                 segments_result, removed_segments = _remove_empty_segments(segments_result)
                 if removed_segments:
                     metadata["empty_segments_removed"] = removed_segments
@@ -1726,6 +2190,13 @@ def main() -> None:
                     style="dim",
                 )
                 log_status = "delegated_verification"
+            try:
+                _require_exact_source_match(content, segments_result)
+            except LocalVerificationError as exc:
+                error_message = f"Final coverage check failed: {exc}"
+                log_status = "local_verification_failed"
+                console.print(error_message, style=LOCAL_VERIFICATION_ERROR_STYLE)
+                raise SystemExit(1) from exc
         else:
             if error_message is None:
                 error_message = "Failed to extract segments from the model response."
