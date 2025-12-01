@@ -69,7 +69,7 @@ MODEL_PRICING_USD_PER_MTOKENS = {
     },
 }
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 LOG_OUTPUT_DIR = PROJECT_ROOT / "gemini_output_logs"
 SEGMENTATIONS_DIR = PROJECT_ROOT / "gemini_segmentations"
 

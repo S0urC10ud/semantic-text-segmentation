@@ -21,7 +21,7 @@ console = Console()
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SEGMENTATIONS_DIR = PROJECT_ROOT / "gemini_segmentations"
 LOG_OUTPUT_DIR = PROJECT_ROOT / "gemini_output_logs"
 

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Gemini Ground Truth Viewer</title>
-  <link rel="stylesheet" href="/static/style.css?v=3">
+  <link rel="stylesheet" href="static/style.css?v=4">
 </head>
 <body>
   <header class="topbar">
@@ -14,6 +14,7 @@
     </div>
     <div class="topbar-meta">
       <span id="snapshotDirectory"></span>
+      <span id="snapshotStats"></span>
     </div>
   </header>
 
@@ -21,48 +22,41 @@
     <aside class="runs-panel">
       <div class="panel-heading">
         <div>
-          <h2>Runs</h2>
-          <p>Snapshots stored in <strong id="runCount">0</strong> files.</p>
+          <h2>Content Types</h2>
+          <p><strong id="typeCount">0</strong> types across <strong id="fileCount">0</strong> files.</p>
         </div>
-        <input id="runSearch" type="search" placeholder="Filter by run id or source…">
       </div>
-      <div id="runsList" class="runs-list">
-        <div class="placeholder">Loading runs…</div>
+      <div id="typesList" class="runs-list types-list">
+        <div class="placeholder">Loading content types…</div>
       </div>
     </aside>
 
     <section class="detail-panel" id="detailPanel">
       <div class="detail-placeholder">
-        Select a run from the left to view the ground-truth segments Gemini produced.
+        Select a content type to view a random sample of that segment.
       </div>
     </section>
   </main>
 
-  <template id="runCardTemplate">
-    <article class="run-card">
-      <div class="run-card-header">
-        <div class="run-card-id"></div>
-        <div class="run-card-timestamp"></div>
+  <template id="typeCardTemplate">
+    <article class="type-card">
+      <div class="type-card-header">
+        <div class="type-color"></div>
+        <div class="type-name"></div>
       </div>
-      <div class="run-card-dir"></div>
-      <div class="run-card-meta">
+      <div class="type-card-meta">
         <div>
-          <span class="label">Segments</span>
-          <span class="value run-card-segments"></span>
+          <span class="label">Files</span>
+          <span class="value type-card-files"></span>
         </div>
         <div>
-          <span class="label">Characters</span>
-          <span class="value run-card-characters"></span>
-        </div>
-        <div>
-          <span class="label">Model</span>
-          <span class="value run-card-model"></span>
+          <span class="label">Folder</span>
+          <span class="value type-card-segments"></span>
         </div>
       </div>
-      <div class="run-card-source"></div>
     </article>
   </template>
 
-  <script src="/static/app.js?v=3"></script>
+  <script src="static/app.js?v=4"></script>
 </body>
 </html>

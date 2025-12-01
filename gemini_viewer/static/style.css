@@ -34,6 +34,15 @@ body {
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.topbar-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 14px;
+  color: rgba(248, 250, 252, 0.85);
+}
+
 .branding {
   font-weight: 600;
   font-size: 20px;
@@ -47,11 +56,6 @@ body {
 .brand-secondary {
   color: #f8fafc;
   margin-left: 8px;
-}
-
-.topbar-meta {
-  font-size: 14px;
-  color: rgba(248, 250, 252, 0.85);
 }
 
 main.layout {
@@ -82,15 +86,6 @@ main.layout {
   margin: 4px 0 0 0;
   font-size: 14px;
   color: var(--muted);
-}
-
-#runSearch {
-  width: 100%;
-  margin-top: 12px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  font-size: 14px;
 }
 
 .runs-list {
@@ -166,7 +161,7 @@ main.layout {
   font-size: 14px;
 }
 
-.run-card {
+.type-card {
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 12px 14px;
@@ -175,17 +170,17 @@ main.layout {
   transition: border-color 0.2s ease, transform 0.2s ease;
 }
 
-.run-card:hover {
+.type-card:hover {
   border-color: #cbd5f5;
   transform: translateY(-2px);
 }
 
-.run-card.selected {
+.type-card.selected {
   border-color: var(--accent);
   box-shadow: 0 6px 18px rgba(37, 99, 235, 0.12);
 }
 
-.run-card-header {
+.type-card-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -193,40 +188,34 @@ main.layout {
   margin-bottom: 8px;
 }
 
-.run-card-id {
+.type-color {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.type-name {
   font-weight: 600;
   font-size: 14px;
   word-break: break-all;
+  flex: 1;
 }
 
-.run-card-timestamp {
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.run-card-meta {
+.type-card-meta {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   font-size: 13px;
   color: var(--muted);
   margin-bottom: 8px;
 }
 
-.run-card-meta .value {
+.type-card-meta .value {
   display: block;
   font-weight: 600;
   color: var(--text);
-}
-
-.run-card-purity {
-  grid-column: span 3;
-}
-
-.run-card-source {
-  font-size: 12px;
-  color: var(--muted);
-  word-break: break-all;
+  word-break: break-word;
 }
 
 .detail-panel {
@@ -270,7 +259,7 @@ main.layout {
 
 .meta-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 12px;
   margin-bottom: 24px;
 }
@@ -293,6 +282,22 @@ main.layout {
   display: block;
   margin-top: 6px;
   font-weight: 600;
+  word-break: break-word;
+  white-space: normal;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.meta-card.file-meta {
+  grid-column: span 2;
+}
+
+@media (max-width: 720px) {
+  .meta-card.file-meta {
+    grid-column: span 1;
+  }
 }
 
 .type-legend {

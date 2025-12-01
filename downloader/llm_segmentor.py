@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-Batch runner that segments monitor/test samples with Gemini.
-
-By default each sample first goes through downloader/999_check_purity.py to see if
-the file is "pure" (single content type). Pure files emit a single-segment snapshot.
-Non-pure files fall back to downloader/999_check_gemini.py unchanged.
-
-The script scans arrow_out/<split>/<lang> directories (restricted to an allow-list),
-materializes each sample's content to <sha256>.tmp, and stores the resulting snapshot
-under gemini_segmentations/<split>/<lang>/<sha256>.json.
-
-WARNING: Running this script will make a Gemini API call for every processed sample.
-Ensure GOOGLE_API_KEY is set and costs are acceptable before execution.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -51,7 +36,8 @@ ALLOWED_LANGS = {
     "dockerfile",
     "markdown",
     "restructuredtext",
-    "javascript_typescript"
+    "javascript_typescript",
+    "python"
 }
 ALLOWED_LANGS_LOWER = {lang.lower() for lang in ALLOWED_LANGS}
 
