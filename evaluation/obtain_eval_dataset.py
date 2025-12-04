@@ -2006,7 +2006,12 @@ def _write_dataset(
 
 
 def build_all_datasets(args) -> dict:
-    data_root = Path(args.data_root).resolve()
+    # data_root_orig is where Arrow monitor outputs live (downloader/arrow_out
+    # by default). We may override data_root for fine-tuned memmap-based
+    # builds, but fine-tuned evaluation should stay strictly on the
+    # monitor_preprocessed_b subset.
+    data_root_orig = Path(args.data_root).resolve()
+    data_root = data_root_orig
     output_root = Path(args.output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -2014,9 +2019,13 @@ def build_all_datasets(args) -> dict:
     #  - default: Gemini segmentations + Arrow monitor
     #  - fine-tuned: use the preprocessed monitor memmap split (B) so that
     #    evaluation examples come only from the held-out subset.
+    monitor_seg_root = Path(args.monitor_seg_root).resolve()
     if getattr(args, "fine_tuned", False):
         memmap_root = (REPO_ROOT / "downloader" / "monitor_preprocessed_b").resolve()
         _log(f"📥 Fine-tuned mode: loading monitor memmap from {memmap_root} ...")
+        # For fine-tuned evaluation, all monitor-derived tasks (including
+        # markdown_mix) are built strictly from the monitor_preprocessed_b
+        # memmap subset.
         fragments_by_lang, monitor_docs = _load_monitor_fragments_and_docs_from_memmap(
             memmap_root,
             args.per_label,
@@ -2027,15 +2036,17 @@ def build_all_datasets(args) -> dict:
         # data source in the manifest for clarity.
         data_root = memmap_root
     else:
-        monitor_seg_root = Path(args.monitor_seg_root).resolve()
         fragments_by_lang, monitor_docs = _load_monitor_fragments_and_docs(
-            data_root,
+            data_root_orig,
             args.per_label,
             extra_multiplier=args.extra_pool_multiplier,
             seed=args.seed,
             monitor_seg_root=monitor_seg_root,
         )
-    if not fragments_by_lang and not monitor_docs:
+    monitor_docs_for_needles = monitor_docs
+    markdown_docs = monitor_docs
+
+    if not fragments_by_lang and not monitor_docs_for_needles:
         raise RuntimeError("No monitor data available – cannot build evaluation datasets.")
 
     rng = random.Random(args.seed)
@@ -2056,7 +2067,7 @@ def build_all_datasets(args) -> dict:
     for name, lo, hi in buckets:
         builders.append(
             _build_monitor_needle_dataset(
-                monitor_docs,
+                monitor_docs_for_needles,
                 args.per_label,
                 name,
                 lo,
@@ -2068,7 +2079,7 @@ def build_all_datasets(args) -> dict:
     builders.append(_build_malicious_dataset(fragments_by_lang, args.per_label, rng))
     builders.append(_build_pair_dataset(fragments_by_lang, args.per_label, rng))
     builders.append(_build_triplet_dataset(fragments_by_lang, args.per_label, rng))
-    builders.append(_build_markdown_dataset_from_monitor(monitor_docs, args.per_label, rng))
+    builders.append(_build_markdown_dataset_from_monitor(markdown_docs, args.per_label, rng))
 
     for size in (1024, 10_240, 102_400, 1_048_576):
         builders.append(
@@ -2135,7 +2146,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument(
         "--throughput-examples",
         type=int,
-        default=32,
+        default=4,
         help="Number of synthetic samples to create for each throughput size.",
     )
     parser.add_argument(

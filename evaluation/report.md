@@ -8,7 +8,7 @@
 - Max samples per task: 2000
 - Sample seed: 13
 - Evaluation data root: `/home/s0urc10ud/text-segmentation/evaluation/data`
-- Generated at: 2025-12-04T10:11:27
+- Generated at: 2025-12-04T12:07:15
 
 ### Task Highlights
 
@@ -22,17 +22,17 @@
 _Text hits column: lower is better._
 | Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| \`\`\` fenced \`\`\` | — | — | — | — | — | — | — | — | — |
-| bare code | 374/374 | 374/374 | 100.0% | 1.00 | 0/374 | 255/374 | 255/374 | 84.5% | 0.84 |
+| \`\`\` fenced \`\`\` | 175/175 | 175/175 | 100.0% | 1.00 | 0/175 | 123/175 | 123/175 | 85.1% | 0.85 |
+| bare code | 199/199 | 199/199 | 100.0% | 1.00 | 0/199 | 132/199 | 132/199 | 83.8% | 0.84 |
 
 Text coverage (IoU ≥50%): 0.8%
 
 | Metric | Value |
 | --- | --- |
-| Host fenced IoU ≥50% | — hits, mean IoU n/a, coverage n/a |
-| Host bare IoU ≥50% | — hits, mean IoU n/a, coverage n/a |
-| Other fenced IoU ≥50% | — hits, mean IoU n/a, coverage n/a |
-| Other bare IoU ≥50% | 255/374 hits, mean IoU 0.84, coverage 84.5% |
+| Host fenced IoU ≥50% | 93/129 hits, mean IoU 0.86, coverage 86.2% |
+| Host bare IoU ≥50% | 103/145 hits, mean IoU 0.84, coverage 84.3% |
+| Other fenced IoU ≥50% | 30/46 hits, mean IoU 0.73, coverage 73.1% |
+| Other bare IoU ≥50% | 29/54 hits, mean IoU 0.80, coverage 80.4% |
 
 ##### pure_fragments
 749/2000 samples stayed fully pure (no foreign chars). 1910/2000 stayed within ≤50% foreign coverage.
@@ -107,8 +107,8 @@ Monitor markdown documents with natural code/text interleavings.
 _Text hits column: lower is better._
 | Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| \`\`\` fenced \`\`\` | — | — | — | — | — | — | — | — | — |
-| bare code | 374/374 | 374/374 | 100.0% | 1.00 | 0/374 | 255/374 | 255/374 | 84.5% | 0.84 |
+| \`\`\` fenced \`\`\` | 175/175 | 175/175 | 100.0% | 1.00 | 0/175 | 123/175 | 123/175 | 85.1% | 0.85 |
+| bare code | 199/199 | 199/199 | 100.0% | 1.00 | 0/199 | 132/199 | 132/199 | 83.8% | 0.84 |
 
 Text coverage (IoU ≥50%): 0.8%
 
@@ -482,16 +482,16 @@ Natural monitor files with a short foreign-language needle sized 4-15 printable 
 
 | Task | Device | Samples | Total Bytes | Throughput | Latency (s) | RSS Δ (MB) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| throughput_1024 | cpu | 32 | 32768 | 4.16 KB/s | 7.68 | 849.08 |
-| throughput_10240 | cpu | 32 | 327680 | 28.76 KB/s | 11.13 | 73.48 |
-| throughput_102400 | cpu | 32 | 3276800 | 49.91 KB/s | 64.12 | 114.28 |
-| throughput_1048576 | cpu | 32 | 33554432 | 74.51 KB/s | 439.79 | 363.23 |
-| throughput_1024 | cuda | 32 | 32768 | 38.51 KB/s | 0.83 | -119.11 |
-| throughput_10240 | cuda | 32 | 327680 | 81.91 KB/s | 3.91 | 0.16 |
-| throughput_102400 | cuda | 32 | 3276800 | 89.76 KB/s | 35.65 | -0.90 |
-| throughput_1048576 | cuda | 32 | 33554432 | 93.49 KB/s | 350.51 | 147.35 |
+| throughput_1024 | cpu | 4 | 4096 | 4.59 KB/s | 0.87 | 530.94 |
+| throughput_10240 | cpu | 4 | 40960 | 30.94 KB/s | 1.29 | 72.47 |
+| throughput_102400 | cpu | 4 | 409600 | 63.78 KB/s | 6.27 | 259.42 |
+| throughput_1048576 | cpu | 4 | 4194304 | 76.91 KB/s | 53.26 | 507.34 |
+| throughput_1024 | cuda | 4 | 4096 | 18.84 KB/s | 0.21 | -318.89 |
+| throughput_10240 | cuda | 4 | 40960 | 74.77 KB/s | 0.53 | 52.31 |
+| throughput_102400 | cuda | 4 | 409600 | 72.96 KB/s | 5.48 | 78.66 |
+| throughput_1048576 | cuda | 4 | 4194304 | 88.23 KB/s | 46.42 | 357.85 |
 
 Latency is the total wall-clock time to run the benchmark loop over all samples per benchmark type, excluding the one warmup inference call that triggers JAX’s JIT compilation beforehand.
 RSS Δ (MB) is the difference in the Python process’s resident set size (RSS) measured via `psutil` immediately before and after each throughput benchmark, approximating the net change in host memory usage attributable to the model and runtime.
 
-Report generated at 2025-12-04 10:46:38
+Report generated at 2025-12-04 12:25:49
