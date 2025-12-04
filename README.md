@@ -11,7 +11,7 @@ TL;DR: How can I segment my text?
 0. install `uv`
 1. get the packages by `uv sync` and activate the venv 
 2. download the model: https://drive.google.com/file/d/1HvrDp0NOuSr_xVjzzBSxmLg8LsrKk98k/view?usp=sharing
-3. run the segment viewer: `python interactive_viewer.py --ckpt best_model.msgpack`
+3. run the segment viewer: `cd viewers` and  `uv run python interactive_viewer.py --ckpt path_to_model.msgpack`
 4. Open http://127.0.0.1:8000 or use the API: http://127.0.0.1:8000/openapi.json (if `interactive_viewer.py` is started with `--openapi`)
 
 Note that the first request takes far longer than the rest because JAX has to trace + optimize + generate device-specific code + possibly autotune + run the model.

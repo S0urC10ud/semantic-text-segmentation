@@ -4,17 +4,27 @@ version = "0.1.0"
 description = "Byte-wise HTML/CSS/JS segmentation with JAX/Flax"
 readme = "README.md"
 requires-python = "~=3.11.0"
+
 dependencies = [
     "datasets==3.6.0",      # uses map/filter/shuffle with num_proc
     "flax>=0.11.2",
     "optax>=0.2.5",
-    "numpy>=1.26",           # JAX works well with >=1.26; NumPy 2.x also fine on recent JAX
-    "pyarrow>=12",           # datasets backend
+    "numpy>=1.26",          # JAX works well with >=1.26; NumPy 2.x also fine on recent JAX
+    "pyarrow>=12",          # datasets backend
     "msgpack>=1.0.5",
-    "jax==0.7.2.dev20250913",
-    "jaxlib==0.7.2.dev20250913",
-    "jax-cuda13-pjrt==0.7.2.dev20250913",
-    "jax-cuda13-plugin==0.7.2.dev20250913",
+
+    # --- JAX setup ---
+    # Cross-platform CPU JAX:
+    #   - On all platforms, install JAX 0.8.1 (has wheels on Windows, Linux, macOS).
+    #   - jaxlib is pinned to the same version; wheels exist for win_amd64 + manylinux.
+    "jax==0.8.1",
+    "jaxlib==0.8.1",
+
+    # Extra GPU support only on Linux (CUDA 13):
+    # These wheels are Linux-only (manylinux_x86_64/aarch64), so we guard them.
+    'jax-cuda13-plugin[with-cuda]==0.8.1; platform_system == "Linux"',
+    'jax-cuda13-pjrt==0.8.1; platform_system == "Linux"',
+
     "orbax-checkpoint>=0.6.0",
     "tensorstore>=0.1.67",
     "wandb==0.21.4",
@@ -22,24 +32,22 @@ dependencies = [
     "uvicorn==0.35.0",
     "matplotlib==3.10.6",
     "magika==0.6.2",
-    "psutil==7.1.3"
+    "psutil==7.1.3",
 ]
 
 [project.optional-dependencies]
-# If you want GPU wheels via pip (requires CUDA 12 runtime/driver installed):
 gpu = [
     "jax[cuda12]>=0.4.30",
 ]
 
 [project.scripts]
-# (optional) if you want a CLI entrypoint; otherwise just run python u_net.py
 seg-train = "u_net:main"
 
 [tool.uv]
 package = true
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["."] 
 include = ["activate", "segment_viewer"]
 
 [[tool.uv.index]]
