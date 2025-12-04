@@ -1,5 +1,7 @@
 let CONFUSION = null;
 let LABELS = [];
+let ACTIVE_DATASET = null;
+let DATASET_OPTIONS = [];
 let tooltip = null;
 const DEFAULT_CELL_WIDTH = 34;
 const MIN_CELL_WIDTH = 22;
@@ -28,6 +30,83 @@ function buildMetrics(aggregates){
     span.className = 'metric';
     span.textContent = `${label}: ${(value * 100).toFixed(2)}%`;
     holder.appendChild(span);
+  });
+}
+
+function setMatrixLoading(message = 'Loading confusion matrix…'){
+  const matrixEl = el('#matrix');
+  if (!matrixEl) return;
+  matrixEl.classList.add('loading');
+  matrixEl.textContent = message;
+  if (matrixEl.previousElementSibling && matrixEl.previousElementSibling.classList.contains('matrix-note')){
+    matrixEl.previousElementSibling.remove();
+  }
+}
+
+function resetSampleView(){
+  const meta = el('#cellMeta');
+  if (meta){
+    meta.textContent = 'Select any cell to view examples.';
+  }
+  const stats = el('#sampleStats');
+  if (stats){
+    stats.innerHTML = '';
+  }
+  const palette = el('#samplePalette');
+  if (palette){
+    palette.hidden = true;
+    palette.innerHTML = '';
+  }
+  const pred = el('#samplePred');
+  if (pred){
+    pred.textContent = 'Nothing selected.';
+  }
+  const truth = el('#sampleTruth');
+  if (truth){
+    truth.textContent = 'No ground truth.';
+  }
+  const metaBox = el('#sampleMeta');
+  if (metaBox){
+    metaBox.textContent = '';
+  }
+}
+
+function updateDatasetSwitch(){
+  const holder = el('#datasetSwitch');
+  if (!holder){
+    return;
+  }
+  if (!DATASET_OPTIONS.length){
+    holder.innerHTML = '';
+    holder.style.display = 'none';
+    return;
+  }
+  holder.style.display = 'flex';
+  holder.innerHTML = '';
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = 'Dataset';
+  holder.appendChild(label);
+  DATASET_OPTIONS.forEach(option => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = option.name || option.id;
+    if (option.summary){
+      btn.title = option.summary;
+    }
+    if (option.id === ACTIVE_DATASET){
+      btn.classList.add('active');
+    }
+    if (!option.available){
+      btn.disabled = true;
+    }
+    btn.addEventListener('click', () => {
+      if (option.id === ACTIVE_DATASET || !option.available){
+        return;
+      }
+      loadDataset(option.id);
+    });
+    holder.appendChild(btn);
   });
 }
 
@@ -119,7 +198,15 @@ async function loadExample(trueId, predId){
   meta.textContent = 'Loading example…';
   setSampleLoading(true);
   try{
-    const res = await fetch(`/api/example?true_id=${trueId}&pred_id=${predId}&ts=${Date.now()}`, {
+    const params = new URLSearchParams({
+      true_id: String(trueId),
+      pred_id: String(predId),
+      ts: String(Date.now())
+    });
+    if (ACTIVE_DATASET){
+      params.set('dataset', ACTIVE_DATASET);
+    }
+    const res = await fetch(`/api/example?${params.toString()}`, {
       cache: 'no-store'
     });
     if (!res.ok){
@@ -315,29 +402,66 @@ function applyWrapIndicator(container){
   container.classList.add('wrapped');
 }
 
-async function init(){
+async function loadDataset(requestedId){
+  if (requestedId){
+    ACTIVE_DATASET = requestedId;
+  }
+  setMatrixLoading('Loading confusion matrix…');
+  resetSampleView();
+  const meta = el('#cellMeta');
+  if (meta){
+    meta.textContent = 'Loading dataset…';
+  }
+  setSampleLoading(true);
   try{
-    const res = await fetch('/api/confusion');
+    const params = new URLSearchParams();
+    if (ACTIVE_DATASET){
+      params.set('dataset', ACTIVE_DATASET);
+    }
+    const query = params.toString();
+    const res = await fetch(`/api/confusion${query ? `?${query}` : ''}`, {
+      cache: 'no-store'
+    });
     if (!res.ok){
       const err = await res.json().catch(()=>({}));
       throw new Error(err.detail || `Request failed (${res.status})`);
     }
     const data = await res.json();
     CONFUSION = data;
-    LABELS = data.labels;
+    LABELS = data.labels || [];
+    ACTIVE_DATASET = data.dataset || ACTIVE_DATASET;
+    DATASET_OPTIONS = Array.isArray(data.datasets) ? data.datasets : [];
+    updateDatasetSwitch();
     el('#deviceLabel').textContent = data.device || 'Device n/a';
-    el('#sampleCount').textContent = `${data.total_windows || 0} windows`;
+    const summary = data.summary || `${data.total_windows || 0} windows`;
+    el('#sampleCount').textContent = summary;
     buildMetrics(data.aggregates);
     renderMatrix(data);
-    setSampleLoading(false);
   }catch(err){
+    CONFUSION = null;
     const matrixEl = el('#matrix');
-    matrixEl.classList.remove('loading');
-    matrixEl.textContent = `Failed to load confusion data: ${err.message}`;
+    if (matrixEl){
+      matrixEl.classList.remove('loading');
+      matrixEl.textContent = `Failed to load confusion data: ${err.message}`;
+    }
+    const metaBox = el('#cellMeta');
+    if (metaBox){
+      metaBox.textContent = 'Failed to load dataset.';
+    }
+  }finally{
+    setSampleLoading(false);
   }
 }
 
-window.addEventListener('DOMContentLoaded', init);
+async function init(){
+  setMatrixLoading();
+  resetSampleView();
+  await loadDataset();
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  init();
+});
 let resizeTimer = null;
 window.addEventListener('resize', () => {
   if (!CONFUSION){

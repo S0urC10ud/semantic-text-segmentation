@@ -2,7 +2,8 @@
 """Comprehensive evaluation harness for the labeling model.
 
 The script expects evaluation datasets produced by ``obtain_eval_dataset.py``
-and runs a battery of benchmarks (outputs visible in report.md)
+from the monitor set (Gemini segmentations + Arrow monitor) and runs a battery
+of benchmarks (outputs visible in report.md)
 
 Example:
 python evaluation.py \
@@ -61,10 +62,10 @@ import flax.serialization as serialization  # noqa: E402
 from flax.errors import ScopeParamShapeError  # noqa: E402
 import orbax.checkpoint as ocp  # noqa: E402
 
-from train import config as cfg  # noqa: E402
-from train.model import UNet1D  # noqa: E402
-from train.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
-from train.metrics_helper import compute_metrics_from_confusion  # noqa: E402
+import utils.config as cfg  # noqa: E402
+from utils.model import UNet1D  # noqa: E402
+from utils.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
+from utils.metrics_helper import compute_metrics_from_confusion  # noqa: E402
 
 DEFAULT_CHUNK_SIZE = cfg.MODEL_WINDOW_BYTES
 
@@ -664,12 +665,97 @@ def _markdown_stat_group() -> Dict[str, Any]:
         "correct_chars": 0,
         "nontext_chars": 0,
         "text_chars": 0,
+        "union_correct_chars": 0,
+        "union_nontext_chars": 0,
+        "union_text_chars": 0,
         "iou_sum": 0.0,
         "nontext_iou_sum": 0.0,
         "text_iou_sum": 0.0,
         "wrong_label_cases": 0,
         "wrong_label_fooled": 0,
     }
+
+
+def _infer_markdown_host_lang(blocks: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    """Heuristically infer the dominant 'host' code language in a markdown doc.
+
+    For monitor-derived markdown documents we only know that a document is
+    markdown plus the per-span code labels. To recover host/other semantics
+    similar to the synthetic markdown_mix builder, we treat the language with
+    the largest total span (in characters) as the host language.
+    """
+    totals: Dict[str, int] = {}
+    for block in blocks:
+        lang = str(block.get("language") or "")
+        if not lang:
+            continue
+        try:
+            start = int(block.get("char_start", 0))
+            end = int(block.get("char_end", start))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        totals[lang] = totals.get(lang, 0) + (end - start)
+    if not totals:
+        return None
+    return max(totals.items(), key=lambda kv: kv[1])[0]
+
+
+def _is_fenced_markdown_block(content: str, start: int, end: int) -> bool:
+    """Best-effort detection of ``` fenced code blocks around a segment.
+
+    The monitor-based markdown_mix dataset only records the code spans, not the
+    surrounding fences. We reconstruct a 'wrapped' signal by looking for an
+    opening fence line (```[lang]) immediately before the block and a closing
+    fence (```) after it, both starting at the beginning of a line (ignoring
+    whitespace). This intentionally errs on the side of requiring a clear
+    fence structure rather than trying to be perfect.
+    """
+    try:
+        length = len(content)
+    except Exception:
+        return False
+    if length <= 0:
+        return False
+
+    start = max(0, min(length, int(start)))
+    end = max(start, min(length, int(end)))
+    if end <= start:
+        return False
+
+    # Look for an opening fence somewhere before the block.
+    fence_idx = content.rfind("```", 0, start)
+    if fence_idx == -1:
+        return False
+    fence_line_start = content.rfind("\n", 0, fence_idx)
+    if fence_line_start == -1:
+        fence_line_start = 0
+    else:
+        fence_line_start += 1
+    fence_line_end = content.find("\n", fence_idx, start)
+    if fence_line_end == -1 or fence_line_end > start:
+        return False
+    fence_line = content[fence_line_start:fence_line_end]
+    # Require the fence to be the first non-whitespace token on the line.
+    stripped = fence_line.lstrip()
+    if not stripped.startswith("```"):
+        return False
+
+    # Look for a closing fence after the block.
+    closing_idx = content.find("```", end)
+    if closing_idx == -1:
+        return False
+    close_line_start = content.rfind("\n", 0, closing_idx)
+    if close_line_start == -1:
+        close_line_start = 0
+    else:
+        close_line_start += 1
+    close_prefix = content[close_line_start:closing_idx]
+    if any(not ch.isspace() for ch in close_prefix):
+        return False
+
+    return True
 
 
 def _safe_ratio(numerator: float, denominator: float) -> Optional[float]:
@@ -866,6 +952,9 @@ def evaluate_task(
                 "correct_chars": 0,
                 "nontext_chars": 0,
                 "text_chars": 0,
+                "union_correct_chars": 0,
+                "union_nontext_chars": 0,
+                "union_text_chars": 0,
                 "by_wrapper": {},
                 "correct_iou_hits": 0,
                 "nontext_iou_hits": 0,
@@ -1083,6 +1172,11 @@ def evaluate_task(
                     text_stats["samples"] += 1
 
             blocks_meta = metadata.get("markdown_blocks") or []
+            is_monitor_markdown = bool(metadata.get("monitor_source"))
+            inferred_host_lang: Optional[str] = None
+            if is_monitor_markdown and blocks_meta:
+                inferred_host_lang = _infer_markdown_host_lang(blocks_meta)
+
             for block in blocks_meta:
                 start = int(block.get("char_start", 0))
                 end = int(block.get("char_end", start))
@@ -1120,11 +1214,27 @@ def evaluate_task(
                 correct_iou = intersection_correct / union_correct if union_correct > 0 else 0.0
                 nontext_iou = intersection_nontext / union_nontext if union_nontext > 0 else 0.0
                 text_iou = intersection_text / union_text if union_text > 0 else 0.0
+
                 correct_chars = intersection_correct
                 nontext_chars = intersection_nontext
                 text_chars = intersection_text
-                wrapper_key = "wrapped" if block.get("wrapped") else "plain"
-                role = block.get("role", "host")
+
+                # Recover wrapper/role semantics for monitor-based markdown docs.
+                wrapped_flag = bool(block.get("wrapped"))
+                if is_monitor_markdown and not wrapped_flag:
+                    if _is_fenced_markdown_block(content, start, end):
+                        wrapped_flag = True
+                wrapper_key = "wrapped" if wrapped_flag else "plain"
+
+                role = block.get("role")
+                if is_monitor_markdown:
+                    if inferred_host_lang and actual_label == inferred_host_lang:
+                        role = "host"
+                    else:
+                        role = "other"
+                if role not in ("host", "other"):
+                    role = "host"
+
                 role_groups = markdown_stats["roles"].setdefault(
                     role,
                     {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
@@ -1141,6 +1251,9 @@ def evaluate_task(
                     group["correct_chars"] += correct_chars
                     group["nontext_chars"] += nontext_chars
                     group["text_chars"] += text_chars
+                    group["union_correct_chars"] += union_correct
+                    group["union_nontext_chars"] += union_nontext
+                    group["union_text_chars"] += union_text
                     if math.isfinite(correct_iou):
                         group["iou_sum"] += correct_iou
                     group["nontext_iou_sum"] += nontext_iou
@@ -1222,6 +1335,9 @@ def evaluate_task(
                 inline_stats["correct_chars"] += correct_chars
                 inline_stats["nontext_chars"] += nontext_chars
                 inline_stats["text_chars"] += text_chars
+                inline_stats["union_correct_chars"] += union_correct
+                inline_stats["union_nontext_chars"] += union_nontext
+                inline_stats["union_text_chars"] += union_text
                 inline_stats.setdefault("correct_iou_sum", 0.0)
                 inline_stats.setdefault("nontext_iou_sum", 0.0)
                 inline_stats.setdefault("text_iou_sum", 0.0)
@@ -1240,6 +1356,9 @@ def evaluate_task(
                         "correct_chars": 0,
                         "nontext_chars": 0,
                         "text_chars": 0,
+                        "union_correct_chars": 0,
+                        "union_nontext_chars": 0,
+                        "union_text_chars": 0,
                         "correct_iou_sum": 0.0,
                         "nontext_iou_sum": 0.0,
                         "text_iou_sum": 0.0,
@@ -1253,6 +1372,9 @@ def evaluate_task(
                 wrapper_entry["correct_chars"] += correct_chars
                 wrapper_entry["nontext_chars"] += nontext_chars
                 wrapper_entry["text_chars"] += text_chars
+                wrapper_entry["union_correct_chars"] += union_correct
+                wrapper_entry["union_nontext_chars"] += union_nontext
+                wrapper_entry["union_text_chars"] += union_text
                 wrapper_entry["correct_iou_sum"] += correct_iou
                 wrapper_entry["nontext_iou_sum"] += nontext_iou
                 wrapper_entry["text_iou_sum"] += text_iou
@@ -1285,6 +1407,9 @@ def evaluate_task(
                         "correct_chars": 0,
                         "nontext_chars": 0,
                         "text_chars": 0,
+                        "union_correct_chars": 0,
+                        "union_nontext_chars": 0,
+                        "union_text_chars": 0,
                         "correct_iou_sum": 0.0,
                         "nontext_iou_sum": 0.0,
                         "text_iou_sum": 0.0,
@@ -1298,6 +1423,9 @@ def evaluate_task(
                 lang_inline["correct_chars"] += correct_chars
                 lang_inline["nontext_chars"] += nontext_chars
                 lang_inline["text_chars"] += text_chars
+                lang_inline["union_correct_chars"] += union_correct
+                lang_inline["union_nontext_chars"] += union_nontext
+                lang_inline["union_text_chars"] += union_text
                 lang_inline["correct_iou_sum"] += correct_iou
                 lang_inline["nontext_iou_sum"] += nontext_iou
                 lang_inline["text_iou_sum"] += text_iou
@@ -1873,8 +2001,10 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
             correct_chars = int(group.get("correct_chars", 0))
             nontext_cov = _format_pct(_safe_ratio(nontext_chars, truth_chars))
             correct_cov = _format_pct(_safe_ratio(correct_chars, truth_chars))
-            nontext_avg_iou = _format_float(_safe_ratio(group.get("nontext_iou_sum", 0.0), count))
-            correct_avg_iou = _format_float(_safe_ratio(group.get("iou_sum", 0.0), count))
+            nontext_union = int(group.get("union_nontext_chars", 0))
+            correct_union = int(group.get("union_correct_chars", 0))
+            nontext_avg_iou = _format_float(_safe_ratio(nontext_chars, nontext_union))
+            correct_avg_iou = _format_float(_safe_ratio(correct_chars, correct_union))
             return (
                 f"| {name} | {_format_hits(nontext_cov_hits, count)} | {_format_hits(nontext_iou_hits, count)} | "
                 f"{nontext_cov} | {nontext_avg_iou} | {_format_hits(text_hits, count)} | "
@@ -1902,8 +2032,8 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
                 "truth_chars": inline_stats.get("truth_chars", 0),
                 "nontext_chars": inline_stats.get("nontext_chars", 0),
                 "correct_chars": inline_stats.get("correct_chars", 0),
-                "nontext_iou_sum": inline_stats.get("nontext_iou_sum", 0.0),
-                "iou_sum": inline_stats.get("correct_iou_sum", 0.0),
+                "union_nontext_chars": inline_stats.get("union_nontext_chars", 0),
+                "union_correct_chars": inline_stats.get("union_correct_chars", 0),
             }
             wrapper_table.append(_wrapper_row(MARKDOWN_INLINE_LABEL, inline_group))
 
@@ -1926,9 +2056,10 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
                 group = roles.get(role_key, {}).get(wrapper_key, {})
                 count = int(group.get("count", 0))
                 hits = int(group.get("detected_correct", 0))
-                avg_iou = _safe_ratio(group.get("iou_sum", 0.0), count)
                 truth_chars = int(group.get("truth_chars", 0))
                 correct_chars = int(group.get("correct_chars", 0))
+                union_correct = int(group.get("union_correct_chars", 0))
+                avg_iou = _safe_ratio(correct_chars, union_correct)
                 coverage = _format_pct(_safe_ratio(correct_chars, truth_chars))
                 summary_table.append(
                     f"| {role_label} {wrapper_label} IoU ≥50% | {_format_hits(hits, count)} hits, mean IoU {_format_float(avg_iou)}, coverage {coverage} |"
@@ -2015,11 +2146,13 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
 
 
 def _render_throughput_table(results: List[ThroughputResult]) -> str:
-    lines = ["| Task | Device | Samples | Total Bytes | Throughput | Latency (s) | RSS Δ (MB) | Device Δ (MB) |",
-             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    lines = [
+        "| Task | Device | Samples | Total Bytes | Throughput | Latency (s) | RSS Δ (MB) |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
     for res in results:
         lines.append(
-            "| {task} | {device} | {samples} | {bytes} | {through} | {lat:.2f} | {rss} | {dev} |".format(
+            "| {task} | {device} | {samples} | {bytes} | {through} | {lat:.2f} | {rss} |".format(
                 task=res.task,
                 device=res.device,
                 samples=res.samples,
@@ -2027,9 +2160,19 @@ def _render_throughput_table(results: List[ThroughputResult]) -> str:
                 through=_format_bytes_per_sec(res.throughput),
                 lat=res.elapsed,
                 rss="n/a" if res.rss_delta is None else f"{res.rss_delta:.2f}",
-                dev="n/a" if res.device_mem_delta is None else f"{res.device_mem_delta:.2f}",
             )
         )
+    lines.append("")
+    lines.append(
+        "Latency is the total wall-clock time to run the benchmark loop over all samples "
+        "per benchmark type, excluding the one warmup inference call that triggers JAX’s "
+        "JIT compilation beforehand."
+    )
+    lines.append(
+        "RSS Δ (MB) is the difference in the Python process’s resident set size (RSS) "
+        "measured via `psutil` immediately before and after each throughput benchmark, "
+        "approximating the net change in host memory usage attributable to the model and runtime."
+    )
     return "\n".join(lines)
 
 
@@ -2565,8 +2708,12 @@ def write_report(
                 truth_chars = int(group.get("truth_chars", 0))
                 nontext_cov = _format_pct(_safe_ratio(int(group.get("nontext_chars", 0)), truth_chars))
                 correct_cov = _format_pct(_safe_ratio(int(group.get("correct_chars", 0)), truth_chars))
-                nontext_avg_iou = _format_float(_safe_ratio(group.get("nontext_iou_sum", 0.0), count))
-                correct_avg_iou = _format_float(_safe_ratio(group.get("iou_sum", 0.0), count))
+                nontext_union = int(group.get("union_nontext_chars", 0))
+                correct_union = int(group.get("union_correct_chars", 0))
+                nontext_chars = int(group.get("nontext_chars", 0))
+                correct_chars = int(group.get("correct_chars", 0))
+                nontext_avg_iou = _format_float(_safe_ratio(nontext_chars, nontext_union))
+                correct_avg_iou = _format_float(_safe_ratio(correct_chars, correct_union))
                 nontext_cov_hits = _format_hits(int(group.get("detected_nontext", 0)), count)
                 nontext_iou_hits = _format_hits(int(group.get("detected_nontext_iou", 0)), count)
                 text_hits = _format_hits(int(group.get("detected_text", 0)), count)
@@ -2593,8 +2740,8 @@ def write_report(
                     "truth_chars": inline_stats.get("truth_chars", 0),
                     "nontext_chars": inline_stats.get("nontext_chars", 0),
                     "correct_chars": inline_stats.get("correct_chars", 0),
-                    "nontext_iou_sum": inline_stats.get("nontext_iou_sum", 0.0),
-                    "iou_sum": inline_stats.get("correct_iou_sum", 0.0),
+                    "union_nontext_chars": inline_stats.get("union_nontext_chars", 0),
+                    "union_correct_chars": inline_stats.get("union_correct_chars", 0),
                 }
                 _emit_wrapper_row(MARKDOWN_INLINE_LABEL, inline_group)
             text_truth = int(markdown_stats.get("text", {}).get("truth_chars", 0))
@@ -2646,11 +2793,30 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--max-samples", type=int, default=2000, help="Maximum samples per accuracy task (0 = all).")
     parser.add_argument("--sample-seed", type=int, default=13, help="Seed for subsampling large datasets.")
     parser.add_argument("--log-interval", type=int, default=250, help="Progress logging interval (in samples).")
+    parser.add_argument(
+        "--fine-tuned",
+        action="store_true",
+        default=False,
+        help=(
+            "When set and --data-root is not overridden, evaluate against a "
+            "separate fine-tune holdout dataset root (evaluation/data_b)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    # For fine-tuned models, optionally redirect to a separate evaluation
+    # dataset root (e.g., built from monitor_preprocessed_b) unless the user
+    # has explicitly chosen a custom --data-root.
+    default_eval_root = (REPO_ROOT / "evaluation" / "data").resolve()
+    fine_tune_eval_root = (REPO_ROOT / "evaluation" / "data_b").resolve()
+    if getattr(args, "fine_tuned", False):
+        if Path(args.data_root).resolve() == default_eval_root:
+            args.data_root = str(fine_tune_eval_root)
+            print(f"ℹ️  Fine-tuned mode: using evaluation data root {args.data_root}", flush=True)
+
     data_root = Path(args.data_root).resolve()
     manifest_path = Path(args.manifest) if args.manifest else data_root / "manifest.json"
     overall_start = time.perf_counter()

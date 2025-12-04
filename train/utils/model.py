@@ -2,19 +2,19 @@
 The 1D U-Net model architecture and training-related utilities like the
 TrainState, loss functions, and train/eval steps.
 """
-from typing import Tuple, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
+
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import optax
+import utils.config as cfg
 from flax import linen as nn
 from flax.training import train_state
 
-import config as cfg
-
 if TYPE_CHECKING:
-    from config import TrainConfig
+    from utils.config import TrainConfig
 
 # ---------------------------
 # Model: 1D U-Net
@@ -118,23 +118,65 @@ def create_train_state(rng, cfg: "TrainConfig", num_classes: int):
     )
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
-@jax.jit
-def cross_entropy_masked(logits: jnp.ndarray, labels: jnp.ndarray, pad_id: Optional[int] = None) -> jnp.ndarray:
+def _ignored_token_mask(tokens: Optional[jnp.ndarray]) -> Optional[jnp.ndarray]:
+    if tokens is None:
+        return None
+    ignore_vals = getattr(cfg, "IGNORED_TRAINING_TOKEN_IDS", ())
+    if not ignore_vals:
+        return jnp.zeros_like(tokens, dtype=jnp.bool_)
+    mask = jnp.zeros_like(tokens, dtype=jnp.bool_)
+    for val in ignore_vals:
+        mask = jnp.logical_or(mask, tokens == int(val))
+    return mask
+
+
+def _supervision_mask(
+    labels: jnp.ndarray,
+    tokens: Optional[jnp.ndarray],
+    pad_id: Optional[int] = None,
+) -> jnp.ndarray:
     if pad_id is None:
         pad_id = cfg.PAD_ID
-    mask = (labels != pad_id)
+    # Treat any labels mapped to the derived "other" bucket as padding so
+    # they do not contribute to loss/accuracy during training. This keeps
+    # supervision aligned with the model's explicit logits and avoids NaNs
+    # when fine-tuning on monitor sets that include an 'other' label.
+    other_idx = getattr(cfg, "OTHER_CLASS_INDEX", None)
+    if other_idx is not None:
+        labels = jnp.where(labels == int(other_idx), pad_id, labels)
+    mask = labels != pad_id
+    ignore_mask = _ignored_token_mask(tokens) if tokens is not None else None
+    if ignore_mask is not None:
+        mask = jnp.logical_and(mask, jnp.logical_not(ignore_mask))
+    return mask
+
+
+@jax.jit
+def cross_entropy_masked(
+    logits: jnp.ndarray,
+    labels: jnp.ndarray,
+    tokens: Optional[jnp.ndarray] = None,
+    pad_id: Optional[int] = None,
+) -> jnp.ndarray:
+    mask = _supervision_mask(labels, tokens, pad_id)
     safe_labels = jnp.where(mask, labels, 0)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, safe_labels.astype(jnp.int32))
+    loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits, safe_labels.astype(jnp.int32)
+    )
     loss = loss * mask.astype(loss.dtype)
     denom = jnp.maximum(1, jnp.sum(mask))
     return jnp.sum(loss) / denom
 
+
 @jax.jit
-def accuracy_masked(logits: jnp.ndarray, labels: jnp.ndarray, pad_id: Optional[int] = None) -> jnp.ndarray:
-    if pad_id is None:
-        pad_id = cfg.PAD_ID
+def accuracy_masked(
+    logits: jnp.ndarray,
+    labels: jnp.ndarray,
+    tokens: Optional[jnp.ndarray] = None,
+    pad_id: Optional[int] = None,
+) -> jnp.ndarray:
+    mask = _supervision_mask(labels, tokens, pad_id)
     pred = jnp.argmax(logits, axis=-1).astype(labels.dtype)
-    mask = (labels != pad_id)
     correct = jnp.sum(jnp.logical_and(pred == labels, mask).astype(jnp.int32))
     total = jnp.maximum(1, jnp.sum(mask.astype(jnp.int32)))
     return (correct / total).astype(jnp.float32)
@@ -150,11 +192,11 @@ def train_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.n
             train=True,
             rngs={"dropout": dropout_rng}
         )
-        loss = cross_entropy_masked(logits, batch_labels)
+        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
         return loss, logits
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    acc = accuracy_masked(logits, batch_labels)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return state, loss, acc
 
 def train_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.ndarray, rng):
@@ -167,11 +209,11 @@ def train_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, batch_labels
             train=True,
             rngs={"dropout": dropout_rng}
         )
-        loss = cross_entropy_masked(logits, batch_labels)
+        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
         return loss, logits
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    acc = accuracy_masked(logits, batch_labels)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return state, loss, acc
 
 @jax.jit
@@ -186,11 +228,10 @@ def microbatch_grad_step(state: TrainState, batch_tokens: jnp.ndarray, batch_lab
             train=True,
             rngs={"dropout": dropout_rng},
         )
-        loss = cross_entropy_masked(logits, batch_labels)
+        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
         return loss, logits
-
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    acc = accuracy_masked(logits, batch_labels)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return grads, loss, acc
 
 
@@ -205,11 +246,11 @@ def microbatch_grad_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, ba
             train=True,
             rngs={"dropout": dropout_rng},
         )
-        loss = cross_entropy_masked(logits, batch_labels)
+        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
         return loss, logits
 
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-    acc = accuracy_masked(logits, batch_labels)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return grads, loss, acc
 
 
@@ -226,6 +267,6 @@ def eval_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.nd
         train=False,
         rngs={"dropout": rng}
     )
-    loss = cross_entropy_masked(logits, batch_labels)
-    acc = accuracy_masked(logits, batch_labels)
+    loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return loss, acc

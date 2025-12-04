@@ -501,6 +501,9 @@ _SCRIPT_STYLE_OPEN_RE = re.compile(r"(?is)<\s*(script|style)\b[^>]*>")
 _SCRIPT_STYLE_CLOSE_RE = re.compile(r"(?is)</\s*(script|style)\s*>")
 _FRAMEWORK_KEYWORDS_RE = re.compile(r"(?i)\b(angular|react|svelte|vue)\b")
 
+_SVG_STYLE_BLOCK_RE = re.compile(r"(?is)<\s*style\b[^>]*>.*?</\s*style\s*>")
+_SVG_STYLE_SELF_CLOSE_RE = re.compile(r"(?is)<\s*style\b[^>]*/>")
+
 _DANGEROUS_URI_ATTRS = {"href", "src", "xlink:href", "formaction", "action", "data", "poster"}
 
 
@@ -650,6 +653,155 @@ def strip_html_script_and_style(text: str) -> str:
     cleaned = _SCRIPT_STYLE_OPEN_RE.sub("", cleaned)
     cleaned = _SCRIPT_STYLE_CLOSE_RE.sub("", cleaned)
     return cleaned
+
+
+def strip_svg_style_tags(text: str) -> str:
+    """
+    Remove CSS <style> blocks from SVG content.
+    """
+    if not text:
+        return ""
+    current = text
+    prev = None
+    while prev != current:
+        prev = current
+        current = _SVG_STYLE_BLOCK_RE.sub("", current)
+    current = _SVG_STYLE_SELF_CLOSE_RE.sub("", current)
+    return current
+
+
+_MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+?)`(?!`)")
+_HTML_TAG_RE = re.compile(r"</?[^>\s]+(?:\s+[^<>]*)?>", re.IGNORECASE)
+_RST_CODE_DIRECTIVE_RE = re.compile(r"^\s*\.\.\s+code(?:-block)?::", re.IGNORECASE)
+
+
+def _leading_whitespace_width(text: str) -> int:
+    stripped = text.lstrip(" \t")
+    return len(text) - len(stripped)
+
+
+def _markdown_fence_details(stripped_line: str) -> Optional[Tuple[str, int]]:
+    if not stripped_line:
+        return None
+    leader = stripped_line[0]
+    if leader not in ("`", "~"):
+        return None
+    count = 0
+    for ch in stripped_line:
+        if ch == leader:
+            count += 1
+        else:
+            break
+    if count >= 3:
+        return leader, count
+    return None
+
+
+def _strip_markdown_fenced_blocks(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    out: List[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    for line in lines:
+        stripped = line.lstrip()
+        fence_info = _markdown_fence_details(stripped)
+        if not in_fence and fence_info:
+            in_fence = True
+            fence_char, fence_len = fence_info
+            out.append(line)
+            continue
+        if in_fence:
+            if fence_info and fence_info[0] == fence_char and fence_info[1] >= fence_len:
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+                out.append(line)
+            # drop everything between fences
+            continue
+        out.append(line)
+
+    return "".join(out)
+
+
+def clean_markdown_text(text: str) -> str:
+    if not text:
+        return ""
+    stripped = _strip_markdown_fenced_blocks(text)
+    without_tags = _HTML_TAG_RE.sub("", stripped)
+    cleaned = _MARKDOWN_INLINE_CODE_RE.sub("``", without_tags)
+    return cleaned
+
+
+def clean_restructuredtext(text: str) -> str:
+    if not text:
+        return ""
+    lines = text.splitlines(keepends=True)
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        indent = _leading_whitespace_width(line)
+        stripped_r = line.rstrip("\r\n")
+
+        is_code_directive = bool(_RST_CODE_DIRECTIVE_RE.match(stripped_r))
+        is_literal_block = (
+            bool(stripped)
+            and stripped.endswith("::")
+            and not stripped.endswith(":::")
+            and not stripped.lstrip().startswith("..")
+        )
+
+        if is_code_directive or is_literal_block:
+            out.append(line)
+            i += 1
+
+            if is_code_directive:
+                while i < n:
+                    opt_line = lines[i]
+                    opt_stripped = opt_line.strip()
+                    opt_indent = _leading_whitespace_width(opt_line)
+                    if opt_stripped.startswith(":") and opt_indent > indent:
+                        out.append(opt_line)
+                        i += 1
+                    else:
+                        break
+
+            if i < n and lines[i].strip() == "":
+                out.append(lines[i])
+                i += 1
+
+            block_indent: Optional[int] = None
+            while i < n:
+                block_line = lines[i]
+                block_stripped = block_line.strip()
+                current_indent = _leading_whitespace_width(block_line)
+
+                if block_stripped == "":
+                    i += 1
+                    continue
+
+                if block_indent is None:
+                    if current_indent > indent:
+                        block_indent = current_indent
+                        i += 1
+                        continue
+                    break
+
+                if current_indent >= block_indent:
+                    i += 1
+                    continue
+                break
+            continue
+
+        out.append(line)
+        i += 1
+
+    return "".join(out)
 
 # Placeholder for any character outside ASCII range (0–127).
 NON_ASCII_PLACEHOLDER = "\u00A4"  # displayed sentinel (¤) for non-ASCII content
@@ -1939,6 +2091,21 @@ def gen_windows_for_label(
             content_filtered = strip_html_script_and_style(raw_text)
             if _FRAMEWORK_KEYWORDS_RE.search(content_filtered):
                 continue
+            if not content_filtered.strip():
+                continue
+        elif lbl_canon == "markdown":
+            content_filtered = clean_markdown_text(raw_text)
+            if not content_filtered.strip():
+                continue
+        elif lbl_canon == "restructuredtext":
+            content_filtered = clean_restructuredtext(raw_text)
+            if not content_filtered.strip():
+                continue
+        elif lbl_canon == "svg":
+            # For training/validation windows, strip embedded CSS style blocks
+            # from SVG content before windowing. Raw monitor/test files are
+            # produced via gen_raw_files_for_label and remain untouched.
+            content_filtered = strip_svg_style_tags(raw_text)
             if not content_filtered.strip():
                 continue
         else:

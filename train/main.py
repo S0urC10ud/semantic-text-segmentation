@@ -3,6 +3,7 @@ import os
 import random
 import sys
 import time
+from pathlib import Path
 from typing import Dict, Tuple, TYPE_CHECKING
 
 # Unbuffered/stdout-friendly logs
@@ -37,10 +38,13 @@ from wandb import Settings
 jax.config.update("jax_disable_jit", False)
 jax.config.update("jax_enable_x64", False)
 
-import config as cfg
-from data_utils import prepare_dsets_by_lang_with_splits, LANG_ALIASES
-from window_generator import make_training_window, make_training_window_with_metadata
-from model import (
+import utils.config as cfg
+from utils.data import prepare_dsets_by_lang_with_splits, LANG_ALIASES
+from utils.window_generator import (
+    make_training_window,
+    make_training_window_with_metadata,
+)
+from utils.model import (
     create_train_state,
     train_step,
     eval_step,
@@ -51,18 +55,19 @@ from model import (
     microbatch_grad_step_no_jit,
     grad_global_norm,
 )
-from preview import build_preview_html
+from utils.preview import build_preview_html
 
-from metrics_helper import (
+from utils.metrics_helper import (
     evaluate_split_with_metrics,
     compute_metrics_from_confusion,
     print_metrics_table,
     wandb_log_metrics,
 )
-from token_utils import sanitize_tokens
+from utils.monitor_eval import load_monitor_memmaps, evaluate_monitor_set
+from utils.token_utils import sanitize_tokens
 
 if TYPE_CHECKING:
-    from config import DataConfig, TrainConfig
+    from utils.config import DataConfig, TrainConfig
 
 import signal
 
@@ -167,17 +172,22 @@ def main():
     parser.add_argument(
         "--data_root", type=str, default="../downloader/arrow_out"
     )
-    parser.add_argument("--allow_hf_fallback", action="store_true", default=False)
     parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     # 4KB fixed windows by default
     parser.add_argument("--bucket_step", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_minutes", type=int, default=0)
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
     parser.add_argument("--dont_use_train_windows", action="store_true", default=False,
                       help="Use train directory instead of train_windows for training data")
+    parser.add_argument(
+        "--language_pair_prob",
+        type=float,
+        default=None,
+        help="Probability of enabling curated language pair mixing/transitivity (0 disables, default).",
+    )
     parser.add_argument(
         "--lang",
         dest="langs",
@@ -192,8 +202,8 @@ def main():
     parser.add_argument("--prune_delta", type=float, default=0.000001)
 
     # Train args
-    parser.add_argument("--steps", type=int, default=20000)
-    parser.add_argument("--lr", type=float, default=4e-4)
+    parser.add_argument("--steps", type=int, default=2_000_000)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--accum_steps", type=int, default=1)
@@ -201,8 +211,70 @@ def main():
     parser.add_argument("--channels", type=str, default="32,64,64,128,128,128,128,256")
     parser.add_argument("--dropout_rate", type=float, default=0.15)
     parser.add_argument("--log_every", type=int, default=50)
-    parser.add_argument("--eval_every", type=int, default=250)
+    parser.add_argument("--eval_every", type=int, default=2000)
+    parser.add_argument(
+        "--monitor_eval_every",
+        type=int,
+        default=-1,
+        help="Run monitor validation every N steps (0 disables, -1 = match --eval_every)",
+    )
+    parser.add_argument(
+        "--monitor_eval_limit",
+        type=int,
+        default=4096,
+        help="Max monitor files to sample per monitor eval (-1 = use all files; be careful, this is slow).",
+    )
+    parser.add_argument(
+        "--monitor_eval_root",
+        type=str,
+        default="../downloader/monitor_preprocessed",
+        help="Path to downloader/monitor_preprocessed (output of 999_prepare_monitor_set.py).",
+    )
+    parser.add_argument(
+        "--monitor_other_threshold",
+        type=float,
+        default=0.3,
+        help="If >0, route monitor predictions with max softmax below this threshold to 'other'.",
+    )
     parser.add_argument("--ckpt_path", type=str, default="auto")
+    parser.add_argument(
+        "--continue",
+        dest="continue_run_id",
+        type=str,
+        default="",
+        help="Resume from an existing W&B run id (reuses its checkpoint and W&B run).",
+    )
+    parser.add_argument(
+        "--fine-tune",
+        dest="fine_tune",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="RUNID-STEP",
+        help=(
+            "Enable fine-tuning from a pre-existing W&B run. "
+            "Optionally specify 'RUNID-STEP' (e.g. fkbz80vt-468000) to "
+            "load a specific checkpoint step from checkpoints/sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--fine_tune_run_id",
+        type=str,
+        default="",
+        help="Source W&B run id to load the checkpoint from when --fine-tune is set and not resuming a fine-tune run.",
+    )
+    parser.add_argument(
+        "--fine_tune_train_root",
+        type=str,
+        default="../downloader/monitor_preprocessed_a",
+        help="Root directory for the fine-tune training memmap (monitor_preprocessed_a).",
+    )
+    parser.add_argument(
+        "--fine_tune_val_root",
+        type=str,
+        default="../downloader/monitor_preprocessed_b",
+        help="Root directory for the fine-tune validation/monitor memmap (monitor_preprocessed_b).",
+    )
     parser.add_argument("--sweep_id", type=str, default="")
     parser.add_argument("--no_jit", action="store_true")
     parser.add_argument("--preview_only", action="store_true")
@@ -210,6 +282,48 @@ def main():
     parser.add_argument("--preview_count", type=int, default=10)
 
     args = parser.parse_args()
+
+    # Interpret --fine-tune argument (optional RUNID-STEP shorthand).
+    fine_tune_raw = getattr(args, "fine_tune", None)
+    fine_tune_run_id = getattr(args, "fine_tune_run_id", "")
+    fine_tune_step = None
+    if isinstance(fine_tune_raw, str):
+        if fine_tune_raw:
+            # Expect RUNID-STEP (e.g., fkbz80vt-468000)
+            if "-" in fine_tune_raw:
+                run_part, step_part = fine_tune_raw.rsplit("-", 1)
+                if run_part:
+                    fine_tune_run_id = run_part
+                try:
+                    fine_tune_step = int(step_part)
+                except ValueError:
+                    raise ValueError(
+                        "--fine-tune argument must be of the form RUNID-STEP, "
+                        "e.g. fkbz80vt-468000"
+                    )
+            else:
+                # Treat as run id only, no explicit step
+                fine_tune_run_id = fine_tune_raw
+        else:
+            # '--fine-tune' present without RUNID-STEP; rely on --fine_tune_run_id
+            pass
+    fine_tune_enabled = (fine_tune_raw is not None) or bool(fine_tune_run_id)
+    args.fine_tune = fine_tune_enabled
+    args.fine_tune_run_id = fine_tune_run_id
+    args.fine_tune_step = fine_tune_step
+
+    # Resolve learning rate depending on mode if not explicitly provided.
+    if args.lr is None:
+        # Use a smaller default LR for fine-tuning.
+        args.lr = 3e-5 if args.fine_tune else 1e-3
+
+    if args.fine_tune and not args.continue_run_id:
+        # For a fresh fine-tune run we require a source W&B run id.
+        if not args.fine_tune_run_id:
+            raise ValueError(
+                "--fine-tune requires either RUNID-STEP or --fine_tune_run_id "
+                "when not resuming with --continue."
+            )
 
     if args.accum_steps < 1:
         raise ValueError("--accum_steps must be >= 1")
@@ -250,13 +364,24 @@ def main():
     # Build configs
     d_cfg = cfg.DataConfig(
         data_root=args.data_root,
-        allow_hf_fallback=args.allow_hf_fallback,
         num_proc=args.num_proc,
         seed=args.seed,
         bucket_step=args.bucket_step,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
+    if args.language_pair_prob is not None:
+        prob = max(0.0, min(1.0, float(args.language_pair_prob)))
+        d_cfg.language_pair_mode_prob = prob
+    monitor_every = args.monitor_eval_every
+    if monitor_every < 0:
+        monitor_every = args.eval_every
+
+    # For fine-tuning, always use the dedicated monitor_preprocessed_b memmap
+    # as the monitor/validation set, regardless of any custom monitor_eval_root.
+    if args.fine_tune:
+        args.monitor_eval_root = args.fine_tune_val_root
+
     t_cfg = cfg.TrainConfig(
         steps=args.steps,
         lr=args.lr,
@@ -268,12 +393,21 @@ def main():
         dropout_rate=args.dropout_rate,
         log_every=args.log_every,
         eval_every=args.eval_every,
+        monitor_eval_every=int(monitor_every),
+        monitor_eval_limit=int(args.monitor_eval_limit),
+        monitor_eval_root=args.monitor_eval_root,
+        monitor_other_threshold=float(args.monitor_other_threshold),
         ckpt_path=args.ckpt_path,
         sweep_id=args.sweep_id,
         no_jit=args.no_jit,
         preview_only=args.preview_only,
         preview_start=args.preview_start,
         preview_count=args.preview_count,
+        fine_tune=args.fine_tune,
+        fine_tune_run_id=args.fine_tune_run_id,
+        fine_tune_train_root=args.fine_tune_train_root,
+        fine_tune_val_root=args.fine_tune_val_root,
+        fine_tune_step=args.fine_tune_step,
     )
 
     # Prepare datasets
@@ -282,6 +416,7 @@ def main():
         d_cfg.data_root,
         use_train_windows=not args.dont_use_train_windows,
         include_languages=selected_langs,
+        verbose=False,
     )
     train_dsets = dsets["train"]
 
@@ -307,11 +442,61 @@ def main():
         print(f"Preview HTML written to: {os.path.abspath(out_path)}")
         return
 
+    fine_tune_data = None
+    if args.fine_tune:
+        fine_tune_root = Path(args.fine_tune_train_root)
+        if not fine_tune_root.exists():
+            raise ValueError(
+                f"Fine-tune training root not found at {fine_tune_root}. "
+                "Ensure downloader/monitor_preprocessed_a has been created."
+            )
+        try:
+            fine_tune_data = load_monitor_memmaps(fine_tune_root)
+            meta_ft = fine_tune_data.get("meta", {})
+            total_files_ft = meta_ft.get("num_files", len(fine_tune_data["files"]))
+            print(
+                f"Fine-tune training enabled: {total_files_ft} files from {fine_tune_root}",
+                flush=True,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load fine-tune monitor memmap from {fine_tune_root}: {e}"
+            ) from e
+
+    monitor_data = None
+    if t_cfg.monitor_eval_every > 0:
+        monitor_root = Path(t_cfg.monitor_eval_root)
+        if monitor_root.exists():
+            try:
+                monitor_data = load_monitor_memmaps(monitor_root)
+                meta = monitor_data.get("meta", {})
+                total_files = meta.get("num_files", len(monitor_data["files"]))
+                print(
+                    f"Monitor eval enabled: {total_files} files from {monitor_root}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"⚠️  Monitor eval disabled (load failure): {e}", flush=True)
+                t_cfg.monitor_eval_every = 0
+        else:
+            print(f"⚠️  Monitor eval root not found at {monitor_root}, disabling.", flush=True)
+            t_cfg.monitor_eval_every = 0
+
     # --- WandB: single init here (longer timeout) ---
-    wandb.init(
-        project=os.getenv("WANDB_PROJECT", "code-segmentation"),
-        settings=Settings(init_timeout=300),
-    )
+    wandb_init_kwargs = {
+        "project": os.getenv("WANDB_PROJECT", "code-segmentation-v2"),
+        "settings": Settings(init_timeout=300, start_method="thread"),
+    }
+    if getattr(args, "continue_run_id", ""):
+        # Resume an existing run (and reuse its checkpoint path).
+        wandb_init_kwargs.update(
+            {
+                "id": args.continue_run_id,
+                "resume": "allow",
+            }
+        )
+        print(f"Resuming W&B run: {args.continue_run_id}", flush=True)
+    wandb.init(**wandb_init_kwargs)
     wandb.config.update({**d_cfg.__dict__, **t_cfg.__dict__}, allow_val_change=True)
 
     # Derive unique checkpoint path from run id if requested/placeholder-ish
@@ -333,6 +518,71 @@ def main():
     num_params = count_params(state.params)
     print(f"Model created with {num_params/1e6:.2f}M parameters.", flush=True)
 
+    # If we're starting a new fine-tune run (not resuming), load weights
+    # from the source W&B run's checkpoint before configuring this run's
+    # own checkpoint path.
+    if t_cfg.fine_tune and not getattr(args, "continue_run_id", ""):
+        source_run_id = t_cfg.fine_tune_run_id
+        source_ckpt_path = f"checkpoints/sweeps/{source_run_id}.msgpack"
+        src_ckpt_dir, src_ckpt_prefix, src_ckpt_blob = resolve_ckpt_paths(
+            source_ckpt_path
+        )
+        step_arg = t_cfg.fine_tune_step
+
+        # When a specific step is requested (RUNID-STEP), prefer the
+        # raw-params snapshot named <run_id>-<step>.msgpack.
+        if step_arg is not None:
+            base = os.path.basename(src_ckpt_blob)
+            stem, ext = os.path.splitext(base)
+            hist_path = os.path.join(src_ckpt_dir, f"{stem}-{step_arg}{ext}")
+            if os.path.exists(hist_path):
+                print(
+                    f"Restoring fine-tune params from {hist_path}",
+                    flush=True,
+                )
+                with open(hist_path, "rb") as f:
+                    raw = f.read()
+                params = serialization.from_bytes(state.params, raw)
+                state = state.replace(params=params)
+            else:
+                # Fallback: try the Flax checkpoint layout
+                flax_ckpt_path = os.path.join(src_ckpt_dir, f"{src_ckpt_prefix}{step_arg}")
+                if os.path.exists(flax_ckpt_path):
+                    print(
+                        f"Restoring fine-tune checkpoint from run {source_run_id} "
+                        f"at step {step_arg}",
+                        flush=True,
+                    )
+                    state = checkpoints.restore_checkpoint(
+                        src_ckpt_dir, state, step=step_arg, prefix=src_ckpt_prefix
+                    )
+                else:
+                    raise ValueError(
+                        f"Requested fine-tune checkpoint step {step_arg} for run "
+                        f"{source_run_id} not found. Expected either:\n"
+                        f"  - {hist_path} (raw params snapshot), or\n"
+                        f"  - {flax_ckpt_path} (Flax TrainState checkpoint)."
+                    )
+        else:
+            # No explicit step: restore the latest TrainState checkpoint if present.
+            if os.path.exists(src_ckpt_blob) or os.path.exists(
+                os.path.join(src_ckpt_dir, f"{src_ckpt_prefix}0")
+            ):
+                print(
+                    f"Restoring fine-tune checkpoint from run {source_run_id} "
+                    "(latest step)",
+                    flush=True,
+                )
+                state = checkpoints.restore_checkpoint(
+                    src_ckpt_dir, state, prefix=src_ckpt_prefix
+                )
+            else:
+                print(
+                    f"⚠️  Fine-tune source checkpoint not found at {source_ckpt_path}; "
+                    "starting from randomly initialized weights.",
+                    flush=True,
+                )
+
     ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(t_cfg.ckpt_path)
     ckpt_async_manager = checkpoints.AsyncManager() if hasattr(checkpoints, "AsyncManager") else None
     if os.path.exists(ckpt_blob) or os.path.exists(
@@ -342,8 +592,16 @@ def main():
         state = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
 
     # Switch to epoch-based batching
-    from epoch_batcher import EpochPrefetchBatcher
-    data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
+    from utils.epoch_batcher import EpochPrefetchBatcher, MonitorFineTuneBatcher
+
+    if t_cfg.fine_tune:
+        if fine_tune_data is None:
+            raise RuntimeError(
+                "Fine-tune mode enabled but fine-tune data failed to load."
+            )
+        data_fetcher = MonitorFineTuneBatcher(fine_tune_data, d_cfg)
+    else:
+        data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
     train_step_fn = train_step_no_jit if t_cfg.no_jit else train_step
     micro_step_fn = (
         microbatch_grad_step_no_jit if t_cfg.no_jit else microbatch_grad_step
@@ -600,12 +858,112 @@ def main():
                         "val/train_gap": float(loss) - val_loss,
                         "val/acc_gap": float(acc) - val_acc,
                     }
+                    # Do not commit yet; eval may also log monitor metrics.
                     _wandb_safe_log(val_metrics, step=step, commit=False)
 
-                    # Print table and log to W&B
+                    # Print table (console) and defer W&B commit until after optional monitor eval
                     print_metrics_table(
                         per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID
                     )
+
+                    if monitor_data is not None and t_cfg.monitor_eval_every > 0 and step % t_cfg.monitor_eval_every == 0:
+                        print("Running monitor evaluation...", flush=True)
+                        eval_rng, monitor_rng = jax.random.split(eval_rng)
+                        limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)
+                        monitor_stats = evaluate_monitor_set(
+                            state=state,
+                            monitor_data=monitor_data,
+                            L=d_cfg.window_max_bytes,
+                            batch_size=d_cfg.batch_size,
+                            rng=monitor_rng,
+                            limit=limit,
+                            eval_step_fn=eval_step,
+                            other_threshold=t_cfg.monitor_other_threshold,
+                        )
+                        # Base monitor confusion: only trained classes.
+                        per_class_m, aggregates_m = compute_metrics_from_confusion(
+                            monitor_stats["conf_mat"], cfg.NUM_CLASSES, cfg.PAD_ID
+                        )
+                        print_metrics_table(
+                            per_class_m,
+                            aggregates_m,
+                            cfg.ID2LANG,
+                            cfg.NUM_CLASSES,
+                            cfg.PAD_ID,
+                            title="Monitor",
+                        )
+                        monitor_scalar_logs = {
+                            "monitor/loss": monitor_stats["loss_mean"],
+                            "monitor/acc": monitor_stats["acc_mean"],
+                            "monitor/windows": monitor_stats["windows"],
+                            "monitor/skipped": monitor_stats["skipped"],
+                            "monitor/files_used": monitor_stats["files_used"],
+                            "monitor/threshold": t_cfg.monitor_other_threshold,
+                        }
+                        # Gap metrics (monitor - val) for quick drift detection
+                        monitor_gap_logs = {
+                            "monitor_gap/micro_accuracy": float(aggregates_m["micro"]["acc"] - aggregates["micro"]["acc"]),
+                            "monitor_gap/macro_f1": float(aggregates_m["macro"]["f1"] - aggregates["macro"]["f1"]),
+                            "monitor_gap/macro_precision": float(aggregates_m["macro"]["precision"] - aggregates["macro"]["precision"]),
+                            "monitor_gap/macro_recall": float(aggregates_m["macro"]["recall"] - aggregates["macro"]["recall"]),
+                            "monitor_gap/weighted_f1": float(aggregates_m["weighted"]["f1"] - aggregates["weighted"]["f1"]),
+                        }
+                        monitor_combined_logs = {**monitor_scalar_logs, **monitor_gap_logs}
+                        wandb_log_metrics(
+                            step,
+                            per_class_m,
+                            aggregates_m,
+                            cfg.ID2LANG,
+                            cfg.NUM_CLASSES,
+                            cfg.PAD_ID,
+                            monitor_stats["conf_mat"],
+                            prefix="monitor",
+                            extra_logs=monitor_combined_logs,
+                            commit=False,
+                        )
+                        if monitor_stats.get("conf_thresh") is not None and monitor_stats.get("acc_thresh_mean") is not None:
+                            # Thresholded confusion includes a derived "other" bucket
+                            # at index cfg.OTHER_CLASS_INDEX.
+                            num_classes_with_other = cfg.NUM_CLASSES + 1
+                            per_class_mt, aggregates_mt = compute_metrics_from_confusion(
+                                monitor_stats["conf_thresh"],
+                                num_classes_with_other,
+                                cfg.PAD_ID,
+                            )
+                            print_metrics_table(
+                                per_class_mt,
+                                aggregates_mt,
+                                cfg.ID2LANG,
+                                cfg.NUM_CLASSES,
+                                cfg.PAD_ID,
+                                title="Monitor (thresholded)",
+                            )
+                            thresh_logs = {
+                                "monitor_thresh/acc": monitor_stats.get("acc_thresh_mean", 0.0) or 0.0,
+                                "monitor_thresh/threshold": t_cfg.monitor_other_threshold,
+                                "monitor_thresh/windows": monitor_stats["windows"],
+                                "monitor_thresh/skipped": monitor_stats["skipped"],
+                                "monitor_thresh/files_used": monitor_stats["files_used"],
+                                "monitor_gap_thresh/micro_accuracy": float(aggregates_mt["micro"]["acc"] - aggregates["micro"]["acc"]),
+                                "monitor_gap_thresh/macro_f1": float(aggregates_mt["macro"]["f1"] - aggregates["macro"]["f1"]),
+                                "monitor_gap_thresh/macro_precision": float(aggregates_mt["macro"]["precision"] - aggregates["macro"]["precision"]),
+                                "monitor_gap_thresh/macro_recall": float(aggregates_mt["macro"]["recall"] - aggregates["macro"]["recall"]),
+                                "monitor_gap_thresh/weighted_f1": float(aggregates_mt["weighted"]["f1"] - aggregates["weighted"]["f1"]),
+                            }
+                            wandb_log_metrics(
+                                step,
+                                per_class_mt,
+                                aggregates_mt,
+                                cfg.ID2LANG,
+                                cfg.NUM_CLASSES,
+                                cfg.PAD_ID,
+                                monitor_stats["conf_thresh"],
+                                prefix="monitor_thresh",
+                                extra_logs=thresh_logs,
+                                commit=False,
+                            )
+
+                    # Finally, log val confusion + metrics and commit the step atomically
                     wandb_log_metrics(
                         step,
                         per_class,
@@ -614,6 +972,7 @@ def main():
                         cfg.NUM_CLASSES,
                         cfg.PAD_ID,
                         conf_mat,
+                        commit=True,
                     )
 
                     # Save checkpoints (unchanged)

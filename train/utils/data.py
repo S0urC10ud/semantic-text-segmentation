@@ -3,13 +3,15 @@ Utilities for loading, preparing, and augmenting the dataset.
 """
 import os
 from typing import List, Tuple, Dict, Optional
+import contextlib
+import io
 import numpy as np
 import datasets as hfds
 from datasets import load_dataset
 from datasets import load_from_disk
 from datasets import concatenate_datasets
 
-import config as cfg
+import utils.config as cfg
 
 LANG_ALIASES: Dict[str, List[str]] = {
     "c_family": ["c", "cpp"],
@@ -25,46 +27,59 @@ def bytes_from_text(s: str) -> np.ndarray:
 
 # -------- Data loading and validation --------
 
-def _build_local_dataset_for_lang(lang: str, data_root: str, split: str, use_train_windows = True):
+def _build_local_dataset_for_lang(
+    lang: str,
+    data_root: str,
+    split: str,
+    use_train_windows: bool = True,
+    *,
+    verbose: bool = False,
+):
     """Load and analyze dataset for a specific language and split."""
     
     # Data is in <data_root>/<split>/<lang>/dataset
     arrow_dir = os.path.join(data_root, split, lang, "dataset")
     if not os.path.exists(arrow_dir):
-        print(f"❌ ERROR: No dataset found at {arrow_dir}")
+        if verbose:
+            print(f"❌ ERROR: No dataset found at {arrow_dir}")
         return None
     
     try:
-        print(f"📂 Loading Arrow dataset for '{lang}' {split} from: {arrow_dir}")
+        if verbose:
+            print(f"📂 Loading Arrow dataset for '{lang}' {split} from: {arrow_dir}")
         ds = load_from_disk(arrow_dir)
         
         if len(ds) == 0:
-            print(f"⚠️  WARNING: Empty dataset for '{lang}' {split}")
+            if verbose:
+                print(f"⚠️  WARNING: Empty dataset for '{lang}' {split}")
             return None
             
         # Analyze content
         if "content" not in ds.features:
-            print(f"❌ ERROR: Dataset '{lang}' {split} missing 'content' column")
+            if verbose:
+                print(f"❌ ERROR: Dataset '{lang}' {split} missing 'content' column")
             return None
         
         # Sample size statistics (from first 100 samples)
-        sample_size = min(100, len(ds))
-        sizes = [len(bytes_from_text(ex["content"])) for ex in ds.select(range(sample_size))]
-        min_size = min(sizes)
-        max_size = max(sizes)
-        avg_size = sum(sizes) / len(sizes)
-        
-        print(f"✅ Loaded {len(ds)} samples for '{lang}' {split}")
-        print(f"   Content sizes (bytes): min={min_size}, max={max_size}, avg={avg_size:.1f}")
-        
-        if max_size > 1536:
-            print(f"⚠️  WARNING: Some content exceeds target window size (1536 bytes)")
-            print(f"   These will be truncated during training")
+        if verbose:
+            sample_size = min(100, len(ds))
+            sizes = [len(bytes_from_text(ex["content"])) for ex in ds.select(range(sample_size))]
+            min_size = min(sizes)
+            max_size = max(sizes)
+            avg_size = sum(sizes) / len(sizes)
+            
+            print(f"✅ Loaded {len(ds)} samples for '{lang}' {split}")
+            print(f"   Content sizes (bytes): min={min_size}, max={max_size}, avg={avg_size:.1f}")
+            
+            if max_size > 1536:
+                print(f"⚠️  WARNING: Some content exceeds target window size (1536 bytes)")
+                print(f"   These will be truncated during training")
         
         return ds
        
     except Exception as e:
-        print(f"❌ ERROR loading dataset for '{lang}' {split}: {e}")
+        if verbose:
+            print(f"❌ ERROR loading dataset for '{lang}' {split}: {e}")
         return None
 
 
@@ -73,6 +88,8 @@ def _load_dataset_with_aliases(
     data_root: str,
     split: str,
     use_train_windows: bool = True,
+    *,
+    verbose: bool = False,
 ) -> Tuple[Optional[hfds.Dataset], List[str]]:
     """
     Attempt to load the dataset for ``lang``; if not present, fall back to any alias
@@ -82,9 +99,12 @@ def _load_dataset_with_aliases(
     """
     primary_path = os.path.join(data_root, split, lang, "dataset")
     if os.path.exists(primary_path):
-        primary = _build_local_dataset_for_lang(
-            lang, data_root, split, use_train_windows=use_train_windows
-        )
+        loader = _build_local_dataset_for_lang
+        if verbose:
+            primary = loader(lang, data_root, split, use_train_windows=use_train_windows, verbose=verbose)
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                primary = loader(lang, data_root, split, use_train_windows=use_train_windows, verbose=verbose)
         if primary is not None and len(primary) > 0:
             return primary, [lang]
 
@@ -94,9 +114,12 @@ def _load_dataset_with_aliases(
         alias_path = os.path.join(data_root, split, alias, "dataset")
         if not os.path.exists(alias_path):
             continue
-        alias_ds = _build_local_dataset_for_lang(
-            alias, data_root, split, use_train_windows=use_train_windows
-        )
+        loader = _build_local_dataset_for_lang
+        if verbose:
+            alias_ds = loader(alias, data_root, split, use_train_windows=use_train_windows, verbose=verbose)
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                alias_ds = loader(alias, data_root, split, use_train_windows=use_train_windows, verbose=verbose)
         if alias_ds is not None and len(alias_ds) > 0:
             alias_sources.append(alias)
             alias_datasets.append(alias_ds)
@@ -116,20 +139,24 @@ def prepare_dsets_by_lang_with_splits(
     use_train_windows: bool = True,
     include_languages: Optional[List[str]] = None,
     *,
-    preserve_lang_order: bool = False,
+    preserve_lang_order: bool = True,
     preferred_order: Optional[List[str]] = None,
+    always_include_labels: Optional[List[str]] = None,
+    verbose: bool = False,
 ) -> Dict[str, Dict[int, hfds.Dataset]]:
     """
     Returns a nested dict: splits['train'|'val'|'test'][lang_id] -> dataset
     Datasets can contain windows of varying sizes - padding/truncation happens during training.
     """
-    print("\n" + "="*60)
-    print("🔍 SCANNING DATASETS IN:", data_root)
-    print("="*60)
+    if verbose:
+        print("\n" + "="*60)
+        print("🔍 SCANNING DATASETS IN:", data_root)
+        print("="*60)
     
     if not os.path.exists(data_root):
         raise ValueError(f"❌ DATA ROOT NOT FOUND: {data_root}")
 
+    optional_labels = set(always_include_labels or getattr(cfg, "OPTIONAL_LABELS", []))
     configured_langs = list(cfg.LANG2ID.keys())
     if preferred_order:
         configured_order = list(preferred_order)
@@ -172,10 +199,15 @@ def prepare_dsets_by_lang_with_splits(
     lang_stats = {lang: {"splits": {}, "total_samples": 0} for lang in target_langs}
     
     for split in ("train", "val", "test"):
-        print(f"\n📂 Checking {split} split...")
+        if verbose:
+            print(f"\n📂 Checking {split} split...")
         for lang in target_langs:
             ds, source_labels = _load_dataset_with_aliases(
-                lang, data_root, split, use_train_windows=use_train_windows
+                lang,
+                data_root,
+                split,
+                use_train_windows=use_train_windows,
+                verbose=verbose,
             )
             if ds is not None and len(ds) > 0:
                 lang_id = cfg.LANG2ID[lang]
@@ -183,9 +215,10 @@ def prepare_dsets_by_lang_with_splits(
                 lang_stats[lang]["splits"][split] = len(ds)
                 lang_stats[lang]["total_samples"] += len(ds)
                 if source_labels and source_labels != [lang]:
-                    print(
-                        f"   ℹ️  Loaded '{lang}' {split} data from legacy buckets: {', '.join(source_labels)}"
-                    )
+                    if verbose:
+                        print(
+                            f"   ℹ️  Loaded '{lang}' {split} data from legacy buckets: {', '.join(source_labels)}"
+                        )
                 for source_label in (source_labels or [lang]):
                     data_path = os.path.join(data_root, split, source_label, "dataset")
                     canonical_path = os.path.realpath(data_path)
@@ -197,11 +230,12 @@ def prepare_dsets_by_lang_with_splits(
                     path_registry[canonical_path] = split
     
     # Print summary table
-    print("\n" + "="*80)
-    print("📊 DATASET AVAILABILITY REPORT")
-    print("="*80)
-    print(f"{'Language':12} | {'Train':>10} | {'Val':>10} | {'Test':>10} | {'Total':>10} | Status")
-    print("-" * 80)
+    if verbose:
+        print("\n" + "="*80)
+        print("📊 DATASET AVAILABILITY REPORT")
+        print("="*80)
+        print(f"{'Language':12} | {'Train':>10} | {'Val':>10} | {'Test':>10} | {'Total':>10} | Status")
+        print("-" * 80)
     
     available_langs = set()
     all_missing = True
@@ -210,6 +244,7 @@ def prepare_dsets_by_lang_with_splits(
         train_count = stats["splits"].get("train", 0)
         val_count = stats["splits"].get("val", 0)
         test_count = stats["splits"].get("test", 0)
+        is_optional = lang in optional_labels
         
         # Determine status
         status_parts = []
@@ -225,13 +260,19 @@ def prepare_dsets_by_lang_with_splits(
             available_langs.add(lang)
             all_missing = False
         else:
-            status = " ".join(status_parts)
-            
+            status_prefix = "⚠️ OPTIONAL " if is_optional else ""
+            status = status_prefix + " ".join(status_parts)
+            if is_optional:
+                # Keep optional labels in the mapping even if data is missing
+                available_langs.add(lang)
+                all_missing = False
+        
         # Format counts with color indicators
         def fmt_count(n):
             return f"{n:>10}" if n > 0 else "     ----"
             
-        print(f"{lang:12} | {fmt_count(train_count)} | {fmt_count(val_count)} | {fmt_count(test_count)} | {stats['total_samples']:>10} | {status}")
+        if verbose:
+            print(f"{lang:12} | {fmt_count(train_count)} | {fmt_count(val_count)} | {fmt_count(test_count)} | {stats['total_samples']:>10} | {status}")
     
     if all_missing:
         raise ValueError("\n" + "!"*80 + "\n" +
@@ -247,6 +288,13 @@ def prepare_dsets_by_lang_with_splits(
             raise ValueError(
                 f"❌ Requested languages missing required splits: {sorted(missing_requested)}"
             )
+    else:
+        missing_required = [lang for lang in target_langs if lang not in available_langs and lang not in optional_labels]
+        if missing_required:
+            raise ValueError(
+                f"❌ Required languages missing train/val data: {sorted(missing_required)} "
+                f"(expected under {data_root})"
+            )
     
     # Rebuild LANG2ID with only available languages
     cfg.LANG2ID.clear()
@@ -257,17 +305,22 @@ def prepare_dsets_by_lang_with_splits(
     for i, lang in enumerate(ordered_langs):
         cfg.LANG2ID[lang] = i
     
-    print("\n" + "="*80)
-    print(f"✅ USING {len(available_langs)} LANGUAGES: {sorted(available_langs)}")
-    print(f"🔢 Language ID mapping: {dict(sorted(cfg.LANG2ID.items(), key=lambda x: x[1]))}")
-    print("="*80 + "\n")
+    if verbose:
+        print("\n" + "="*80)
+        print(f"✅ USING {len(available_langs)} LANGUAGES: {sorted(available_langs)}")
+        print(f"🔢 Language ID mapping: {dict(sorted(cfg.LANG2ID.items(), key=lambda x: x[1]))}")
+        print("="*80 + "\n")
     
     # Build the final splits dict
     splits = {"train": {}, "val": {}, "test": {}}
     for split in ("train", "val", "test"):
         for lang, lang_id in cfg.LANG2ID.items():
             ds, _ = _load_dataset_with_aliases(
-                lang, data_root, split, use_train_windows=use_train_windows
+                lang,
+                data_root,
+                split,
+                use_train_windows=use_train_windows,
+                verbose=verbose,
             )
             if ds is not None and len(ds) > 0:
                 splits[split][lang_id] = ds
@@ -289,13 +342,18 @@ def prepare_dsets_by_lang_with_splits(
     for split_name, mp in splits.items():
         for lang, lang_id in cfg.LANG2ID.items():
             ds, _ = _load_dataset_with_aliases(
-                lang, data_root, split_name, use_train_windows=use_train_windows
+                lang,
+                data_root,
+                split_name,
+                use_train_windows=use_train_windows,
+                verbose=verbose,
             )
             if ds is not None and len(ds) > 0:
                 new_splits[split_name][lang_id] = ds
     
-    print(f"Found {len(cfg.LANG2ID)} available languages: {sorted(cfg.LANG2ID.keys())}")
-    print(f"Language ID mapping: {dict(sorted(cfg.LANG2ID.items(), key=lambda x: x[1]))}")
+    if verbose:
+        print(f"Found {len(cfg.LANG2ID)} available languages: {sorted(cfg.LANG2ID.keys())}")
+        print(f"Language ID mapping: {dict(sorted(cfg.LANG2ID.items(), key=lambda x: x[1]))}")
     
     # Update the global mappings in config
     cfg.update_lang_mappings()

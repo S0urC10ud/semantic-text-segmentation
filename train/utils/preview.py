@@ -1,13 +1,14 @@
 """
 Utilities for generating an HTML preview of augmented data samples.
 """
-import os
-import json
 import colorsys
-from typing import List, Dict, Any, Optional
-import numpy as np
+import json
+import os
+from typing import Any, Dict, List, Optional
 
-import config
+import numpy as np
+import utils.config as config
+
 
 def generate_color(index, total):
     """Generate a distinct color from HSL color space"""

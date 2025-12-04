@@ -1,6 +1,6 @@
 # Segmenter Evaluation Report
 
-- Checkpoint: `../train/checkpoints/sweeps/l68s24dx.msgpack`
+- Checkpoint: `../train/checkpoints/sweeps/y325i63s-20000.msgpack`
 - Model dim: 256
 - Channels: 32, 64, 64, 128, 128, 128, 128, 256
 - Chunk: 1536
@@ -8,70 +8,68 @@
 - Max samples per task: 2000
 - Sample seed: 13
 - Evaluation data root: `/home/s0urc10ud/text-segmentation/evaluation/data`
-- Generated at: 2025-11-02T11:52:32
+- Generated at: 2025-12-04T10:11:27
 
 ### Task Highlights
 
 ##### mal_injection
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Avg coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 1204/2000 | 556/2000 | 0.38 | 72.6% |
-| Correct payload | 611/2000 | 604/2000 | 0.30 | 47.5% |
+| Any non-wrapper | 1062/2000 | 547/2000 | 0.31 | 67.3% |
+| Correct payload | 642/2000 | 558/2000 | 0.27 | 47.3% |
 
 ##### markdown_mix
 _Text hits column: lower is better._
 | Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| \`\`\` fenced \`\`\` | 2027/2027 | 2027/2027 | 99.7% | 1.00 | 0/2027 | 1988/2027 | 1988/2027 | 97.4% | 0.97 |
-| bare code | 1971/1973 | 1971/1973 | 99.6% | 1.00 | 2/1973 | 1925/1973 | 1925/1973 | 96.9% | 0.97 |
-| inline code (\`...\`) | 1027/1028 | 1027/1028 | 99.6% | 1.00 | 1/1028 | 876/1028 | 876/1028 | 84.9% | 0.85 |
+| \`\`\` fenced \`\`\` | — | — | — | — | — | — | — | — | — |
+| bare code | 374/374 | 374/374 | 100.0% | 1.00 | 0/374 | 255/374 | 255/374 | 84.5% | 0.84 |
 
-Text coverage (IoU ≥50%): 92.1%
+Text coverage (IoU ≥50%): 0.8%
 
 | Metric | Value |
 | --- | --- |
-| Host fenced IoU ≥50% | 988/998 hits, mean IoU 0.98, coverage 97.9% |
-| Host bare IoU ≥50% | 983/1002 hits, mean IoU 0.97, coverage 97.0% |
-| Other fenced IoU ≥50% | 1000/1029 hits, mean IoU 0.96, coverage 96.6% |
-| Other bare IoU ≥50% | 942/971 hits, mean IoU 0.97, coverage 96.8% |
-| Wrong fence label fooled | 0/363 cases |
+| Host fenced IoU ≥50% | — hits, mean IoU n/a, coverage n/a |
+| Host bare IoU ≥50% | — hits, mean IoU n/a, coverage n/a |
+| Other fenced IoU ≥50% | — hits, mean IoU n/a, coverage n/a |
+| Other bare IoU ≥50% | 255/374 hits, mean IoU 0.84, coverage 84.5% |
 
 ##### pure_fragments
-1957/2000 samples stayed fully pure (no foreign chars). 1996/2000 stayed within ≤50% foreign coverage.
-Expected foreign bytes for a 1536-byte fragment: 3.7/1536
+749/2000 samples stayed fully pure (no foreign chars). 1910/2000 stayed within ≤50% foreign coverage.
+Expected foreign bytes for a 1536-byte fragment: 141.8/1536
 
 ##### sequence_pair
-First segment coverage 99.3%
-Second segment coverage 83.1%
+First segment coverage 93.6%
+Second segment coverage 86.3%
 
 ##### sequence_triplet
-First segment coverage 99.3%
-Second segment coverage 98.7%
-Third segment coverage 78.7%
+First segment coverage 93.8%
+Second segment coverage 91.3%
+Third segment coverage 85.3%
 
 ##### needle_64_plus
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 1918/2000 | 1331/2000 | 0.68 | 97.9% |
-| Correct payload | 1791/2000 | 1737/2000 | 0.83 | 90.8% |
+| Any non-wrapper | 111/125 | 57/125 | 0.50 | 90.7% |
+| Correct payload | 100/125 | 95/125 | 0.73 | 82.6% |
 
 ##### needle_32_63
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 1707/2000 | 636/2000 | 0.51 | 83.3% |
-| Correct payload | 1474/2000 | 1408/2000 | 0.66 | 72.7% |
+| Any non-wrapper | 49/51 | 20/51 | 0.42 | 90.2% |
+| Correct payload | 41/51 | 41/51 | 0.72 | 76.7% |
 
 ##### needle_16_31
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 1419/2000 | 501/2000 | 0.41 | 68.7% |
-| Correct payload | 1135/2000 | 1068/2000 | 0.49 | 54.7% |
+| Any non-wrapper | 35/51 | 15/51 | 0.29 | 50.0% |
+| Correct payload | 28/51 | 24/51 | 0.42 | 38.8% |
 
 ##### needle_4_15
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 954/2000 | 298/2000 | 0.25 | 52.2% |
-| Correct payload | 620/2000 | 569/2000 | 0.26 | 33.4% |
+| Any non-wrapper | 14/43 | 5/43 | 0.13 | 38.2% |
+| Correct payload | 12/43 | 12/43 | 0.25 | 34.0% |
 
 
 ## Task Details
@@ -81,137 +79,148 @@ Third segment coverage 78.7%
 Host fragments with malicious payload injections.
 
 - Samples: 2000
-- Characters evaluated: 3292830
-- Overall accuracy: 0.7812
-- High confusions: csharp->c_family 28051 (12.8%), javascript_typescript->c_family 27157 (15.3%), powershell->c_family 24835 (10.6%), python->c_family 23084 (14.2%), python->javascript_typescript 22960 (14.1%)
+- Characters evaluated: 8014522
+- Overall accuracy: 0.8599
+- High confusions: dockerfile->shell 38794 (47.7%), php->html 34003 (16.5%), java->javascript_typescript 32747 (10.3%), python->javascript_typescript 28351 (10.2%), text->php 22286 (6.9%)
 
 | Language | Non-wrapper cov ≥50% | Non-wrapper coverage (avg) | Non-wrapper IoU ≥50% | Non-wrapper avg IoU | Correct cov ≥50% | Correct coverage (avg) | Correct IoU ≥50% | Correct avg IoU | Top misclassifications |
 | --- | --- | ---: | --- | ---: | --- | ---: | --- | ---: | --- |
-| csharp | 219/221 | 98.1% | 114/221 | 0.63 | 188/221 | 84.8% (overall 85.8%) | 186/221 | 0.83 | c_family (12.8%), java (0.6%), javascript_typescript (0.2%) |
-| go | 91/213 | 40.6% | 35/213 | 0.26 | 6/213 | 4.9% (overall 60.0%) | 6/213 | 0.05 | c_family (13.0%), javascript_typescript (8.7%), dockerfile (2.3%) |
-| java | 181/212 | 80.3% | 90/212 | 0.54 | 118/212 | 47.9% (overall 69.2%) | 117/212 | 0.54 | c_family (11.6%), javascript_typescript (9.2%), html (3.2%) |
-| javascript_typescript | 163/263 | 79.6% | 70/263 | 0.39 | 98/263 | 62.5% (overall 73.0%) | 97/263 | 0.35 | c_family (15.3%), java (2.0%), csharp (1.9%) |
-| php | 101/232 | 42.4% | 38/232 | 0.27 | 19/232 | 9.1% (overall 56.1%) | 18/232 | 0.09 | javascript_typescript (10.9%), c_family (9.9%), shell (2.4%) |
-| powershell | 149/208 | 90.5% | 101/208 | 0.52 | 129/208 | 77.7% (overall 81.6%) | 129/208 | 0.57 | c_family (10.6%), csharp (2.9%), shell (1.1%) |
-| python | 123/219 | 52.3% | 43/219 | 0.33 | 2/219 | 1.3% (overall 56.7%) | 1/219 | 0.01 | c_family (14.2%), javascript_typescript (14.1%), java (2.3%) |
-| ruby | 94/228 | 43.2% | 32/228 | 0.25 | 15/228 | 10.0% (overall 63.4%) | 14/228 | 0.08 | c_family (15.0%), javascript_typescript (5.9%), python (2.0%) |
-| shell | 83/204 | 42.8% | 33/204 | 0.25 | 36/204 | 17.1% (overall 66.9%) | 36/204 | 0.17 | c_family (12.6%), dockerfile (4.4%), powershell (3.1%) |
+| csharp | 209/220 | 94.2% | 130/220 | 0.62 | 202/220 | 90.5% (overall 91.8%) | 182/220 | 0.78 | php (5.2%), xml (0.9%), go (0.8%) |
+| go | 85/228 | 40.6% | 30/228 | 0.23 | 3/228 | 2.6% (overall 76.6%) | 3/228 | 0.03 | php (5.7%), javascript_typescript (3.7%), shell (1.9%) |
+| java | 177/229 | 76.4% | 94/229 | 0.47 | 107/229 | 38.4% (overall 75.0%) | 93/229 | 0.42 | javascript_typescript (10.3%), php (5.7%), csharp (2.8%) |
+| javascript_typescript | 105/227 | 60.2% | 49/227 | 0.24 | 71/227 | 52.3% (overall 77.7%) | 68/227 | 0.27 | php (6.3%), html (2.8%), c_family (2.3%) |
+| php | 84/219 | 37.8% | 33/219 | 0.21 | 68/219 | 28.7% (overall 58.5%) | 32/219 | 0.19 | html (16.5%), shell (3.0%), javascript_typescript (1.8%) |
+| powershell | 149/221 | 84.3% | 109/221 | 0.46 | 135/221 | 72.7% (overall 79.0%) | 127/221 | 0.52 | encoding_base64 (5.8%), php (5.2%), csharp (3.5%) |
+| python | 123/222 | 55.1% | 65/222 | 0.33 | 0/222 | 0.1% (overall 74.5%) | 0/222 | 0.00 | javascript_typescript (10.2%), php (5.0%), json (1.6%) |
+| ruby | 51/218 | 26.1% | 9/218 | 0.09 | 0/218 | 0.0% (overall 71.8%) | 0/218 | 0.00 | php (6.3%), javascript_typescript (4.1%), python (2.1%) |
+| shell | 79/216 | 39.7% | 28/216 | 0.17 | 56/216 | 28.2% (overall 67.9%) | 53/216 | 0.24 | php (6.4%), java (3.5%), xml (2.3%) |
 
 ### markdown_mix
 
-Markdown-like text/code interleavings with optional fences.
+Monitor markdown documents with natural code/text interleavings.
 
-- Samples: 2000
-- Characters evaluated: 2762356
-- Overall accuracy: 0.9485
-- High confusions: text->c_family 62214 (7.1%), javascript_typescript->java 2940 (3.6%), ruby->python 2389 (3.0%), sql->c_family 2300 (3.1%), dockerfile->c_family 1936 (2.6%)
+- Samples: 67
+- Characters evaluated: 244176
+- Overall accuracy: 0.2580
+- High confusions: text->__unknown__ 154004 (89.9%), text->php 9140 (5.3%), text->restructuredtext 3500 (2.0%), html->__unknown__ 1988 (10.5%), shell->__unknown__ 1336 (24.3%)
 
 _Text hits column: lower is better._
 | Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| \`\`\` fenced \`\`\` | 2027/2027 | 2027/2027 | 99.7% | 1.00 | 0/2027 | 1988/2027 | 1988/2027 | 97.4% | 0.97 |
-| bare code | 1971/1973 | 1971/1973 | 99.6% | 1.00 | 2/1973 | 1925/1973 | 1925/1973 | 96.9% | 0.97 |
-| inline code (\`...\`) | 1027/1028 | 1027/1028 | 99.6% | 1.00 | 1/1028 | 876/1028 | 876/1028 | 84.9% | 0.85 |
+| \`\`\` fenced \`\`\` | — | — | — | — | — | — | — | — | — |
+| bare code | 374/374 | 374/374 | 100.0% | 1.00 | 0/374 | 255/374 | 255/374 | 84.5% | 0.84 |
 
-Text coverage (IoU ≥50%): 92.1%
+Text coverage (IoU ≥50%): 0.8%
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| encoding_hex | 81654 | 0.9899 |
-| encoding_base58 | 78590 | 0.9858 |
-| go | 76598 | 0.9847 |
-| csv | 75878 | 0.9843 |
-| encoding_base85 | 82887 | 0.9806 |
-| php | 77280 | 0.9790 |
-| encoding_base32 | 76520 | 0.9789 |
-| encoding_base64 | 80277 | 0.9754 |
-| html | 83351 | 0.9719 |
-| c_family | 77014 | 0.9659 |
-| json | 81864 | 0.9631 |
-| shell | 68731 | 0.9629 |
-| rust | 79862 | 0.9556 |
-| dockerfile | 73171 | 0.9544 |
-| sql | 75401 | 0.9541 |
-| css | 87749 | 0.9534 |
-| visual_basic | 80642 | 0.9522 |
-| powershell | 81212 | 0.9521 |
-| csharp | 75019 | 0.9515 |
-| python | 76913 | 0.9502 |
-| yaml | 75485 | 0.9468 |
-| java | 80144 | 0.9398 |
-| ruby | 78938 | 0.9287 |
-| text | 875624 | 0.9215 |
-| javascript_typescript | 81552 | 0.9067 |
+| restructuredtext | 143 | 1.0000 |
+| java | 10619 | 0.9932 |
+| swift | 859 | 0.9907 |
+| php | 1927 | 0.9766 |
+| yaml | 10056 | 0.9151 |
+| csharp | 1712 | 0.8773 |
+| html | 18927 | 0.8711 |
+| javascript_typescript | 12302 | 0.8276 |
+| json | 4193 | 0.8235 |
+| xml | 103 | 0.7961 |
+| c_family | 3949 | 0.6900 |
+| python | 1071 | 0.6555 |
+| shell | 5498 | 0.6490 |
+| dockerfile | 335 | 0.6239 |
+| css | 153 | 0.2157 |
+| ruby | 1058 | 0.0189 |
+| text | 171271 | 0.0083 |
 | __unknown__ | 0 | nan |
 
 ### pure_fragments
 
-Single-label validation fragments (baseline accuracy).
+Single-label monitor fragments (baseline accuracy).
 
 - Samples: 2000
-- Characters evaluated: 2675343
-- Overall accuracy: 0.9980
-- High confusions: visual_basic->sql 1262 (1.1%), yaml->encoding_base64 1260 (1.2%), javascript_typescript->java 909 (0.8%), csharp->encoding_base64 375 (0.4%), go->json 361 (0.3%)
+- Characters evaluated: 7330306
+- Overall accuracy: 0.9120
+- High confusions: php->html 47411 (31.9%), dockerfile->shell 36671 (55.5%), powershell->encoding_base64 26651 (11.5%), html->javascript_typescript 25739 (7.8%), text->php 17099 (6.6%)
 
-Expected foreign bytes for a 1536-byte fragment: 3.7/1536
+Expected foreign bytes for a 1536-byte fragment: 141.8/1536
 
 #### Purity Analysis
 
 | Language | Purity % | Top Misclassifications |
 | --- | ---: | --- |
-| csv | 100.0% | — |
-| dockerfile | 100.0% | — |
-| encoding_base32 | 100.0% | — |
-| encoding_base58 | 100.0% | — |
-| encoding_base64 | 100.0% | — |
-| encoding_base85 | 100.0% | — |
-| encoding_hex | 100.0% | — |
-| html | 100.0% | — |
-| java | 100.0% | — |
-| ruby | 100.0% | — |
-| text | 100.0% | — |
-| json | 100.0% | csv (0.0%) |
-| php | 100.0% | dockerfile (0.0%) |
-| c_family | 100.0% | css (0.0%), csv (0.0%), text (0.0%) |
-| css | 100.0% | javascript_typescript (0.0%) |
-| rust | 99.9% | go (0.0%), c_family (0.0%) |
-| powershell | 99.9% | shell (0.1%), python (0.0%), rust (0.0%) |
-| sql | 99.9% | javascript_typescript (0.1%), go (0.0%), csharp (0.0%) |
-| python | 99.8% | shell (0.1%), text (0.0%), csharp (0.0%) |
-| csharp | 99.6% | encoding_base64 (0.4%), sql (0.0%) |
-| go | 99.5% | json (0.3%), powershell (0.1%), csharp (0.0%) |
-| shell | 99.5% | c_family (0.3%), json (0.2%), python (0.0%) |
-| javascript_typescript | 99.1% | java (0.8%), rust (0.0%), csharp (0.0%) |
-| visual_basic | 98.9% | sql (1.1%), csharp (0.0%) |
-| yaml | 98.7% | encoding_base64 (1.2%), python (0.1%), dockerfile (0.0%) |
+| csv | 98.1% | php (1.9%), yaml (0.0%), markdown (0.0%) |
+| encoding_base64 | 97.2% | php (2.8%) |
+| gettext_catalog | 96.6% | php (3.4%) |
+| tex | 96.6% | php (3.1%), restructuredtext (0.3%) |
+| rust | 96.4% | php (3.2%), restructuredtext (0.2%), ruby (0.1%) |
+| encoding_base85 | 96.2% | php (3.8%) |
+| encoding_hex | 95.8% | php (4.2%) |
+| go | 95.7% | php (3.8%), c_family (0.3%), html (0.2%) |
+| encoding_base32 | 95.4% | php (4.6%) |
+| encoding_base58 | 95.1% | php (4.9%) |
+| visual_basic | 95.0% | php (3.7%), kotlin (0.6%), xml (0.5%) |
+| sql | 94.6% | php (3.5%), visual_basic (1.7%), javascript_typescript (0.1%) |
+| csharp | 94.5% | php (4.6%), visual_basic (0.6%), powershell (0.2%) |
+| swift | 94.3% | php (5.1%), c_family (0.6%) |
+| c_family | 93.9% | php (4.6%), java (0.8%), restructuredtext (0.4%) |
+| xml | 93.6% | php (4.5%), encoding_base64 (1.2%), tex (0.7%) |
+| scala | 93.6% | php (6.4%) |
+| text | 93.3% | php (6.6%), markdown (0.0%) |
+| ruby | 92.8% | php (4.4%), python (1.6%), rust (0.9%) |
+| css | 92.3% | php (2.9%), c_family (1.9%), encoding_base64 (1.7%) |
+| python | 92.3% | php (4.2%), json (1.8%), c_family (0.4%) |
+| java | 92.0% | php (5.1%), c_family (2.8%), scala (0.1%) |
+| dart | 91.6% | php (7.9%), rust (0.5%) |
+| svg | 90.1% | php (5.8%), css (2.5%), encoding_base64 (1.6%) |
+| shell | 90.0% | php (4.4%), java (2.2%), xml (1.8%) |
+| yaml | 89.4% | php (4.4%), javascript_typescript (2.8%), shell (0.9%) |
+| kotlin | 89.2% | php (6.9%), dart (2.4%), python (0.7%) |
+| javascript_typescript | 88.9% | html (4.4%), php (4.2%), c_family (1.8%) |
+| json | 88.2% | php (8.6%), html (2.7%), tex (0.6%) |
+| powershell | 84.4% | encoding_base64 (11.5%), php (3.2%), csharp (0.6%) |
+| html | 83.8% | javascript_typescript (7.8%), php (3.0%), encoding_base64 (2.9%) |
+| restructuredtext | 74.8% | python (6.7%), php (5.4%), shell (3.9%) |
+| markdown | 68.6% | java (7.3%), php (6.2%), javascript_typescript (4.7%) |
+| php | 66.3% | html (31.9%), javascript_typescript (1.0%), svg (0.3%) |
+| dockerfile | 32.3% | shell (55.5%), php (8.9%), python (1.3%) |
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| encoding_base32 | 122440 | 1.0000 |
-| encoding_base85 | 120579 | 1.0000 |
-| html | 120578 | 1.0000 |
-| csv | 116802 | 1.0000 |
-| encoding_base58 | 115238 | 1.0000 |
-| java | 114493 | 1.0000 |
-| encoding_base64 | 114116 | 1.0000 |
-| encoding_hex | 107526 | 1.0000 |
-| text | 105594 | 1.0000 |
-| ruby | 99733 | 1.0000 |
-| dockerfile | 75658 | 1.0000 |
-| json | 91562 | 0.9999 |
-| php | 89490 | 0.9999 |
-| c_family | 104597 | 0.9998 |
-| css | 127914 | 0.9997 |
-| rust | 106354 | 0.9994 |
-| powershell | 110100 | 0.9991 |
-| sql | 99041 | 0.9991 |
-| python | 112079 | 0.9983 |
-| csharp | 103769 | 0.9963 |
-| go | 105381 | 0.9952 |
-| shell | 72060 | 0.9948 |
-| javascript_typescript | 118472 | 0.9914 |
-| visual_basic | 114546 | 0.9890 |
-| yaml | 107221 | 0.9873 |
+| csv | 321188 | 0.9811 |
+| encoding_base64 | 243336 | 0.9716 |
+| gettext_catalog | 270307 | 0.9663 |
+| tex | 190336 | 0.9661 |
+| rust | 319899 | 0.9645 |
+| encoding_base85 | 262975 | 0.9623 |
+| encoding_hex | 291748 | 0.9579 |
+| go | 226177 | 0.9571 |
+| encoding_base32 | 284896 | 0.9538 |
+| encoding_base58 | 240140 | 0.9510 |
+| visual_basic | 299498 | 0.9497 |
+| sql | 185856 | 0.9457 |
+| csharp | 150077 | 0.9449 |
+| swift | 195327 | 0.9434 |
+| c_family | 201432 | 0.9392 |
+| xml | 183065 | 0.9360 |
+| scala | 215334 | 0.9358 |
+| text | 257283 | 0.9335 |
+| ruby | 126931 | 0.9280 |
+| css | 286423 | 0.9230 |
+| python | 231295 | 0.9226 |
+| java | 275347 | 0.9201 |
+| dart | 165671 | 0.9162 |
+| svg | 196457 | 0.9008 |
+| shell | 72186 | 0.8999 |
+| yaml | 139037 | 0.8945 |
+| kotlin | 104008 | 0.8921 |
+| javascript_typescript | 143513 | 0.8885 |
+| json | 139006 | 0.8820 |
+| powershell | 231263 | 0.8444 |
+| html | 330610 | 0.8377 |
+| restructuredtext | 175338 | 0.7485 |
+| markdown | 159465 | 0.6857 |
+| php | 148856 | 0.6635 |
+| dockerfile | 66026 | 0.3228 |
 | __unknown__ | 0 | nan |
 
 ### sequence_pair
@@ -219,42 +228,52 @@ Expected foreign bytes for a 1536-byte fragment: 3.7/1536
 Two-language back-to-back sequences A->B.
 
 - Samples: 2000
-- Characters evaluated: 5315911
-- Overall accuracy: 0.9127
-- High confusions: dockerfile->c_family 25894 (16.6%), java->c_family 24943 (10.2%), text->c_family 24334 (11.3%), csharp->c_family 21579 (10.9%), json->c_family 20938 (10.6%)
+- Characters evaluated: 14357042
+- Overall accuracy: 0.8995
+- High confusions: dockerfile->shell 77449 (49.8%), php->html 73281 (26.2%), html->javascript_typescript 33032 (5.5%), powershell->encoding_base64 31294 (8.9%), restructuredtext->python 30869 (8.3%)
 
 | Segment | Coverage |
 | --- | ---: |
-| First | 99.3% |
-| Second | 83.1% |
+| First | 93.6% |
+| Second | 86.3% |
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| c_family | 211272 | 0.9877 |
-| css | 228147 | 0.9391 |
-| csv | 250033 | 0.9383 |
-| encoding_hex | 232844 | 0.9375 |
-| encoding_base64 | 225624 | 0.9344 |
-| encoding_base85 | 210869 | 0.9330 |
-| rust | 218697 | 0.9293 |
-| html | 222484 | 0.9215 |
-| python | 218013 | 0.9200 |
-| encoding_base58 | 221677 | 0.9199 |
-| go | 230328 | 0.9152 |
-| sql | 189966 | 0.9140 |
-| visual_basic | 216538 | 0.9139 |
-| encoding_base32 | 234894 | 0.9109 |
-| javascript_typescript | 245923 | 0.9092 |
-| php | 187238 | 0.9071 |
-| powershell | 203302 | 0.9038 |
-| ruby | 196713 | 0.8979 |
-| yaml | 216610 | 0.8954 |
-| java | 244568 | 0.8904 |
-| json | 197182 | 0.8871 |
-| csharp | 198659 | 0.8868 |
-| text | 214931 | 0.8842 |
-| shell | 143220 | 0.8562 |
-| dockerfile | 156179 | 0.8336 |
+| gettext_catalog | 781157 | 0.9722 |
+| encoding_base32 | 515540 | 0.9690 |
+| encoding_base64 | 421300 | 0.9679 |
+| encoding_base58 | 416059 | 0.9622 |
+| encoding_hex | 578954 | 0.9620 |
+| csv | 540946 | 0.9594 |
+| encoding_base85 | 462015 | 0.9588 |
+| rust | 600445 | 0.9539 |
+| visual_basic | 522444 | 0.9506 |
+| java | 443006 | 0.9481 |
+| tex | 439102 | 0.9444 |
+| go | 513877 | 0.9424 |
+| dart | 379444 | 0.9382 |
+| csharp | 368522 | 0.9362 |
+| ruby | 228586 | 0.9287 |
+| css | 470567 | 0.9234 |
+| c_family | 531110 | 0.9206 |
+| scala | 406456 | 0.9170 |
+| xml | 323403 | 0.9159 |
+| sql | 344971 | 0.9156 |
+| swift | 349545 | 0.9141 |
+| python | 500205 | 0.9106 |
+| svg | 295022 | 0.9063 |
+| json | 352845 | 0.9041 |
+| kotlin | 268533 | 0.8903 |
+| text | 526828 | 0.8552 |
+| javascript_typescript | 275079 | 0.8463 |
+| html | 596240 | 0.8357 |
+| powershell | 353481 | 0.8314 |
+| shell | 148418 | 0.8156 |
+| yaml | 272650 | 0.7599 |
+| restructuredtext | 371211 | 0.6884 |
+| php | 280038 | 0.6868 |
+| markdown | 323456 | 0.6655 |
+| dockerfile | 155587 | 0.3232 |
 | __unknown__ | 0 | nan |
 
 ### sequence_triplet
@@ -262,228 +281,217 @@ Two-language back-to-back sequences A->B.
 Three-language back-to-back sequences A->B->C.
 
 - Samples: 2000
-- Characters evaluated: 8039933
-- Overall accuracy: 0.9214
-- High confusions: visual_basic->c_family 34525 (8.7%), powershell->c_family 29886 (8.8%), javascript_typescript->c_family 29546 (8.6%), css->c_family 29181 (7.9%), yaml->c_family 28877 (8.6%)
+- Characters evaluated: 21819852
+- Overall accuracy: 0.9013
+- High confusions: dockerfile->shell 138161 (43.7%), php->html 121665 (26.6%), html->javascript_typescript 73990 (8.8%), text->markdown 56265 (6.6%), dockerfile->markdown 48176 (15.2%)
 
 | Segment | Coverage |
 | --- | ---: |
-| First | 99.3% |
-| Second | 98.7% |
-| Third | 78.7% |
+| First | 93.8% |
+| Second | 91.3% |
+| Third | 85.3% |
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| c_family | 335600 | 0.9895 |
-| csv | 352950 | 0.9474 |
-| encoding_base32 | 339546 | 0.9419 |
-| encoding_base64 | 336746 | 0.9408 |
-| encoding_base58 | 331445 | 0.9400 |
-| encoding_hex | 364264 | 0.9374 |
-| csharp | 282810 | 0.9299 |
-| rust | 357641 | 0.9289 |
-| json | 274767 | 0.9281 |
-| html | 366242 | 0.9263 |
-| encoding_base85 | 328521 | 0.9235 |
-| go | 335244 | 0.9214 |
-| sql | 306969 | 0.9193 |
-| java | 325049 | 0.9192 |
-| css | 368186 | 0.9186 |
-| ruby | 298089 | 0.9140 |
-| php | 286337 | 0.9135 |
-| python | 315451 | 0.9047 |
-| yaml | 336900 | 0.9027 |
-| visual_basic | 395279 | 0.9026 |
-| powershell | 340966 | 0.9021 |
-| text | 300368 | 0.8987 |
-| dockerfile | 206925 | 0.8968 |
-| javascript_typescript | 342067 | 0.8834 |
-| shell | 211571 | 0.8773 |
+| gettext_catalog | 1251310 | 0.9790 |
+| encoding_hex | 1006676 | 0.9780 |
+| encoding_base85 | 858258 | 0.9731 |
+| encoding_base32 | 823412 | 0.9707 |
+| encoding_base58 | 789693 | 0.9685 |
+| rust | 859577 | 0.9680 |
+| csv | 1009782 | 0.9672 |
+| encoding_base64 | 657326 | 0.9641 |
+| visual_basic | 882961 | 0.9572 |
+| csharp | 475250 | 0.9546 |
+| go | 698252 | 0.9479 |
+| swift | 541562 | 0.9446 |
+| tex | 596637 | 0.9437 |
+| css | 736122 | 0.9361 |
+| dart | 472731 | 0.9332 |
+| kotlin | 309809 | 0.9323 |
+| svg | 461032 | 0.9307 |
+| xml | 560718 | 0.9169 |
+| scala | 581213 | 0.9135 |
+| ruby | 397065 | 0.9091 |
+| c_family | 663131 | 0.9079 |
+| java | 702658 | 0.9024 |
+| sql | 487781 | 0.8889 |
+| json | 389427 | 0.8880 |
+| powershell | 501420 | 0.8804 |
+| python | 674700 | 0.8791 |
+| shell | 225160 | 0.8577 |
+| text | 848134 | 0.8312 |
+| javascript_typescript | 445552 | 0.8196 |
+| html | 837059 | 0.8136 |
+| yaml | 424111 | 0.8075 |
+| restructuredtext | 407516 | 0.7024 |
+| markdown | 470549 | 0.6788 |
+| php | 457291 | 0.6578 |
+| dockerfile | 315977 | 0.2577 |
 | __unknown__ | 0 | nan |
 
 ### needle_64_plus
 
-Host fragments with a foreign-language needle injection sized 64-∞ printable chars (whitespace ignored).
+Natural monitor files with a short foreign-language needle sized 64-∞ printable chars (whitespace ignored).
 
-- Samples: 2000
-- Characters evaluated: 4094149
-- Overall accuracy: 0.8529
-- High confusions: encoding_base58->c_family 40863 (15.7%), encoding_base85->c_family 34814 (13.8%), css->c_family 32621 (14.6%), javascript_typescript->c_family 26710 (14.0%), java->c_family 26088 (16.1%)
+- Samples: 125
+- Characters evaluated: 518480
+- Overall accuracy: 0.8668
+- High confusions: markdown->php 9155 (7.0%), html->php 7898 (6.2%), encoding_base64->css 6547 (25.6%), dockerfile->shell 3845 (34.7%), markdown->html 3717 (2.9%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| c_family | 140643 | 0.9611 |
-| encoding_hex | 245872 | 0.9111 |
-| encoding_base64 | 258432 | 0.9050 |
-| encoding_base32 | 237176 | 0.9020 |
-| encoding_base85 | 251814 | 0.8604 |
-| powershell | 175301 | 0.8505 |
-| go | 168570 | 0.8499 |
-| json | 95594 | 0.8492 |
-| ruby | 148877 | 0.8480 |
-| css | 223022 | 0.8463 |
-| rust | 151783 | 0.8452 |
-| yaml | 106793 | 0.8435 |
-| encoding_base58 | 261058 | 0.8414 |
-| sql | 143609 | 0.8413 |
-| python | 151589 | 0.8401 |
-| php | 141915 | 0.8400 |
-| dockerfile | 96494 | 0.8362 |
-| html | 119111 | 0.8344 |
-| shell | 98540 | 0.8312 |
-| csv | 126288 | 0.8304 |
-| csharp | 136651 | 0.8270 |
-| visual_basic | 163514 | 0.8177 |
-| javascript_typescript | 190865 | 0.8128 |
-| java | 161768 | 0.8019 |
-| text | 98870 | 0.7683 |
+| xml | 525 | 1.0000 |
+| rust | 5811 | 0.9919 |
+| java | 1319 | 0.9909 |
+| swift | 859 | 0.9907 |
+| ruby | 582 | 0.9863 |
+| restructuredtext | 39541 | 0.9727 |
+| csharp | 1350 | 0.9622 |
+| powershell | 21649 | 0.9441 |
+| svg | 9008 | 0.9291 |
+| yaml | 44159 | 0.9111 |
+| html | 126555 | 0.9071 |
+| shell | 31713 | 0.8950 |
+| javascript_typescript | 23546 | 0.8784 |
+| python | 4524 | 0.8601 |
+| markdown | 130308 | 0.8538 |
+| php | 18695 | 0.8246 |
+| json | 7883 | 0.7373 |
+| encoding_base64 | 25532 | 0.6896 |
+| dockerfile | 11076 | 0.6359 |
+| css | 11304 | 0.5923 |
+| sql | 677 | 0.0355 |
+| go | 1864 | 0.0000 |
 | __unknown__ | 0 | nan |
+| c_family | 0 | nan |
 
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |
 | --- | --- | --- | ---: | ---: | --- |
-| Any non-wrapper | 1918/2000 | 1331/2000 | 0.68 | 97.9% | c_family (73.8%), csharp (4.7%), powershell (3.4%) |
-| Correct label | 1791/2000 | 1737/2000 | 0.83 | 90.8% | — |
+| Any non-wrapper | 111/125 | 57/125 | 0.50 | 90.7% | html (20.6%), __unknown__ (19.3%), php (19.0%) |
+| Correct label | 100/125 | 95/125 | 0.73 | 82.6% | — |
 
 ### needle_32_63
 
-Host fragments with a foreign-language needle injection sized 32-63 printable chars (whitespace ignored).
+Natural monitor files with a short foreign-language needle sized 32-63 printable chars (whitespace ignored).
 
-- Samples: 2000
-- Characters evaluated: 2839542
-- Overall accuracy: 0.9360
-- High confusions: css->c_family 6962 (5.4%), javascript_typescript->c_family 6841 (5.7%), powershell->c_family 6698 (5.2%), csv->c_family 6354 (5.3%), visual_basic->c_family 6331 (5.5%)
+- Samples: 51
+- Characters evaluated: 160827
+- Overall accuracy: 0.8899
+- High confusions: html->php 3190 (5.4%), markdown->php 2338 (6.0%), shell->html 1752 (15.7%), c_family->markdown 1413 (99.9%), restructuredtext->php 1387 (8.8%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| c_family | 122734 | 0.9664 |
-| encoding_base64 | 111376 | 0.9574 |
-| dockerfile | 87849 | 0.9556 |
-| encoding_base58 | 104514 | 0.9525 |
-| encoding_hex | 113342 | 0.9512 |
-| encoding_base32 | 118464 | 0.9502 |
-| encoding_base85 | 101377 | 0.9497 |
-| html | 122002 | 0.9481 |
-| csv | 120959 | 0.9464 |
-| text | 107096 | 0.9446 |
-| json | 93934 | 0.9430 |
-| css | 127971 | 0.9409 |
-| csharp | 116333 | 0.9389 |
-| yaml | 108431 | 0.9380 |
-| go | 131920 | 0.9336 |
-| rust | 132375 | 0.9313 |
-| shell | 76547 | 0.9291 |
-| sql | 106851 | 0.9269 |
-| powershell | 128119 | 0.9260 |
-| ruby | 109704 | 0.9241 |
-| java | 127285 | 0.9231 |
-| php | 109147 | 0.9224 |
-| python | 126246 | 0.9109 |
-| visual_basic | 115987 | 0.9080 |
-| javascript_typescript | 118979 | 0.8917 |
+| dockerfile | 3544 | 0.9992 |
+| php | 2961 | 0.9774 |
+| svg | 4553 | 0.9464 |
+| html | 59065 | 0.9407 |
+| powershell | 12461 | 0.9255 |
+| restructuredtext | 15748 | 0.9086 |
+| markdown | 38803 | 0.9081 |
+| css | 870 | 0.8391 |
+| yaml | 5674 | 0.8162 |
+| xml | 103 | 0.7961 |
+| javascript_typescript | 1374 | 0.7082 |
+| shell | 11135 | 0.6919 |
+| json | 2625 | 0.5840 |
+| python | 195 | 0.4615 |
+| c_family | 1414 | 0.0000 |
+| rust | 159 | 0.0000 |
+| ruby | 87 | 0.0000 |
+| encoding_base64 | 56 | 0.0000 |
 | __unknown__ | 0 | nan |
 
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |
 | --- | --- | --- | ---: | ---: | --- |
-| Any non-wrapper | 1707/2000 | 636/2000 | 0.51 | 83.3% | c_family (12.5%), csharp (11.9%), python (9.9%) |
-| Correct label | 1474/2000 | 1408/2000 | 0.66 | 72.7% | — |
+| Any non-wrapper | 49/51 | 20/51 | 0.42 | 90.2% | php (34.8%), html (13.3%), yaml (13.2%) |
+| Correct label | 41/51 | 41/51 | 0.72 | 76.7% | — |
 
 ### needle_16_31
 
-Host fragments with a foreign-language needle injection sized 16-31 printable chars (whitespace ignored).
+Natural monitor files with a short foreign-language needle sized 16-31 printable chars (whitespace ignored).
 
-- Samples: 2000
-- Characters evaluated: 2766550
-- Overall accuracy: 0.9564
-- High confusions: javascript_typescript->c_family 3682 (3.1%), go->c_family 3658 (3.0%), java->c_family 3632 (3.3%), csv->c_family 3549 (2.9%), encoding_base58->c_family 3479 (3.1%)
+- Samples: 51
+- Characters evaluated: 178110
+- Overall accuracy: 0.9230
+- High confusions: html->php 2668 (3.4%), restructuredtext->shell 1963 (13.2%), json->__unknown__ 1827 (19.5%), restructuredtext->php 1507 (10.1%), html->javascript_typescript 923 (1.2%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| encoding_base64 | 108104 | 0.9767 |
-| encoding_hex | 113210 | 0.9757 |
-| text | 105895 | 0.9740 |
-| encoding_base85 | 117006 | 0.9738 |
-| c_family | 121938 | 0.9737 |
-| encoding_base32 | 108440 | 0.9726 |
-| html | 112889 | 0.9709 |
-| csv | 120636 | 0.9699 |
-| json | 93592 | 0.9689 |
-| encoding_base58 | 113637 | 0.9684 |
-| css | 117265 | 0.9632 |
-| dockerfile | 78123 | 0.9571 |
-| powershell | 128463 | 0.9549 |
-| yaml | 104951 | 0.9546 |
-| csharp | 106227 | 0.9515 |
-| ruby | 115466 | 0.9511 |
-| rust | 116455 | 0.9480 |
-| sql | 104394 | 0.9457 |
-| go | 122950 | 0.9450 |
-| php | 109117 | 0.9410 |
-| visual_basic | 135540 | 0.9407 |
-| java | 109309 | 0.9348 |
-| javascript_typescript | 116990 | 0.9333 |
-| shell | 72352 | 0.9306 |
-| python | 113601 | 0.9299 |
+| powershell | 1383 | 1.0000 |
+| dockerfile | 1787 | 0.9983 |
+| yaml | 12952 | 0.9879 |
+| markdown | 29774 | 0.9659 |
+| php | 3758 | 0.9476 |
+| html | 77537 | 0.9467 |
+| python | 1327 | 0.9375 |
+| shell | 8376 | 0.9368 |
+| javascript_typescript | 15567 | 0.9239 |
+| csharp | 38 | 0.8947 |
+| json | 9386 | 0.7988 |
+| restructuredtext | 14853 | 0.7664 |
+| css | 421 | 0.4869 |
+| encoding_hex | 764 | 0.1479 |
+| xml | 78 | 0.0000 |
+| sql | 49 | 0.0000 |
+| dart | 31 | 0.0000 |
+| ruby | 29 | 0.0000 |
 | __unknown__ | 0 | nan |
+| c_family | 0 | nan |
 
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |
 | --- | --- | --- | ---: | ---: | --- |
-| Any non-wrapper | 1419/2000 | 501/2000 | 0.41 | 68.7% | c_family (11.6%), csharp (10.1%), python (8.4%) |
-| Correct label | 1135/2000 | 1068/2000 | 0.49 | 54.7% | — |
+| Any non-wrapper | 35/51 | 15/51 | 0.29 | 50.0% | yaml (49.9%), html (16.7%), php (13.9%) |
+| Correct label | 28/51 | 24/51 | 0.42 | 38.8% | — |
 
 ### needle_4_15
 
-Host fragments with a foreign-language needle injection sized 4-15 printable chars (whitespace ignored).
+Natural monitor files with a short foreign-language needle sized 4-15 printable chars (whitespace ignored).
 
-- Samples: 2000
-- Characters evaluated: 2729927
-- Overall accuracy: 0.9701
-- High confusions: rust->c_family 2123 (1.8%), csharp->c_family 2078 (1.9%), encoding_base85->c_family 2032 (1.9%), go->c_family 1953 (1.6%), java->c_family 1928 (1.7%)
+- Samples: 43
+- Characters evaluated: 126512
+- Overall accuracy: 0.8249
+- High confusions: html->php 5722 (7.1%), html->__unknown__ 2957 (3.7%), css->__unknown__ 2160 (49.3%), php->html 2148 (18.7%), markdown->html 1851 (13.6%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
-| encoding_base58 | 113187 | 0.9855 |
-| encoding_hex | 100450 | 0.9853 |
-| encoding_base64 | 102144 | 0.9851 |
-| encoding_base32 | 112696 | 0.9847 |
-| csv | 115899 | 0.9846 |
-| html | 126641 | 0.9834 |
-| encoding_base85 | 109072 | 0.9809 |
-| css | 126927 | 0.9780 |
-| c_family | 116285 | 0.9763 |
-| json | 98221 | 0.9754 |
-| text | 107494 | 0.9753 |
-| ruby | 112796 | 0.9702 |
-| sql | 101411 | 0.9694 |
-| yaml | 103316 | 0.9684 |
-| dockerfile | 68651 | 0.9657 |
-| go | 122831 | 0.9643 |
-| powershell | 112293 | 0.9632 |
-| csharp | 110944 | 0.9621 |
-| visual_basic | 121482 | 0.9609 |
-| shell | 78354 | 0.9594 |
-| java | 112289 | 0.9579 |
-| php | 99816 | 0.9546 |
-| rust | 119779 | 0.9541 |
-| python | 112614 | 0.9525 |
-| javascript_typescript | 124335 | 0.9522 |
+| restructuredtext | 443 | 1.0000 |
+| dockerfile | 881 | 0.9955 |
+| rust | 5811 | 0.9919 |
+| yaml | 4214 | 0.9440 |
+| html | 80097 | 0.8817 |
+| markdown | 13638 | 0.7907 |
+| php | 11500 | 0.7745 |
+| javascript_typescript | 2422 | 0.5917 |
+| shell | 488 | 0.5266 |
+| css | 4383 | 0.2900 |
+| ruby | 1085 | 0.0184 |
+| go | 908 | 0.0000 |
+| sql | 423 | 0.0000 |
+| scala | 143 | 0.0000 |
+| xml | 39 | 0.0000 |
+| c_family | 37 | 0.0000 |
 | __unknown__ | 0 | nan |
 
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |
 | --- | --- | --- | ---: | ---: | --- |
-| Any non-wrapper | 954/2000 | 298/2000 | 0.25 | 52.2% | c_family (10.0%), csharp (9.8%), powershell (6.7%) |
-| Correct label | 620/2000 | 569/2000 | 0.26 | 33.4% | — |
+| Any non-wrapper | 14/43 | 5/43 | 0.13 | 38.2% | html (49.6%), markdown (22.5%), yaml (14.0%) |
+| Correct label | 12/43 | 12/43 | 0.25 | 34.0% | — |
 
 ## Throughput Benchmarks
 
-| Task | Device | Samples | Total Bytes | Throughput | Latency (s) | RSS Δ (MB) | Device Δ (MB) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| throughput_1024 | cpu | 8 | 8192 | 3.55 KB/s | 2.25 | 610.45 | n/a |
-| throughput_10240 | cpu | 8 | 81920 | 22.19 KB/s | 3.61 | 93.09 | n/a |
-| throughput_102400 | cpu | 8 | 819200 | 55.56 KB/s | 14.40 | 203.51 | n/a |
-| throughput_1048576 | cpu | 8 | 8388608 | 72.45 KB/s | 113.06 | 383.29 | n/a |
-| throughput_1024 | cuda | 8 | 8192 | 10.30 KB/s | 0.78 | 1.88 | n/a |
-| throughput_10240 | cuda | 8 | 81920 | 53.42 KB/s | 1.50 | 38.18 | n/a |
-| throughput_102400 | cuda | 8 | 819200 | 82.77 KB/s | 9.67 | 19.38 | n/a |
-| throughput_1048576 | cuda | 8 | 8388608 | 90.11 KB/s | 90.91 | 256.11 | n/a |
+| Task | Device | Samples | Total Bytes | Throughput | Latency (s) | RSS Δ (MB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| throughput_1024 | cpu | 32 | 32768 | 4.16 KB/s | 7.68 | 849.08 |
+| throughput_10240 | cpu | 32 | 327680 | 28.76 KB/s | 11.13 | 73.48 |
+| throughput_102400 | cpu | 32 | 3276800 | 49.91 KB/s | 64.12 | 114.28 |
+| throughput_1048576 | cpu | 32 | 33554432 | 74.51 KB/s | 439.79 | 363.23 |
+| throughput_1024 | cuda | 32 | 32768 | 38.51 KB/s | 0.83 | -119.11 |
+| throughput_10240 | cuda | 32 | 327680 | 81.91 KB/s | 3.91 | 0.16 |
+| throughput_102400 | cuda | 32 | 3276800 | 89.76 KB/s | 35.65 | -0.90 |
+| throughput_1048576 | cuda | 32 | 33554432 | 93.49 KB/s | 350.51 | 147.35 |
 
-Report generated at 2025-11-26 20:18:23
+Latency is the total wall-clock time to run the benchmark loop over all samples per benchmark type, excluding the one warmup inference call that triggers JAX’s JIT compilation beforehand.
+RSS Δ (MB) is the difference in the Python process’s resident set size (RSS) measured via `psutil` immediately before and after each throughput benchmark, approximating the net change in host memory usage attributable to the model and runtime.
+
+Report generated at 2025-12-04 10:46:38

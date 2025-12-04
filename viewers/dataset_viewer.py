@@ -13,19 +13,27 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 import threading
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import uvicorn  # type: ignore
 from datasets import Dataset, load_from_disk  # type: ignore
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn  # type: ignore
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+TRAIN_ROOT = REPO_ROOT / "train"
+if str(TRAIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(TRAIN_ROOT))
 
 try:
-    from train import config as train_config  # type: ignore
+    import utils.config as train_config  # type: ignore
 
     train_config.update_lang_mappings()
     _ID2LANG = dict(train_config.ID2LANG)
@@ -811,7 +819,7 @@ def main() -> None:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("arrow_out"),
+        default=Path(__file__).parent.parent / "downloader" / Path("arrow_out"),
         help="Root directory containing split/label/dataset outputs from 0_main.py.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host interface for the web server.")

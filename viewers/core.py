@@ -4,33 +4,56 @@ Shared model-loading, inference, and label/color utilities for the viewer apps.
 """
 
 import os
+
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-from typing import List, Tuple, Optional, Any, Dict, Sequence
-from collections.abc import Mapping
-import dataclasses
-from pathlib import Path
-import re
-import json
 import bisect
-import importlib.util
+import dataclasses
+import importlib
+import json
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
-
+import flax.serialization as serialization
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-import flax.serialization as serialization
+import numpy as np
 import orbax.checkpoint as ocp
+from flax import linen as nn
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[@-~]")
 
 
 def _load_train_module(module_name: str):
-    module_path = REPO_ROOT / "train" / f"{module_name}.py"
+    """
+    Load a training module used by the viewers.
+
+    Prefers the new `utils.<module_name>` layout (under the repo root),
+    but falls back to the legacy `train/<module_name>.py` location if needed.
+    """
+    # Ensure REPO_ROOT and train/ are importable when running from viewers/
+    repo_str = str(REPO_ROOT)
+    if repo_str not in os.sys.path:
+        os.sys.path.insert(0, repo_str)
+    train_root = REPO_ROOT / "train"
+    train_str = str(train_root)
+    if train_root.exists() and train_str not in os.sys.path:
+        os.sys.path.insert(0, train_str)
+
+    # New layout: utils.<module_name> package at repo root
+    try:
+        return importlib.import_module(f"utils.{module_name}")
+    except Exception:
+        pass
+
+    # Legacy layout: a plain script at train/<module_name>.py
+    module_path = train_root / f"{module_name}.py"
     if not module_path.exists():
         raise ImportError(
-            f"Expected to find train/{module_name}.py next to segment_viewer, "
+            f"Expected to find utils.{module_name} or train/{module_name}.py next to segment_viewer, "
             f"but {module_path} does not exist."
         )
     spec = importlib.util.spec_from_file_location(
@@ -70,11 +93,11 @@ def _apply_label_mapping(label_names: Sequence[str]) -> None:
 def _configured_languages() -> List[str]:
     if TRAIN_CONFIG is None:
         raise RuntimeError(
-            "train/config.py could not be loaded; unable to resolve label ordering automatically."
+            "Training config could not be loaded; unable to resolve label ordering automatically."
         )
     mapping = getattr(TRAIN_CONFIG, "LANG2ID", None)
     if not isinstance(mapping, dict):
-        raise RuntimeError("train/config.py does not define LANG2ID mapping")
+        raise RuntimeError("Training config does not define LANG2ID mapping")
     return [name for name, _ in sorted(mapping.items(), key=lambda kv: kv[1])]
 
 
@@ -135,6 +158,39 @@ def _extract_run_id_from_checkpoint(path: Path) -> Optional[str]:
     if not match:
         return None
     return match.group(1)
+
+
+def _sanitize_label_list(raw: Sequence[Any]) -> List[str]:
+    cleaned: List[str] = []
+    if not raw:
+        return cleaned
+    allowed = None
+    if TRAIN_CONFIG is not None:
+        mapping = getattr(TRAIN_CONFIG, "LANG2ID", None)
+        if isinstance(mapping, dict):
+            allowed = set(mapping.keys())
+    seen = set()
+    dropped: List[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        candidate = ANSI_ESCAPE_RE.sub("", entry).strip()
+        if not candidate:
+            continue
+        if allowed is not None and candidate not in allowed:
+            dropped.append(candidate)
+            continue
+        if candidate in seen:
+            continue
+        cleaned.append(candidate)
+        seen.add(candidate)
+    if dropped:
+        sample = ", ".join(sorted(set(dropped))[:5])
+        print(
+            f"⚠️  Ignoring {len(dropped)} unknown labels from checkpoint metadata: {sample}",
+            flush=True,
+        )
+    return cleaned
 
 def _parse_label_names_from_output(log_text: str) -> List[str]:
     labels: List[str] = []
@@ -232,6 +288,9 @@ def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
                     label_names[idx] = label
                 if label_names:
                     ordered = [label_names[i] for i in sorted(label_names)]
+                    ordered = _sanitize_label_list(ordered)
+                    if not ordered:
+                        ordered = _configured_languages()
                     result["label_names"] = ordered
                     result["_label_source"] = "wandb"
         # Fallback: parse label order from output.log
@@ -239,7 +298,9 @@ def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
         if output_log.exists():
             parsed_labels = _parse_label_names_from_output(output_log.read_text())
             if parsed_labels:
-                result.setdefault("label_names", parsed_labels)
+                ordered = _sanitize_label_list(parsed_labels)
+                if ordered:
+                    result.setdefault("label_names", ordered)
                 result.setdefault("_label_source", "output_log")
         if result:
             return result
@@ -526,8 +587,8 @@ def _load_params_from_any(ckpt_path: str, params_template_for_msgpack):
 
     # 2c) Typed restore: provide a dummy TrainState structure as the target
     try:
-        from flax.training import train_state as ts
         import optax
+        from flax.training import train_state as ts
         # Any tx works; we only need structure. Identity keeps it light.
         tx = optax.identity()
         dummy_state = ts.TrainState.create(
@@ -569,6 +630,8 @@ _ALLOWED_MODEL_TOKEN_VALUES = np.array(
 _PLACEHOLDER_CHAR = "\u00A4"
 _ALLOWED_TEXT_CHARS = {chr(b) for b in _VISIBLE_ASCII_BYTES}
 _ALLOWED_TEXT_CHARS.update({" ", "\n", "\t", _PLACEHOLDER_CHAR})
+_VISUAL_WHITESPACE_CHARS = (" ", "\t", "\n")
+_VISUAL_WHITESPACE_SET = frozenset(_VISUAL_WHITESPACE_CHARS)
 
 
 def _normalize_input_text(text: Optional[str]) -> str:
@@ -604,6 +667,97 @@ def _sanitize_model_tokens(arr: np.ndarray) -> np.ndarray:
     if np.any(invalid):
         arr_np[invalid] = _CURRENCY_BYTE_ID
     return arr_np
+
+
+def _relabel_whitespace_from_neighbors(
+    text: str,
+    labels: List[int],
+    char_probs: List[Dict[str, float]],
+) -> tuple[List[int], List[Dict[str, float]]]:
+    n = len(text)
+    if n == 0 or not labels or len(labels) != n:
+        return labels, char_probs
+
+    # Fast path: no visual whitespace present.
+    if not any(ch in _VISUAL_WHITESPACE_SET for ch in text):
+        return labels, char_probs
+
+    new_labels = list(labels)
+    new_probs = list(char_probs)
+
+    # Build per-line segments so we can prefer neighbors from the same line.
+    line_starts: List[int] = [0]
+    for idx, ch in enumerate(text):
+        if ch == "\n" and idx + 1 < n:
+            line_starts.append(idx + 1)
+    # Ensure monotonic order and uniqueness.
+    line_starts = sorted(set(line_starts))
+    line_segments: List[tuple[int, int]] = []
+    for i, start in enumerate(line_starts):
+        end = line_starts[i + 1] if i + 1 < len(line_starts) else n
+        if start < end:
+            line_segments.append((start, end))
+
+    left_same_line = [-1] * n
+    right_same_line = [-1] * n
+    for start, end in line_segments:
+        last_non_ws = -1
+        for i in range(start, end):
+            if text[i] not in _VISUAL_WHITESPACE_SET:
+                last_non_ws = i
+            left_same_line[i] = last_non_ws
+        last_non_ws = -1
+        for i in range(end - 1, start - 1, -1):
+            if text[i] not in _VISUAL_WHITESPACE_SET:
+                last_non_ws = i
+            right_same_line[i] = last_non_ws
+
+    left_any = [-1] * n
+    right_any = [-1] * n
+    last_non_ws = -1
+    for i in range(n):
+        if text[i] not in _VISUAL_WHITESPACE_SET:
+            last_non_ws = i
+        left_any[i] = last_non_ws
+    last_non_ws = -1
+    for i in range(n - 1, -1, -1):
+        if text[i] not in _VISUAL_WHITESPACE_SET:
+            last_non_ws = i
+        right_any[i] = last_non_ws
+
+    for i, ch in enumerate(text):
+        if ch not in _VISUAL_WHITESPACE_SET:
+            continue
+        src = -1
+        ls = left_same_line[i]
+        rs = right_same_line[i]
+        if ls != -1 or rs != -1:
+            if ls == -1:
+                src = rs
+            elif rs == -1:
+                src = ls
+            else:
+                dist_l = i - ls
+                dist_r = rs - i
+                src = ls if dist_l <= dist_r else rs
+        else:
+            la = left_any[i]
+            ra = right_any[i]
+            if la != -1 or ra != -1:
+                if la == -1:
+                    src = ra
+                elif ra == -1:
+                    src = la
+                else:
+                    dist_l = i - la
+                    dist_r = ra - i
+                    src = la if dist_l <= dist_r else ra
+        if src == -1:
+            continue
+        new_labels[i] = labels[src]
+        if 0 <= src < len(char_probs):
+            new_probs[i] = dict(char_probs[src])
+    return new_labels, new_probs
 
 # ---------------------------
 # Model (must mirror training EXACTLY)
@@ -679,8 +833,16 @@ def make_slug(name: str) -> str:
     return re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
 
 class Predictor:
-    def __init__(self, ckpt_path: str, num_classes: int, model_dim: int,
-                 channels: Tuple[int, ...], dtype_str: str = "bfloat16", chunk: int = DEFAULT_CHUNK_SIZE):
+    def __init__(
+        self,
+        ckpt_path: str,
+        num_classes: int,
+        model_dim: int,
+        channels: Tuple[int, ...],
+        dtype_str: str = "bfloat16",
+        chunk: int = DEFAULT_CHUNK_SIZE,
+        other_threshold: Optional[float] = None,
+    ):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         self.num_classes = int(num_classes)
@@ -701,6 +863,10 @@ class Predictor:
         # Precompile apply fn; JIT caches per-seq-length (shape-polymorphic)
         self._apply = jax.jit(lambda tok: self.model.apply({"params": self.params}, tok, train=False))
         self._last_window_spans: List[Tuple[int, int]] = []
+        # Optional virtual "other" bucket driven by a confidence threshold
+        self.other_threshold: Optional[float] = (
+            float(other_threshold) if other_threshold is not None and other_threshold > 0.0 else None
+        )
 
     @staticmethod
     def _window_weights(length: int) -> np.ndarray:
@@ -803,8 +969,8 @@ class Predictor:
         return np.asarray(logits, dtype=np.float32)
 
     def _byte_labels_to_char_labels(self, text: str, byte_labels: np.ndarray, byte_probs: np.ndarray = None) -> tuple[List[int], List[Dict[str, float]]]:
-        labels = []
-        char_probs = []
+        labels: List[int] = []
+        char_probs: List[Dict[str, float]] = []
         bpos = 0
         for ch in text:
             cb = ch.encode("utf-8")
@@ -829,7 +995,36 @@ class Predictor:
             labels.append(lbl)
             char_probs.append(probs)
             bpos += L
+        labels, char_probs = _relabel_whitespace_from_neighbors(text, labels, char_probs)
         return labels, char_probs
+
+    def _apply_other_threshold(
+        self,
+        labels: List[int],
+        char_probs: List[Dict[str, float]],
+    ) -> tuple[List[int], List[Dict[str, float]]]:
+        """
+        Optionally map low-confidence characters into a virtual 'other' bucket.
+
+        If other_threshold is set, any character whose maximum softmax
+        probability across the trained classes is below this threshold is
+        relabeled to an extra 'other' id at index self.num_classes.
+        """
+        thr = self.other_threshold
+        if thr is None or thr <= 0.0 or not labels or not char_probs:
+            return labels, char_probs
+        other_id = self.num_classes
+        out_labels = list(labels)
+        for i, probs in enumerate(char_probs):
+            if not probs:
+                continue
+            try:
+                max_prob = max(float(v) for v in probs.values())
+            except Exception:
+                continue
+            if max_prob < thr:
+                out_labels[i] = other_id
+        return out_labels, char_probs
 
     def _smooth_min_run(self, labels: List[int], min_run: int) -> List[int]:
         if min_run <= 1 or len(labels) == 0:
@@ -862,6 +1057,8 @@ class Predictor:
         byte_labels, byte_probs = self._segment_bytes(b)
         char_labels, char_probs = self._byte_labels_to_char_labels(text, byte_labels, byte_probs)
         char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
+        # Apply optional virtual 'other' thresholding per character.
+        char_labels, char_probs = self._apply_other_threshold(char_labels, char_probs)
         segs = []
         if len(char_labels) > 0:
             cur = char_labels[0]; start = 0

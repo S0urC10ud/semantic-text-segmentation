@@ -11,19 +11,19 @@ Then open http://127.0.0.1:8000
 """
 
 import os
+
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-from typing import List, Dict, Optional
-from pathlib import Path
 import argparse
 import json
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import jax
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 try:
     from .core import (
@@ -31,13 +31,13 @@ try:
         DEFAULT_CHUNK_SIZE,
         Predictor,
         _apply_label_mapping,
-        _resolve_langs_and_display,
-        _load_checkpoint_hparams,
-        _infer_checkpoint_architecture,
-        _resolve_hparam,
-        _resolve_colors,
         _hex_to_rgba,
+        _infer_checkpoint_architecture,
+        _load_checkpoint_hparams,
         _normalize_input_text,
+        _resolve_colors,
+        _resolve_hparam,
+        _resolve_langs_and_display,
         make_slug,
     )
 except ImportError:  # pragma: no cover
@@ -46,13 +46,13 @@ except ImportError:  # pragma: no cover
         DEFAULT_CHUNK_SIZE,
         Predictor,
         _apply_label_mapping,
-        _resolve_langs_and_display,
-        _load_checkpoint_hparams,
-        _infer_checkpoint_architecture,
-        _resolve_hparam,
-        _resolve_colors,
         _hex_to_rgba,
+        _infer_checkpoint_architecture,
+        _load_checkpoint_hparams,
         _normalize_input_text,
+        _resolve_colors,
+        _resolve_hparam,
+        _resolve_langs_and_display,
         make_slug,
     )
 
@@ -94,6 +94,12 @@ parser.add_argument(
 parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8000)
 parser.add_argument("--openapi", action="store_true")
+parser.add_argument(
+    "--other-threshold",
+    type=float,
+    default=0.3,
+    help="If >0, treat characters whose max softmax is below this as a virtual 'other' class.",
+)
 args, _ = parser.parse_known_args()
 
 ckpt_path = Path(args.ckpt).resolve()
@@ -176,12 +182,26 @@ ID2NAME = {i: display_label_names[i] for i in range(num_classes)}
 ID2COLOR = {i: cols[i] for i in range(num_classes)}
 ID2SLUG  = {i: make_slug(ID2CANONICAL[i]) for i in range(num_classes)}
 
+# Virtual 'other' bucket used when the predictor applies a low-confidence
+# threshold per character. Its index is one past the highest trained class.
+OTHER_LABEL_ID = num_classes
+ID2CANONICAL[OTHER_LABEL_ID] = "other"
+ID2NAME[OTHER_LABEL_ID] = "other"
+ID2COLOR.setdefault(OTHER_LABEL_ID, "#7f8c8d")
+ID2SLUG[OTHER_LABEL_ID] = make_slug("other")
+
 predictor = None
 load_error = None
 try:
-    predictor = Predictor(ckpt_path=args.ckpt, num_classes=num_classes,
-                          model_dim=args.model_dim, channels=channels,
-                          dtype_str=args.dtype, chunk=args.chunk)
+    predictor = Predictor(
+        ckpt_path=args.ckpt,
+        num_classes=num_classes,
+        model_dim=args.model_dim,
+        channels=channels,
+        dtype_str=args.dtype,
+        chunk=args.chunk,
+        other_threshold=args.other_threshold,
+    )
 except Exception as e:
     load_error = str(e)
 
@@ -205,10 +225,19 @@ def index():
 
 @app.get("/api/labels")
 def get_labels():
+    label_ids = sorted(ID2NAME.keys())
     return {
-        "num_classes": num_classes,
-        "labels": [{"id": i, "name": ID2NAME[i], "slug": ID2SLUG[i], "color": ID2COLOR.get(i)}
-                   for i in range(num_classes) if ID2COLOR.get(i)],
+        "num_classes": len(label_ids),
+        "labels": [
+            {
+                "id": i,
+                "name": ID2NAME[i],
+                "slug": ID2SLUG[i],
+                "color": ID2COLOR.get(i),
+            }
+            for i in label_ids
+            if ID2COLOR.get(i)
+        ],
         "device": str(jax.devices()),
         "loaded": load_error is None,
         "error": load_error,
@@ -329,9 +358,18 @@ def api_segment(req: SegmentRequest):
     import collections
     counts = collections.Counter(char_labels)
     total = max(1, sum(counts.values()))
-    stats = [{"id": i, "name": ID2NAME[i], "count": int(counts.get(i, 0)),
-              "pct": float(100.0 * counts.get(i, 0) / total), "color": ID2COLOR[i]}
-             for i in range(num_classes)]
+    # Include any labels that appear in the output, including the virtual 'other'.
+    label_ids = sorted(set(list(range(num_classes)) + list(counts.keys())))
+    stats = [
+        {
+            "id": i,
+            "name": ID2NAME.get(i, str(i)),
+            "count": int(counts.get(i, 0)),
+            "pct": float(100.0 * counts.get(i, 0) / total),
+            "color": ID2COLOR.get(i, "#888888"),
+        }
+        for i in label_ids
+    ]
 
     return {
         "segments": [{"start": int(s), "end": int(e), "label": int(lbl)} for (s, e, lbl) in segs],
@@ -343,4 +381,5 @@ def api_segment(req: SegmentRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host=args.host, port=args.port, reload=False)
+    # When executing this file directly, `app` is defined in this module.
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)

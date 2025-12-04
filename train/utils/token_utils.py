@@ -1,6 +1,5 @@
 import numpy as np
-
-import config as cfg
+import utils.config as cfg
 
 VISIBLE_ASCII_BYTES = tuple(range(0x20, 0x7F))
 WHITESPACE_BYTES = (0x09, 0x0A, 0x0D)

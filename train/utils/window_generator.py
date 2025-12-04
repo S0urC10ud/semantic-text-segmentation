@@ -3,22 +3,21 @@ Functions for generating training windows from datasets, including pure, mixed,
 and line-injected augmentation. Also includes the multi-threaded prefetcher.
 """
 import math
+import queue
 import random
 import re
 import threading
-import queue
 import time
-from typing import List, Tuple, Dict, Optional, TYPE_CHECKING, Any, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
-import numpy as np
 import datasets as hfds
-
-import config as cfg
+import numpy as np
+import utils.config as cfg
 
 if TYPE_CHECKING:
-    from config import DataConfig
-from data_utils import bytes_from_text
-from token_utils import sanitize_tokens
+    from utils.config import DataConfig
+from utils.data import bytes_from_text
+from utils.token_utils import sanitize_tokens
 
 _PROHIBITED_INJECTION_LANGS = {"csv", "json", "yaml", "text", "html"}
 _PROHIBITED_INJECTION_LIDS = {
@@ -76,7 +75,7 @@ _LANGUAGE_PAIR_WEIGHTS = (
     (("encoding_base58", "rust"), 6),
     (("encoding_base32", "yaml"), 4),
 )
-_DEFAULT_LANGUAGE_PAIR_MODE_PROB = 0.5
+_DEFAULT_LANGUAGE_PAIR_MODE_PROB = 0.0
 
 
 _LANGUAGE_PAIR_ADJACENCY: Dict[int, Set[int]] = {}
@@ -304,6 +303,12 @@ def _line_looks_terminated(line: str) -> bool:
         return True
     return False
 
+
+# Characters that we treat as “soft” token / boundary delimiters for
+# sampling and for positioning mixed segments/injections.
+_BOUNDARY_CHARS: Set[str] = set(" \t\r\n;:,.!?()[]{}<>\"'`")
+_BOUNDARY_BYTES: Set[int] = {ord(ch) for ch in _BOUNDARY_CHARS if ord(ch) < 256}
+
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -364,6 +369,256 @@ def _sample_mixed_segment_count(max_segments: int = 3, continue_prob: float = 0.
     while count < max_segments and random.random() < continue_prob:
         count += 1
     return count
+
+
+_DOCKERFILE_LID = cfg.LANG2ID.get("dockerfile")
+_SHELL_LID = cfg.LANG2ID.get("shell")
+_RUN_OPTION_PREFIXES = (
+    "--mount",
+    "--network",
+    "--security",
+    "--signal",
+    "--user",
+    "--group-add",
+    "--cwd",
+    "--rootfs",
+)
+_RUN_CONTINUATION_RE = re.compile(r"\\\s*(?:#.*)?\Z")
+_DOCKER_HEREDOC_PATTERN = re.compile(
+    r"<<(?P<strip>-)?\s*(?P<quote>['\"]?)(?P<tag>[A-Za-z0-9_.-]+)(?P=quote)"
+)
+
+
+def _finalize_window_arrays(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    _maybe_apply_docker_shell_labels(x, y)
+    return sanitize_tokens(x), y
+
+
+def _maybe_apply_docker_shell_labels(tokens: np.ndarray, labels: np.ndarray):
+    """Re-label dockerfile RUN command bodies as shell."""
+    if tokens is None or labels is None:
+        return
+    docker_lid = _DOCKERFILE_LID
+    shell_lid = _SHELL_LID
+    if docker_lid is None or shell_lid is None:
+        return
+    labels_arr = np.asarray(labels)
+    if labels_arr.size == 0:
+        return
+    docker_id = int(docker_lid)
+    shell_id = np.uint8(int(shell_lid))
+    tokens_arr = np.asarray(tokens)
+    length = int(labels_arr.shape[0])
+    i = 0
+    while i < length:
+        if int(labels_arr[i]) != docker_id:
+            i += 1
+            continue
+        j = i + 1
+        while j < length and int(labels_arr[j]) == docker_id:
+            j += 1
+        _relabel_docker_shell_slice(tokens_arr, labels_arr, i, j, shell_id)
+        i = j
+
+
+def _relabel_docker_shell_slice(
+    tokens: np.ndarray,
+    labels: np.ndarray,
+    start: int,
+    end: int,
+    shell_id: np.uint8,
+):
+    if end <= start:
+        return
+    span = tokens[start:end]
+    if span.size == 0:
+        return
+    clipped = np.clip(np.asarray(span, dtype=np.int32), 0, 255).astype(np.uint8, copy=False)
+    try:
+        text = clipped.tobytes().decode("utf-8", "ignore")
+    except Exception:
+        text = ""
+    if not text or "run" not in text.lower():
+        return
+    char_spans = _docker_shell_char_spans(text)
+    if not char_spans:
+        return
+    byte_spans = _char_spans_to_byte_spans(text, char_spans)
+    for local_start, local_end in byte_spans:
+        if local_end <= local_start:
+            continue
+        abs_start = start + local_start
+        abs_end = start + local_end
+        labels[abs_start:abs_end] = shell_id
+
+
+def _char_spans_to_byte_spans(
+    text: str,
+    spans: List[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    if not text or not spans:
+        return []
+    offsets = [0]
+    total = 0
+    for ch in text:
+        total += len(ch.encode("utf-8", "ignore"))
+        offsets.append(total)
+    results: List[Tuple[int, int]] = []
+    text_len = len(text)
+    for start, end in spans:
+        s = max(0, min(text_len, start))
+        e = max(s, min(text_len, end))
+        byte_start = offsets[s]
+        byte_end = offsets[e]
+        if byte_end > byte_start:
+            results.append((byte_start, byte_end))
+    return results
+
+
+def _docker_shell_char_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    if not text:
+        return spans
+    if "run" not in text.lower():
+        return spans
+    lines = text.splitlines(keepends=True)
+    offset = 0
+    for line in lines:
+        span = _scan_run_line(text, line, offset)
+        if span:
+            spans.append(span)
+        offset += len(line)
+    return spans
+
+
+def _scan_run_line(full_text: str, line: str, line_start: int) -> Optional[Tuple[int, int]]:
+    stripped = line.lstrip()
+    if not stripped:
+        return None
+    consumed = len(line) - len(stripped)
+    working = stripped
+    lower = working.lower()
+    if lower.startswith("onbuild"):
+        after = working[len("onbuild"):]
+        if not after or not after[0].isspace():
+            return None
+        consumed += len("onbuild")
+        whitespace = len(after) - len(after.lstrip(" \t"))
+        consumed += whitespace
+        working = after.lstrip(" \t")
+        lower = working.lower()
+    if not lower.startswith("run"):
+        return None
+    if len(working) <= 3 or not working[3].isspace():
+        return None
+    consumed += 3
+    after_run = working[3:]
+    whitespace_after_run = len(after_run) - len(after_run.lstrip(" \t"))
+    consumed += whitespace_after_run
+    command_start = line_start + consumed
+    command_start = _skip_run_options_in_segment(full_text, command_start)
+    if command_start >= len(full_text):
+        return None
+    remainder = full_text[command_start:].lstrip(" \t")
+    if not remainder:
+        return None
+    if remainder.startswith("["):
+        return None
+    command_end = _extend_run_command_span(full_text, command_start)
+    if command_end <= command_start:
+        return None
+    return (command_start, command_end)
+
+
+def _skip_run_options_in_segment(text: str, start_idx: int) -> int:
+    if start_idx >= len(text):
+        return start_idx
+    idx = start_idx
+    length = len(text)
+    while idx < length:
+        ch = text[idx]
+        if ch in " \t":
+            idx += 1
+            continue
+        if ch in "\r\n":
+            idx += 1
+            continue
+        if ch == "\\":
+            lookahead = idx + 1
+            while lookahead < length and text[lookahead] in " \t":
+                lookahead += 1
+            if lookahead < length and text[lookahead] == "\r":
+                lookahead += 1
+            if lookahead < length and text[lookahead] == "\n":
+                idx = lookahead + 1
+                continue
+            break
+        if text.startswith("--", idx):
+            token_end = idx + 2
+            while token_end < length and text[token_end] not in " \t\r\n":
+                token_end += 1
+            token = text[idx:token_end]
+            token_lower = token.split("=", 1)[0].lower()
+            if token_lower not in _RUN_OPTION_PREFIXES:
+                break
+            idx = token_end
+            continue
+        break
+    while idx < length and text[idx] in " \t":
+        idx += 1
+    return idx
+
+
+def _extend_run_command_span(text: str, start_idx: int) -> int:
+    length = len(text)
+    if start_idx >= length:
+        return length
+    newline_pos = text.find("\n", start_idx)
+    if newline_pos == -1:
+        first_line_end = length
+    else:
+        first_line_end = newline_pos + 1
+    first_line_text = text[start_idx:first_line_end]
+    first_line_core = first_line_text.rstrip("\r\n")
+    heredoc_match = _DOCKER_HEREDOC_PATTERN.search(first_line_core)
+    if heredoc_match:
+        token = heredoc_match.group("tag")
+        allow_tabs = bool(heredoc_match.group("strip"))
+        search_pos = first_line_end
+        while search_pos < length:
+            next_newline = text.find("\n", search_pos)
+            if next_newline == -1:
+                line_end = length
+            else:
+                line_end = next_newline + 1
+            line_text = text[search_pos:line_end]
+            stripped_line = line_text.rstrip("\r\n")
+            comparison = stripped_line.lstrip("\t") if allow_tabs else stripped_line
+            if comparison == token:
+                return search_pos
+            search_pos = line_end
+        return length
+    command_end = first_line_end
+    line_body = first_line_core
+    while command_end < length and _line_has_continuation(line_body):
+        line_start = command_end
+        next_newline = text.find("\n", line_start)
+        if next_newline == -1:
+            command_end = length
+            line_body = text[line_start:command_end]
+            break
+        command_end = next_newline + 1
+        line_body = text[line_start:next_newline].rstrip("\r")
+    return command_end
+
+
+def _line_has_continuation(line_body: str) -> bool:
+    if not line_body:
+        return False
+    return bool(_RUN_CONTINUATION_RE.search(line_body.rstrip()))
 
 
 def _choose_segment_slice(
@@ -500,6 +755,77 @@ def _choose_segment_slice(
                     return best_segment, best_start  # type: ignore[return-value]
                 return best_segment
 
+    # Token-aligned fallback for non-line-structured text.
+    if text:
+        boundary_chars = _BOUNDARY_CHARS
+        char_offsets: List[int] = []
+        acc = 0
+        for ch in text:
+            char_offsets.append(acc)
+            acc += len(ch.encode("utf-8", "ignore"))
+        total_bytes = acc
+        if total_bytes == total:  # sanity check
+            token_starts: List[int] = []
+            for i, ch in enumerate(text):
+                if ch in boundary_chars:
+                    continue
+                if i == 0 or text[i - 1] in boundary_chars:
+                    token_starts.append(i)
+            token_candidates: List[Tuple[Tuple[int, int], int, int]] = []
+            if token_starts:
+                max_token_attempts = min(len(token_starts), max_attempts * 4)
+                for _ in range(max_token_attempts):
+                    start_char = random.choice(token_starts)
+                    start_byte = char_offsets[start_char]
+                    if start_byte >= total:
+                        continue
+                    # Extend over following tokens until we approach seg_len.
+                    end_char = start_char
+                    last_non_ws_end = start_char
+                    while end_char < len(text):
+                        ch = text[end_char]
+                        if ch in boundary_chars:
+                            if char_offsets[end_char] - start_byte >= seg_len:
+                                break
+                        else:
+                            last_non_ws_end = end_char + 1
+                        # Stop if we exceed allowed overrun.
+                        current_bytes = char_offsets[end_char] - start_byte
+                        if current_bytes > seg_len + max_overrun:
+                            break
+                        end_char += 1
+                    if last_non_ws_end <= start_char:
+                        continue
+                    end_byte = (
+                        char_offsets[last_non_ws_end]
+                        if last_non_ws_end < len(char_offsets)
+                        else total
+                    )
+                    if end_byte <= start_byte:
+                        continue
+                    slice_len = end_byte - start_byte
+                    if slice_len < max(8, min_letters):
+                        continue
+                    snippet = byte_content[start_byte:end_byte]
+                    snippet_text = snippet.tobytes().decode("utf-8", "ignore")
+                    letters = _count_ascii_letters(snippet_text)
+                    if letters < max(min_letters, 1):
+                        continue
+                    quality = (
+                        abs(slice_len - seg_len),
+                        -letters,
+                    )
+                    token_candidates.append((quality, start_byte, end_byte))
+
+            if token_candidates:
+                token_candidates.sort(key=lambda item: item[0])
+                _, best_start_byte, best_end_byte = token_candidates[0]
+                best_segment = byte_content[best_start_byte:best_end_byte]
+                if return_start:
+                    return best_segment, best_start_byte  # type: ignore[return-value]
+                return best_segment
+
+    # Original random fallback when token alignment is not available.
     chosen_start = 0
     if seg_len > guard_len:
         if total == seg_len:
@@ -518,8 +844,8 @@ def _choose_segment_slice(
         else:
             start = random.randint(0, total - seg_len)
         segment = byte_content[start:start + seg_len]
-        text = segment.tobytes().decode("utf-8", "ignore")
-        letters = _count_ascii_letters(text)
+        text_seg = segment.tobytes().decode("utf-8", "ignore")
+        letters = _count_ascii_letters(text_seg)
         if letters >= min_letters:
             return (segment, start) if return_start else segment
         if letters > best_letters:
@@ -671,7 +997,8 @@ def _make_pure_window_impl(
     x = np.full((target_len,), cfg.PAD_BYTE_ID, dtype=np.int32)
     y = np.full((target_len,), cfg.PAD_ID, dtype=np.uint8)
     if not lids:
-        return sanitize_tokens(x), y, meta
+        x, y = _finalize_window_arrays(x, y)
+        return x, y, meta
     lid, ex, byte_content = _sample_nonempty_example(dsets_by_lang, lids)
     if ex is None or byte_content is None or byte_content.size == 0:
         if collect_meta:
@@ -684,7 +1011,8 @@ def _make_pure_window_impl(
                     "status": "failed_to_sample_nonempty",
                 }
             )
-        return sanitize_tokens(x), y, meta
+        x, y = _finalize_window_arrays(x, y)
+        return x, y, meta
 
     total_len = int(byte_content.shape[0])
     start = 0
@@ -705,7 +1033,8 @@ def _make_pure_window_impl(
                     "status": "zero_bytes",
                 }
             )
-        return sanitize_tokens(x), y, meta
+        x, y = _finalize_window_arrays(x, y)
+        return x, y, meta
 
     x[:L] = slice_bytes.astype(np.int32)
     y[:L] = lid
@@ -722,13 +1051,14 @@ def _make_pure_window_impl(
                 "source_offset": int(start),
             }
         )
-    return sanitize_tokens(x), y, meta
+    x, y = _finalize_window_arrays(x, y)
+    return x, y, meta
 
 
 def make_pure_window(dsets_by_lang: Dict[int, hfds.Dataset],
                      target_len: int) -> Tuple[np.ndarray, np.ndarray]:
     x, y, _ = _make_pure_window_impl(dsets_by_lang, target_len, collect_meta=False)
-    return sanitize_tokens(x), y
+    return x, y
 
 
 def _make_mixed_window_impl(
@@ -746,7 +1076,8 @@ def _make_mixed_window_impl(
 
     lids = list(dsets_by_lang.keys())
     if not lids:
-        return sanitize_tokens(x_buf), y_buf, meta
+        x_buf, y_buf = _finalize_window_arrays(x_buf, y_buf)
+        return x_buf, y_buf, meta
 
     pair_prob = _DEFAULT_LANGUAGE_PAIR_MODE_PROB
     if data_cfg is not None:
@@ -851,6 +1182,17 @@ def _make_mixed_window_impl(
         if L > left and L > 0:
             segment = segment[:left]
             L = int(segment.shape[0])
+
+        # Ensure segment boundaries fall after a soft delimiter where possible.
+        if i > 0 and left > 0 and pos > 0:
+            prev_byte = int(x_buf[pos - 1])
+            if prev_byte != cfg.PAD_BYTE_ID and prev_byte not in _BOUNDARY_BYTES:
+                prev_label = y_buf[pos - 1]
+                x_buf[pos] = ord("\n")
+                y_buf[pos] = prev_label
+                pos += 1
+                left = max(0, left - 1)
+
         write_len = min(L, left)
         start_pos = pos
         if write_len > 0:
@@ -906,7 +1248,8 @@ def _make_mixed_window_impl(
             pair_meta["unlocked_language_ids"] = sorted_unlocked
             pair_meta["unlocked_languages"] = [_lang_name(lid) for lid in sorted_unlocked]
             pair_meta["unlocked_count"] = len(sorted_unlocked)
-    return sanitize_tokens(x_buf), y_buf, meta
+    x_buf, y_buf = _finalize_window_arrays(x_buf, y_buf)
+    return x_buf, y_buf, meta
 
 
 def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
@@ -915,7 +1258,7 @@ def make_mixed_window(dsets_by_lang: Dict[int, hfds.Dataset],
     x, y, _ = _make_mixed_window_impl(
         dsets_by_lang, target_len, min_seg, collect_meta=False, data_cfg=None
     )
-    return sanitize_tokens(x), y
+    return x, y
 
 
 # ---------------------------
@@ -1148,15 +1491,21 @@ def _make_training_window_internal(
             pair_meta["present_language_ids"] = sorted(observed_ids)
             pair_meta["present_languages"] = [_lang_name(rid) for rid in sorted(observed_ids)]
         unique_langs = {seg["language_id"] for seg in final_segments}
-        if metadata["line_injections"]:
+        effective_injections = [
+            inj
+            for inj in metadata.get("line_injections", [])
+            if inj.get("final_bytes", 0) > 0
+        ]
+        if effective_injections:
             actual_mode = "line_inject"
         elif len(unique_langs) <= 1:
-            actual_mode = resolved_mode if resolved_mode == "line_inject" else "pure"
+            actual_mode = "pure"
         else:
             actual_mode = "mixed"
         metadata["actual_mode"] = actual_mode
         metadata["mode"] = actual_mode
-    return sanitize_tokens(x), y, metadata
+    x, y = _finalize_window_arrays(x, y)
+    return x, y, metadata
 
 
 def make_training_window(
@@ -1165,7 +1514,7 @@ def make_training_window(
     data_cfg: "DataConfig",
 ) -> Tuple[np.ndarray, np.ndarray]:
     x, y, _ = _make_training_window_internal(dsets_by_lang, target_len, data_cfg, collect_meta=False)
-    return sanitize_tokens(x), y
+    return x, y
 
 
 def make_training_window_with_metadata(
@@ -1174,7 +1523,7 @@ def make_training_window_with_metadata(
     data_cfg: "DataConfig",
 ) -> Tuple[np.ndarray, np.ndarray, Dict]:
     x, y, meta = _make_training_window_internal(dsets_by_lang, target_len, data_cfg, collect_meta=True)
-    return sanitize_tokens(x), y, meta or {}
+    return x, y, meta or {}
 
 
 # ---------------------------
@@ -1345,6 +1694,55 @@ def _choose_injection_boundaries(
     return sorted(picks, reverse=True)
 
 
+def _choose_injection_window_start(
+    total_len: int,
+    target_len: int,
+    injection_spans: List[Tuple[int, int]],
+) -> int:
+    """
+    Pick a crop offset so that at least one injection span
+    is likely to fall inside the [start, start+target_len) window.
+
+    If no valid span constraints are found, falls back to uniform sampling.
+    """
+    if total_len <= target_len:
+        return 0
+    max_start = max(0, total_len - target_len)
+    if not injection_spans:
+        return random.randint(0, max_start)
+
+    intervals: List[Tuple[int, int]] = []
+    for span_start, span_end in injection_spans:
+        if span_end <= span_start:
+            continue
+        span_start = max(0, min(span_start, total_len))
+        span_end = max(0, min(span_end, total_len))
+        if span_end <= span_start:
+            continue
+
+        # Any start in [min_start, max_span_start] yields overlap with this span.
+        min_start = max(0, span_end - target_len)
+        max_span_start = min(span_start, max_start)
+        if min_start <= max_span_start:
+            intervals.append((min_start, max_span_start))
+        else:
+            # Span is longer than the window or otherwise degenerate; center the crop.
+            span_mid = (span_start + span_end) // 2
+            centered = max(0, min(span_mid - target_len // 2, max_start))
+            intervals.append((centered, centered))
+
+    if not intervals:
+        return random.randint(0, max_start)
+
+    # Sample an interval weighted by its width, then a uniform point within it.
+    widths = [b - a + 1 for a, b in intervals]
+    idx = random.choices(range(len(intervals)), weights=widths, k=1)[0]
+    a, b = intervals[idx]
+    if a >= b:
+        return max(0, min(a, max_start))
+    return random.randint(a, b)
+
+
 def _leading_indent_of_line(chars: List[str], at_char_idx: int) -> str:
     i = at_char_idx - 1
     while i >= 0 and chars[i] != "\n":
@@ -1499,11 +1897,13 @@ def _ensure_merge_without_newline(
     idx: int,
 ) -> int:
     if idx > 0 and chars[idx - 1] == "\n":
-        del chars[idx - 1]
-        del labels[idx - 1]
-        if sources is not None:
-            del sources[idx - 1]
-        return idx - 1
+        prev_idx = idx - 2
+        if prev_idx < 0 or chars[prev_idx] in _BOUNDARY_CHARS:
+            del chars[idx - 1]
+            del labels[idx - 1]
+            if sources is not None:
+                del sources[idx - 1]
+            return idx - 1
     return idx
 
 
@@ -1545,7 +1945,8 @@ def _make_line_injected_window_impl(
     x = np.full((target_len,), cfg.PAD_BYTE_ID, dtype=np.int32)
     y = np.full((target_len,), cfg.PAD_ID, dtype=np.uint8)
     if not lids:
-        return sanitize_tokens(x), y, meta
+        x, y = _finalize_window_arrays(x, y)
+        return x, y, meta
 
     global _LINE_INJECT_CALL_COUNTER
     with _LINE_INJECT_COUNTER_LOCK:
@@ -1657,6 +2058,7 @@ def _make_line_injected_window_impl(
     else:
         donor_lids = list(donor_lids)
     chars, labs = list(host_text), [host_lid] * len(host_text)
+    injection_char_spans: List[Tuple[int, int]] = []
     char_sources: Optional[List[int]] = None
     host_idx: Optional[int] = None
     host_source = _extract_example_source(host_ex)
@@ -1780,6 +2182,7 @@ def _make_line_injected_window_impl(
             sample_idx = len(meta["samples"]) - 1
         _insert_block_at(chars, labs, char_sources, donor_insert_idx, donor_block, donor_lid, sample_idx)
         bidx = donor_insert_idx + len(donor_block)
+        injection_char_spans.append((donor_insert_idx, donor_insert_idx + len(donor_block)))
 
         if post_pad_count > 0:
             post_block = "\n" * post_pad_count
@@ -1801,11 +2204,36 @@ def _make_line_injected_window_impl(
                 }
             )
 
+    # Map injected character spans to byte spans so we can keep
+    # at least one injection inside the cropped window when possible.
+    injection_byte_spans: List[Tuple[int, int]] = []
+    if injection_char_spans:
+        offsets: List[int] = [0] * (len(chars) + 1)
+        acc = 0
+        for i, ch in enumerate(chars):
+            offsets[i] = acc
+            acc += len(ch.encode("utf-8", "ignore"))
+        offsets[len(chars)] = acc
+        for c_start, c_end in injection_char_spans:
+            if c_end <= c_start:
+                continue
+            c_start = max(0, min(c_start, len(chars)))
+            c_end = max(c_start, min(c_end, len(chars)))
+            b_start = offsets[c_start]
+            b_end = offsets[c_end]
+            if b_end > b_start:
+                injection_byte_spans.append((b_start, b_end))
+
     xb_u8, yb_u8, source_idx_bytes = _to_bytes_with_byte_labels(chars, labs, char_sources)
 
+    total_bytes = int(xb_u8.shape[0])
+
     # Windowing/padding
-    if len(xb_u8) >= target_len:
-        start = random.randint(0, len(xb_u8) - target_len)
+    if total_bytes >= target_len:
+        if injection_byte_spans:
+            start = _choose_injection_window_start(total_bytes, target_len, injection_byte_spans)
+        else:
+            start = random.randint(0, total_bytes - target_len)
         x = xb_u8[start:start + target_len].astype(np.int32)
         y = yb_u8[start:start + target_len]
         if source_idx_bytes is not None and source_idx_bytes.size:
@@ -1851,7 +2279,8 @@ def _make_line_injected_window_impl(
             pair_meta_out["unlocked_language_ids"] = unlocked_sorted
             pair_meta_out["unlocked_languages"] = [_lang_name(lid) for lid in unlocked_sorted]
             pair_meta_out["unlocked_count"] = len(unlocked_sorted)
-    return sanitize_tokens(x), y, meta
+    x, y = _finalize_window_arrays(x, y)
+    return x, y, meta
 
 
 def _make_markdown_window_impl(
@@ -2314,14 +2743,15 @@ def _make_markdown_window_impl(
         else:
             meta["host"] = None
 
-    return sanitize_tokens(x), y, meta
+    x, y = _finalize_window_arrays(x, y)
+    return x, y, meta
 
 
 def make_line_injected_window(dsets_by_lang: Dict[int, hfds.Dataset],
                               target_len: int,
                               data_cfg: "DataConfig") -> Tuple[np.ndarray, np.ndarray]:
     x, y, _ = _make_line_injected_window_impl(dsets_by_lang, target_len, data_cfg, collect_meta=False)
-    return sanitize_tokens(x), y
+    return x, y
 
 
 # ---------------------------
