@@ -13,12 +13,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-
 parser = argparse.ArgumentParser(description="Inspect Gemini segmentation output snapshots.")
 parser.add_argument(
     "--segments-dir",
     type=str,
-    default="../gemini_segmentations",
+    default="../../gemini_segmentations",
     help="Directory that stores *.json segmentation snapshots.",
 )
 parser.add_argument("--host", type=str, default="127.0.0.1")
