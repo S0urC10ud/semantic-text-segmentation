@@ -60,12 +60,13 @@ function showTooltip(event) {
   let html = '';
 
   const sortedProbs = Object.entries(probs)
-    .map(([id, prob]) => ({
-      id: parseInt(id, 10),
-      prob: prob,
-      label: LABELS[parseInt(id, 10)]?.name || `Class ${id}`,
-      color: LABELS[parseInt(id, 10)]?.color || '#888888'
-    }))
+    .map(([key, prob]) => {
+      const idx = Number.parseInt(key, 10);
+      const fromLabels = Number.isFinite(idx) ? LABELS[idx] : null;
+      const label = fromLabels?.name || String(key);
+      const color = fromLabels?.color || '#888888';
+      return { id: Number.isFinite(idx) ? idx : key, prob, label, color };
+    })
     .sort((a, b) => b.prob - a.prob);
 
   sortedProbs.forEach(({label, prob, color}) => {

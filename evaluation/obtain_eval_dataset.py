@@ -616,6 +616,11 @@ def _load_monitor_fragments_and_docs_from_memmap(
     contents = data["contents"]
 
     id2lang = dict(cfg.ID2LANG)
+    # Ensure the derived "other" bucket from the monitor memmap is preserved
+    # as a proper label name so evaluation can use it as ground truth.
+    other_idx = getattr(cfg, "OTHER_CLASS_INDEX", None)
+    if other_idx is not None:
+        id2lang[int(other_idx)] = "other"
     fragments_by_lang: Dict[str, List[Fragment]] = {}
     monitor_docs: List[MonitorDoc] = []
 
@@ -1099,6 +1104,66 @@ def _build_pure_dataset(
     return task, examples, desc
 
 
+def _build_pure_dataset_from_monitor(
+    monitor_docs: Sequence[MonitorDoc],
+    per_label: int,
+    rng: random.Random,
+) -> Tuple[str, List[dict], str]:
+    """
+    Build pure_fragments-style task from full monitor documents.
+
+    Each example is a single monitor document (file) and retains the original
+    multi-label segmentations from Gemini or the memmap/Arrow monitor sources.
+    """
+    task = "pure_fragments"
+    desc = "Full monitor documents with original multi-label segmentations."
+    examples: List[dict] = []
+
+    if not monitor_docs:
+        _log("⚠️  No monitor documents available; skipping pure_fragments.")
+        return task, examples, desc
+
+    docs_by_lang: Dict[str, List[MonitorDoc]] = {}
+    for doc in monitor_docs:
+        lang = doc.declared_lang or "unknown"
+        docs_by_lang.setdefault(lang, []).append(doc)
+
+    for lang, docs in docs_by_lang.items():
+        if not docs:
+            continue
+        rng.shuffle(docs)
+        limit = min(per_label, len(docs))
+        for idx, doc in enumerate(docs[:limit]):
+            if not doc.segments:
+                continue
+            segments: List[dict] = []
+            for seg in doc.segments:
+                label = str(seg.get("label", ""))
+                try:
+                    start = int(seg.get("char_start", 0))
+                    end = int(seg.get("char_end", start))
+                except (TypeError, ValueError):
+                    continue
+                if end <= start:
+                    continue
+                segments.append(_segment(label, start, end))
+            if not segments:
+                continue
+
+            langs = sorted({seg["label"] for seg in segments if seg.get("label")})
+            meta = {
+                "host_lang": lang,
+                "host_uid": doc.uid,
+                "monitor_source": doc.source,
+            }
+            if doc.extra_meta:
+                meta.update(doc.extra_meta)
+            record = _make_record(task, lang, idx, doc.content, segments, langs, meta)
+            examples.append(record)
+
+    return task, examples, desc
+
+
 def _choose_injection(
     fragments_by_lang: Dict[str, List[Fragment]],
     host_lang: str,
@@ -1300,6 +1365,10 @@ def _build_malicious_dataset(
     per_label: int,
     rng: random.Random,
 ) -> Tuple[str, List[dict], str]:
+    """Legacy synthetic malicious injection task based on pure fragments.
+
+    Kept for backward compatibility but not used in the main pipeline anymore.
+    """
     task = "mal_injection"
     desc = "Host fragments with malicious payload injections."
     examples: List[dict] = []
@@ -1350,6 +1419,151 @@ def _build_malicious_dataset(
                 "payload_bytes": payload_bytes,
             }
             examples.append(_make_record(task, host_lang, idx, content, segments, langs, meta))
+
+    return task, examples, desc
+
+
+def _build_malicious_dataset_from_monitor(
+    monitor_docs: Sequence[MonitorDoc],
+    per_label: int,
+    rng: random.Random,
+) -> Tuple[str, List[dict], str]:
+    """
+    Build mal_injection task from monitor (Gemini/memmap) documents.
+
+    The host content and its labels come directly from the monitor subset
+    (including any natural mixed-language segments). We then inject a synthetic
+    payload snippet of `payload_lang` into the document and add a new segment
+    for that snippet while preserving all original segments.
+
+    Evaluation for mal_injection then:
+      - Treats all characters whose ground-truth label is `payload_lang`
+        (including the injected span) as payload truth.
+      - Uses IoU between the payload truth mask and predicted `payload_lang`
+        / non-host predictions, so only predictions on characters whose
+        ground-truth label is *not* `payload_lang` count as false positives.
+    """
+    task = "mal_injection"
+    desc = "Monitor-based hosts with synthetic malicious payload injections."
+    examples: List[dict] = []
+    if not monitor_docs:
+        _log("⚠️  No monitor documents available; skipping mal_injection.")
+        return task, examples, desc
+
+    payload_langs = [lang for lang, payloads in malicious_injections_to_discover.items() if payloads]
+    if not payload_langs:
+        return task, examples, desc
+
+    _log("☠️  Building malicious injection dataset from monitor documents...")
+
+    # Group monitor docs by their declared host language.
+    docs_by_lang: Dict[str, List[MonitorDoc]] = {}
+    for doc in monitor_docs:
+        if not doc.content:
+            continue
+        if not doc.segments:
+            continue
+        host_lang = doc.declared_lang or "unknown"
+        docs_by_lang.setdefault(host_lang, []).append(doc)
+
+    for host_lang, docs in docs_by_lang.items():
+        if not docs:
+            continue
+        # Only inject when we have a distinct payload language available.
+        available_payload_langs = [lang for lang in payload_langs if lang != host_lang]
+        if not available_payload_langs:
+            continue
+
+        rng.shuffle(docs)
+        limit = min(per_label, len(docs))
+        for idx, doc in enumerate(docs[:limit]):
+            content = doc.content
+            if not content:
+                continue
+
+            # Choose a payload language that does not already appear in the
+            # document's segmentation, so the injected span is the only region
+            # with that label in the ground truth.
+            existing_labels = {str(seg.get("label", "")) for seg in (doc.segments or [])}
+            candidate_payloads = [lang for lang in available_payload_langs if lang not in existing_labels]
+            if not candidate_payloads:
+                candidate_payloads = available_payload_langs
+
+            payload_lang = rng.choice(candidate_payloads)
+            snippet = _generate_payload_snippet(payload_lang, rng)
+            if not snippet:
+                continue
+
+            insert_at = rng.randrange(0, len(content) + 1)
+            payload_len = len(snippet)
+            new_content = content[:insert_at] + snippet + content[insert_at:]
+
+            # Rebuild segments: preserve all original monitor segments but
+            # shift those after the insertion point and split any segment that
+            # spans across the injection boundary.
+            new_segments: List[dict] = []
+            inserted = False
+
+            def _add_payload_segment() -> None:
+                nonlocal inserted
+                if not inserted:
+                    new_segments.append(
+                        _segment(payload_lang, insert_at, insert_at + payload_len)
+                    )
+                    inserted = True
+
+            for seg in doc.segments:
+                label = str(seg.get("label", ""))
+                try:
+                    start = int(seg.get("char_start", 0))
+                    end = int(seg.get("char_end", start))
+                except (TypeError, ValueError):
+                    continue
+                if end <= start:
+                    continue
+
+                # Entirely before the injection point.
+                if end <= insert_at:
+                    new_segments.append(_segment(label, start, end))
+                    continue
+
+                # Entirely after the injection point.
+                if start >= insert_at:
+                    _add_payload_segment()
+                    new_segments.append(_segment(label, start + payload_len, end + payload_len))
+                    continue
+
+                # Segment crosses the injection point: split into left/right.
+                if start < insert_at:
+                    new_segments.append(_segment(label, start, insert_at))
+                _add_payload_segment()
+                right_start = insert_at + payload_len
+                right_end = end + payload_len
+                if right_start < right_end:
+                    new_segments.append(_segment(label, right_start, right_end))
+
+            # If the injection falls after all existing segments, append it.
+            if not inserted:
+                _add_payload_segment()
+
+            langs = sorted({seg["label"] for seg in new_segments if seg.get("label")})
+            payload_visible = _visible_char_count(snippet)
+            payload_bytes = len(snippet.encode("utf-8", "ignore"))
+            meta: Dict[str, Any] = {
+                "host_lang": host_lang,
+                "host_uid": doc.uid,
+                "payload_lang": payload_lang,
+                "payload_visible_chars": payload_visible,
+                "payload_bytes": payload_bytes,
+                "insertion_char": insert_at,
+                "monitor_source": doc.source,
+            }
+            if doc.extra_meta:
+                meta.update(doc.extra_meta)
+
+            examples.append(
+                _make_record(task, host_lang, idx, new_content, new_segments, langs, meta)
+            )
 
     return task, examples, desc
 
@@ -1818,40 +2032,45 @@ def _build_markdown_dataset_from_monitor(
     monitor_docs: Sequence[MonitorDoc],
     per_label: int,
     rng: random.Random,
+    *,
+    host_declared_lang: str = "markdown",
+    task_name: str = "markdown_mix",
+    host_label_for_record: Optional[str] = None,
+    custom_desc: Optional[str] = None,
 ) -> Tuple[str, List[dict], str]:
-    """Build markdown_mix task from real Gemini-labeled markdown monitor docs."""
+    """Build markdown-like mix task from real monitor docs for a given host type."""
 
-    task = "markdown_mix"
-    desc = "Monitor markdown documents with natural code/text interleavings."
+    task = task_name
+    host_label = host_label_for_record or host_declared_lang
+    desc = custom_desc or f"Monitor {host_declared_lang} documents with natural code/text interleavings."
     examples: List[dict] = []
-    _log("📝 Building markdown mix dataset from monitor set...")
+    _log(f"📝 Building {task} dataset from monitor set for '{host_declared_lang}'...")
 
-    # Only consider documents whose declared type is markdown.
-    markdown_docs = [doc for doc in monitor_docs if doc.declared_lang == "markdown"]
-    if not markdown_docs:
-        _log("⚠️  No monitor markdown documents found; skipping markdown_mix.")
+    # Only consider documents whose declared type matches the requested host language.
+    host_docs = [doc for doc in monitor_docs if doc.declared_lang == host_declared_lang]
+    if not host_docs:
+        _log(f"⚠️  No monitor documents found for '{host_declared_lang}'; skipping {task}.")
         return task, examples, desc
 
-    rng.shuffle(markdown_docs)
-    max_examples = len(markdown_docs)
+    rng.shuffle(host_docs)
+    max_examples = len(host_docs)
     if per_label > 0:
         max_examples = min(max_examples, per_label)
 
-    for idx, doc in enumerate(markdown_docs[:max_examples]):
+    for idx, doc in enumerate(host_docs[:max_examples]):
         if not doc.segments:
             continue
 
-        # Require at least one non-text/code segment inside the markdown host.
+        # Require at least one non-text/code segment inside the markdown-like host.
         nontext_segments = [
             seg
             for seg in doc.segments
-            if str(seg.get("label", "")) not in {"text", "markdown"}
+            if str(seg.get("label", "")) not in {"text", host_declared_lang}
         ]
         if not nontext_segments:
             continue
 
-        # Rebuild segments, mapping markdown text to the "text" label so that
-        # evaluation uses the same conventions as the synthetic markdown dataset.
+        # Rebuild segments using the original labels from the monitor document.
         segments: List[dict] = []
         for seg in doc.segments:
             label = str(seg.get("label", ""))
@@ -1859,8 +2078,7 @@ def _build_markdown_dataset_from_monitor(
             end = int(seg.get("char_end", start))
             if end <= start:
                 continue
-            mapped_label = "text" if label == "markdown" else label
-            segments.append(_segment(mapped_label, start, end))
+            segments.append(_segment(label, start, end))
         if not segments:
             continue
 
@@ -1898,7 +2116,7 @@ def _build_markdown_dataset_from_monitor(
         examples.append(
             _make_record(
                 task,
-                "markdown",
+                host_label,
                 idx,
                 doc.content,
                 segments,
@@ -2056,7 +2274,7 @@ def build_all_datasets(args) -> dict:
     _log("🔧 Building evaluation datasets...")
     builders = []
     _log("📊 Building pure fragments dataset...")
-    builders.append(_build_pure_dataset(fragments_by_lang, args.per_label))
+    builders.append(_build_pure_dataset_from_monitor(monitor_docs_for_needles, args.per_label, rng))
 
     buckets = [
         ("4_15", 4, 15),
@@ -2076,10 +2294,21 @@ def build_all_datasets(args) -> dict:
             )
         )
 
-    builders.append(_build_malicious_dataset(fragments_by_lang, args.per_label, rng))
+    builders.append(_build_malicious_dataset_from_monitor(monitor_docs_for_needles, args.per_label, rng))
     builders.append(_build_pair_dataset(fragments_by_lang, args.per_label, rng))
     builders.append(_build_triplet_dataset(fragments_by_lang, args.per_label, rng))
     builders.append(_build_markdown_dataset_from_monitor(markdown_docs, args.per_label, rng))
+    builders.append(
+        _build_markdown_dataset_from_monitor(
+            markdown_docs,
+            args.per_label,
+            rng,
+            host_declared_lang="restructuredtext",
+            task_name="restructuredtext_mix",
+            host_label_for_record="restructuredtext",
+            custom_desc="Monitor reStructuredText documents with natural code/text interleavings.",
+        )
+    )
 
     for size in (1024, 10_240, 102_400, 1_048_576):
         builders.append(

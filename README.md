@@ -8,11 +8,11 @@ The model works directly on bytes and predicts, for every position, which langua
 
 TL;DR: How can I segment my text?
 
-0. install `uv`
-1. get the packages by `uv sync` and activate the venv 
+0. [install `uv`](https://docs.astral.sh/uv/getting-started/installation/)
+1. get the packages by running `uv sync` in the root directory of the project and activate the venv (Linux: `source ./venv/bin/activate`)
 2. download the model: https://drive.google.com/file/d/1HvrDp0NOuSr_xVjzzBSxmLg8LsrKk98k/view?usp=sharing
 3. run the segment viewer: `cd viewers` and  `uv run python interactive_viewer.py --ckpt path_to_model.msgpack`
-4. Open http://127.0.0.1:8000 or use the API: http://127.0.0.1:8000/openapi.json (if `interactive_viewer.py` is started with `--openapi`)
+4. Open http://127.0.0.1:8000 or use the API - the docs are available at http://127.0.0.1:8000/openapi.json (if `interactive_viewer.py` is started with `--openapi`)
 
 Note that the first request takes far longer than the rest because JAX has to trace + optimize + generate device-specific code + possibly autotune + run the model.
 
@@ -40,7 +40,6 @@ Note that the first request takes far longer than the rest because JAX has to tr
 If you’re trying to understand how things fit together, a good path is:
 `downloader/main.py` → `train/utils/window_generator.py` → `train/main.py` → `evaluation/obtain_eval_dataset.py` → `evaluation/evaluation.py` → `viewers/interactive_viewer.py`.
 
----
 
 ## Setup
 
@@ -133,7 +132,6 @@ python viewers/interactive_viewer.py \
 
 Then open `http://127.0.0.1:8000` in a browser. The UI will show color‑coded spans, per‑character probabilities, and the sliding windows the model actually processed.
 
----
 
 ## Notes
 

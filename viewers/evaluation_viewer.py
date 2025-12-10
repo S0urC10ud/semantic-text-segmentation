@@ -79,6 +79,9 @@ PREDICTION_LABEL_ALIASES: Dict[str, str] = {
     "batchfile": "shell",
 }
 
+_VISUAL_WHITESPACE_CHARS: Tuple[str, ...] = (" ", "\t", "\n")
+_VISUAL_WHITESPACE_SET = frozenset(_VISUAL_WHITESPACE_CHARS)
+
 
 def _auto_color(label: str) -> str:
     base = sum(ord(c) for c in label) + len(label) * 97
@@ -125,6 +128,96 @@ def _build_sample_palette(labels: Sequence[str], include_unknown: bool = True) -
     if include_unknown:
         palette["__unknown__"] = "#b2bec3"
     return palette
+
+
+def _relabel_whitespace_from_neighbors(
+    text: str,
+    labels: List[int],
+    char_probs: List[np.ndarray],
+) -> Tuple[List[int], List[np.ndarray]]:
+    """Relabel whitespace chars by copying labels/probs from nearest non-whitespace neighbors."""
+    n = len(text)
+    if n == 0 or not labels or len(labels) != n:
+        return labels, char_probs
+
+    if not any(ch in _VISUAL_WHITESPACE_SET for ch in text):
+        return labels, char_probs
+
+    new_labels = list(labels)
+    new_probs = list(char_probs)
+
+    # Build per-line segments to prefer neighbors from the same line.
+    line_starts: List[int] = [0]
+    for idx, ch in enumerate(text):
+        if ch == "\n" and idx + 1 < n:
+            line_starts.append(idx + 1)
+    line_starts = sorted(set(line_starts))
+    line_segments: List[Tuple[int, int]] = []
+    for i, start in enumerate(line_starts):
+        end = line_starts[i + 1] if i + 1 < len(line_starts) else n
+        if start < end:
+            line_segments.append((start, end))
+
+    left_same_line = [-1] * n
+    right_same_line = [-1] * n
+    for start, end in line_segments:
+        last_non_ws = -1
+        for i in range(start, end):
+            if text[i] not in _VISUAL_WHITESPACE_SET:
+                last_non_ws = i
+            left_same_line[i] = last_non_ws
+        last_non_ws = -1
+        for i in range(end - 1, start - 1, -1):
+            if text[i] not in _VISUAL_WHITESPACE_SET:
+                last_non_ws = i
+            right_same_line[i] = last_non_ws
+
+    left_any = [-1] * n
+    right_any = [-1] * n
+    last_non_ws = -1
+    for i in range(n):
+        if text[i] not in _VISUAL_WHITESPACE_SET:
+            last_non_ws = i
+        left_any[i] = last_non_ws
+    last_non_ws = -1
+    for i in range(n - 1, -1, -1):
+        if text[i] not in _VISUAL_WHITESPACE_SET:
+            last_non_ws = i
+        right_any[i] = last_non_ws
+
+    for i, ch in enumerate(text):
+        if ch not in _VISUAL_WHITESPACE_SET:
+            continue
+        src = -1
+        ls = left_same_line[i]
+        rs = right_same_line[i]
+        if ls != -1 or rs != -1:
+            if ls == -1:
+                src = rs
+            elif rs == -1:
+                src = ls
+            else:
+                dist_l = i - ls
+                dist_r = rs - i
+                src = ls if dist_l <= dist_r else rs
+        else:
+            la = left_any[i]
+            ra = right_any[i]
+            if la != -1 or ra != -1:
+                if la == -1:
+                    src = ra
+                elif ra == -1:
+                    src = la
+                else:
+                    dist_l = i - la
+                    dist_r = ra - i
+                    src = la if dist_l <= dist_r else ra
+        if src == -1:
+            continue
+        new_labels[i] = labels[src]
+        if 0 <= src < len(char_probs):
+            new_probs[i] = np.array(char_probs[src], copy=True)
+    return new_labels, new_probs
 
 
 def _normalize_segments(segments) -> List[Dict[str, int]]:
@@ -556,6 +649,10 @@ class SegmenterRunner:
                 char_probs.append(avg.astype(np.float32))
             bpos += length
 
+        # Relabel whitespace characters by copying labels/probs from neighbors,
+        # so their labels are inferred rather than driven directly by logits.
+        char_labels, char_probs = _relabel_whitespace_from_neighbors(text, char_labels, char_probs)
+
         if min_run_chars > 1 and char_labels:
             char_labels = self._smooth_min_run(char_labels, min_run_chars)
         return char_labels, char_labels, char_probs
@@ -857,8 +954,17 @@ def api_sample(task: str, index: int):
         })
 
     spans = _compress_pairs(truth_labels, pred_labels)
-    eval_total = sum(1 for lbl in truth_labels if lbl != unknown_label)
-    eval_correct = sum(1 for t, p in zip(truth_labels, pred_labels) if t != unknown_label and t == p)
+    eval_total = 0
+    eval_correct = 0
+    for idx, (t, p) in enumerate(zip(truth_labels, pred_labels)):
+        ch = content_view[idx] if idx < len(content_view) else ""
+        if ch in _VISUAL_WHITESPACE_SET:
+            continue
+        if t == unknown_label:
+            continue
+        eval_total += 1
+        if t == p:
+            eval_correct += 1
     accuracy = float(eval_correct / eval_total) if eval_total else 0.0
 
     unique_labels = [lbl for lbl in label_order if lbl and lbl != unknown_label]

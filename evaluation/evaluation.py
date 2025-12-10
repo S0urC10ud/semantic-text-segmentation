@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Comprehensive evaluation harness for the labeling model.
 
-The script expects evaluation datasets produced by ``obtain_eval_dataset.py``
-from the monitor set (Gemini segmentations + Arrow monitor) and runs a battery
+Expects evaluation datasets produced by ``obtain_eval_dataset.py``
+from the monitor set (Gemini segmentations + Arrow monitor) and runs a set
 of benchmarks (outputs visible in report.md)
 
 Example:
@@ -78,6 +78,8 @@ NON_ASCII_PLACEHOLDER = "\u00A4"
 _VISIBLE_ASCII_MIN = 0x20
 _VISIBLE_ASCII_MAX = 0x7E
 _ALLOWED_TEXT_CONTROLS = {"\n", "\t"}
+_VISUAL_WHITESPACE_CHARS: Tuple[str, ...] = (" ", "\t", "\n")
+_VISUAL_WHITESPACE_SET = frozenset(_VISUAL_WHITESPACE_CHARS)
 
 
 def normalize_eval_text(text: Optional[str]) -> str:
@@ -261,12 +263,102 @@ def _window_weights(length: int) -> np.ndarray:
     return weights.astype(np.float32)
 
 
+def _relabel_whitespace_from_neighbors(
+    text: str,
+    labels: List[int],
+    char_probs: List[np.ndarray],
+) -> Tuple[List[int], List[np.ndarray]]:
+    """Relabel whitespace chars by copying labels/probs from nearest non-whitespace neighbors."""
+    n = len(text)
+    if n == 0 or not labels or len(labels) != n:
+        return labels, char_probs
+
+    if not any(ch in _VISUAL_WHITESPACE_SET for ch in text):
+        return labels, char_probs
+
+    new_labels = list(labels)
+    new_probs = list(char_probs)
+
+    # Build per-line segments to prefer neighbors from the same line.
+    line_starts: List[int] = [0]
+    for idx, ch in enumerate(text):
+        if ch == "\n" and idx + 1 < n:
+            line_starts.append(idx + 1)
+    line_starts = sorted(set(line_starts))
+    line_segments: List[Tuple[int, int]] = []
+    for i, start in enumerate(line_starts):
+        end = line_starts[i + 1] if i + 1 < len(line_starts) else n
+        if start < end:
+            line_segments.append((start, end))
+
+    left_same_line = [-1] * n
+    right_same_line = [-1] * n
+    for start, end in line_segments:
+        last_non_ws = -1
+        for i in range(start, end):
+            if text[i] not in _VISUAL_WHITESPACE_SET:
+                last_non_ws = i
+            left_same_line[i] = last_non_ws
+        last_non_ws = -1
+        for i in range(end - 1, start - 1, -1):
+            if text[i] not in _VISUAL_WHITESPACE_SET:
+                last_non_ws = i
+            right_same_line[i] = last_non_ws
+
+    left_any = [-1] * n
+    right_any = [-1] * n
+    last_non_ws = -1
+    for i in range(n):
+        if text[i] not in _VISUAL_WHITESPACE_SET:
+            last_non_ws = i
+        left_any[i] = last_non_ws
+    last_non_ws = -1
+    for i in range(n - 1, -1, -1):
+        if text[i] not in _VISUAL_WHITESPACE_SET:
+            last_non_ws = i
+        right_any[i] = last_non_ws
+
+    for i, ch in enumerate(text):
+        if ch not in _VISUAL_WHITESPACE_SET:
+            continue
+        src = -1
+        ls = left_same_line[i]
+        rs = right_same_line[i]
+        if ls != -1 or rs != -1:
+            if ls == -1:
+                src = rs
+            elif rs == -1:
+                src = ls
+            else:
+                dist_l = i - ls
+                dist_r = rs - i
+                src = ls if dist_l <= dist_r else rs
+        else:
+            la = left_any[i]
+            ra = right_any[i]
+            if la != -1 or ra != -1:
+                if la == -1:
+                    src = ra
+                elif ra == -1:
+                    src = la
+                else:
+                    dist_l = i - la
+                    dist_r = ra - i
+                    src = la if dist_l <= dist_r else ra
+        if src == -1:
+            continue
+        new_labels[i] = labels[src]
+        if 0 <= src < len(char_probs):
+            new_probs[i] = np.array(char_probs[src], copy=True)
+    return new_labels, new_probs
+
+
 def _byte_labels_to_char_labels(
     text: str,
     byte_labels: np.ndarray,
     byte_probs: Optional[np.ndarray],
     num_classes: int,
-) -> Tuple[List[int], List[np.ndarray]]:
+    ) -> Tuple[List[int], List[np.ndarray]]:
     labels: List[int] = []
     probs: List[np.ndarray] = []
     bpos = 0
@@ -293,6 +385,7 @@ def _byte_labels_to_char_labels(
                 p[lbl] = 1.0
                 probs.append(p)
         bpos += length
+    labels, probs = _relabel_whitespace_from_neighbors(text, labels, probs)
     return labels, probs
 
 
@@ -618,7 +711,8 @@ def _segments_to_labels(content: str, segments: Sequence[dict], label_map: Dict[
         end = int(seg.get("char_end", 0))
         start = max(0, min(length, start))
         end = max(start, min(length, end))
-        idx = label_map.get(label, label_map.get("__unknown__", -1))
+        # Map unknown or out-of-vocabulary labels into the open-set bucket ("other").
+        idx = label_map.get(label, label_map.get("other", -1))
         if idx < 0:
             continue
         labels[start:end] = idx
@@ -836,41 +930,41 @@ class TaskMetrics:
 
 
 def _analyze_pure_fragments(metrics: TaskMetrics) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
-    """Analyze pure fragment classification results.
-    
+    """Analyze pure fragment classification results (per-label character accuracy).
+
     Returns:
         Tuple containing:
-        - Dict mapping label -> purity percentage
+        - Dict mapping label -> accuracy percentage (chars of this label predicted correctly)
         - Dict mapping label -> (incorrect_label -> percentage) for misclassifications
     """
-    purity_scores = {}
-    misclassification_details = {}
-    
+    accuracy_scores: Dict[str, float] = {}
+    misclassification_details: Dict[str, Dict[str, float]] = {}
+
     for idx, true_label in enumerate(metrics.label_names):
-        if true_label == "__unknown__":
+        if true_label == "other":
             continue
-            
+
         true_total = metrics.confusion[idx].sum()
         if true_total == 0:
             continue
-            
+
         correct = metrics.confusion[idx, idx]
-        purity = (correct / true_total) * 100 if true_total > 0 else 0
-        purity_scores[true_label] = purity
-        
-        if purity < 100:
+        acc_pct = (correct / true_total) * 100 if true_total > 0 else 0.0
+        accuracy_scores[true_label] = acc_pct
+
+        if acc_pct < 100.0:
             # Get misclassification distribution
-            mistakes = {}
+            mistakes: Dict[str, float] = {}
             for pred_idx, pred_label in enumerate(metrics.label_names):
-                if pred_idx == idx or pred_label == "__unknown__":
+                if pred_idx == idx or pred_label == "other":
                     continue
                 count = metrics.confusion[idx, pred_idx]
                 if count > 0:
                     mistakes[pred_label] = (count / true_total) * 100
             mistakes = dict(sorted(mistakes.items(), key=lambda x: x[1], reverse=True))
             misclassification_details[true_label] = mistakes
-            
-    return purity_scores, misclassification_details
+
+    return accuracy_scores, misclassification_details
 
 def evaluate_task(
     name: str,
@@ -879,9 +973,11 @@ def evaluate_task(
     runner: SegmenterRunner,
     *,
     min_run_chars: int,
+    other_threshold: float = 0.0,
 ) -> TaskMetrics:
     total_samples = len(dataset)
-    label_candidates = {"__unknown__"}
+    # Always include an 'other' bucket for open-set handling.
+    label_candidates = {"other"}
     for example in dataset:
         for seg in _normalize_segments(example["segments"]):
             label_candidates.add(seg["label"])
@@ -902,6 +998,9 @@ def evaluate_task(
             "perfect": 0,
             "within_threshold": 0,
             "threshold": 0.5,
+            # Per-host-language file-level purity stats:
+            # host_byte_purity[lang] = {"files": N, "pure_files": M}
+            "host_byte_purity": {},
         }
         extra_payload["pure_fragments_purity"] = pure_stats
 
@@ -933,6 +1032,7 @@ def evaluate_task(
         extra_payload["needle_detection"] = needle_stats
 
     markdown_stats: Optional[Dict[str, Any]] = None
+    markdown_stats_key: Optional[str] = None
     if name == "markdown_mix":
         markdown_stats = {
             "threshold": MARKDOWN_IOU_THRESHOLD,
@@ -964,7 +1064,41 @@ def evaluate_task(
                 "text_iou_sum": 0.0,
             },
         }
-        extra_payload["markdown_segments"] = markdown_stats
+        markdown_stats_key = "markdown_segments"
+    elif name == "restructuredtext_mix":
+        markdown_stats = {
+            "threshold": MARKDOWN_IOU_THRESHOLD,
+            "roles": {
+                "host": {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+                "other": {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+            },
+            "overall": {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
+            "wrong_label": {"cases": 0, "fooled": 0},
+            "inline": {
+                "threshold": MARKDOWN_IOU_THRESHOLD,
+                "count": 0,
+                "correct_hits": 0,
+                "nontext_hits": 0,
+                "text_hits": 0,
+                "truth_chars": 0,
+                "correct_chars": 0,
+                "nontext_chars": 0,
+                "text_chars": 0,
+                "union_correct_chars": 0,
+                "union_nontext_chars": 0,
+                "union_text_chars": 0,
+                "by_wrapper": {},
+                "correct_iou_hits": 0,
+                "nontext_iou_hits": 0,
+                "text_iou_hits": 0,
+                "correct_iou_sum": 0.0,
+                "nontext_iou_sum": 0.0,
+                "text_iou_sum": 0.0,
+            },
+        }
+        markdown_stats_key = "restructuredtext_segments"
+    if markdown_stats is not None and markdown_stats_key:
+        extra_payload[markdown_stats_key] = markdown_stats
 
     payload_stats: Optional[Dict[str, Any]] = None
     if name == "mal_injection":
@@ -1014,20 +1148,46 @@ def evaluate_task(
         content = normalize_eval_text(raw_content if isinstance(raw_content, str) else "")
         normalized_segments = _normalize_segments(row.get("segments"))
         truth = _segments_to_labels(content, normalized_segments, label_to_idx)
-        segments, pred_labels, _ = runner.segment_text(content, min_run_chars=min_run_chars)
+        segments, pred_labels, pred_probs = runner.segment_text(content, min_run_chars=min_run_chars)
         pred_idx_array = np.full((len(pred_labels),), -1, dtype=np.int32)
+        other_idx_eval = label_to_idx.get("other")
+        use_other_threshold = other_threshold is not None and float(other_threshold) > 0.0 and other_idx_eval is not None
         for i, lbl_id in enumerate(pred_labels):
             label_name = cfg.ID2LANG.get(int(lbl_id), None)
             if label_name is not None:
                 alias = PREDICTION_LABEL_ALIASES.get(label_name)
                 if alias and alias in label_to_idx:
                     label_name = alias
+
+            # Compute max probability for this character if available.
+            max_prob = None
+            try:
+                if pred_probs is not None and i < len(pred_probs):
+                    prob_vec = np.asarray(pred_probs[i])
+                    if prob_vec.size:
+                        max_prob = float(prob_vec.max())
+            except Exception:
+                max_prob = None
+
+            # Route unknown labels into the open-set 'other' bucket if possible.
             if label_name is None or label_name not in label_to_idx:
-                pred_idx_array[i] = label_to_idx["__unknown__"]
+                if other_idx_eval is not None:
+                    pred_idx_array[i] = other_idx_eval
+                else:
+                    # Fallback: leave as -1 so it is ignored.
+                    pred_idx_array[i] = -1
+                continue
+
+            # Apply open-set thresholding: low-confidence predictions -> 'other'.
+            if use_other_threshold and max_prob is not None and max_prob < float(other_threshold):
+                pred_idx_array[i] = other_idx_eval  # type: ignore[arg-type]
             else:
                 pred_idx_array[i] = label_to_idx[label_name]
 
         valid_mask = (truth >= 0)
+        if content:
+            ws_mask = np.array([ch in _VISUAL_WHITESPACE_SET for ch in content], dtype=bool)
+            valid_mask = np.logical_and(valid_mask, ~ws_mask)
         truth_valid = truth[valid_mask]
         pred_valid = pred_idx_array[valid_mask]
         same_mask = (pred_valid == truth_valid)
@@ -1081,6 +1241,21 @@ def evaluate_task(
                             pure_stats["within_threshold"] += 1
                             if label_stats is not None:
                                 label_stats["within"] += 1
+
+                # File-level purity for the host language: for this host file,
+                # were all host-label characters predicted correctly?
+                host_mask = (truth_valid == host_idx)
+                host_chars = int(host_mask.sum())
+                if host_chars > 0:
+                    host_correct = int((same_mask & host_mask).sum())
+                    host_pure = host_correct == host_chars
+                    host_purity = pure_stats.setdefault("host_byte_purity", {}).setdefault(
+                        host_label,
+                        {"files": 0, "pure_files": 0},
+                    )
+                    host_purity["files"] += 1
+                    if host_pure:
+                        host_purity["pure_files"] += 1
 
         if needle_stats is not None:
             donor_label = metadata.get("donor_lang")
@@ -2044,33 +2219,49 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
             wrapper_table.append("")
             wrapper_table.append(text_cov_line)
 
-        wrong_cases = int(wrong.get("cases", 0))
-        fooled = int(wrong.get("fooled", 0))
-        summary_table = [
-            "| Metric | Value |",
-            "| --- | --- |",
-        ]
-        roles = md_stats.get("roles", {})
-        for role_key, role_label in (("host", "Host"), ("other", "Other")):
-            for wrapper_key, wrapper_label in (("wrapped", "fenced"), ("plain", "bare")):
-                group = roles.get(role_key, {}).get(wrapper_key, {})
-                count = int(group.get("count", 0))
-                hits = int(group.get("detected_correct", 0))
-                truth_chars = int(group.get("truth_chars", 0))
-                correct_chars = int(group.get("correct_chars", 0))
-                union_correct = int(group.get("union_correct_chars", 0))
-                avg_iou = _safe_ratio(correct_chars, union_correct)
+        add_section("markdown_mix", wrapper_table)
+
+    # reStructuredText highlight (focus on foreign code sections, not fences)
+    rst_metrics = metrics_by_name.get("restructuredtext_mix")
+    if rst_metrics:
+        rst_stats = rst_metrics.extras.get("restructuredtext_segments", {}) if rst_metrics.extras else {}
+        text_stats_overall = rst_stats.get("text", {})
+        per_language = rst_stats.get("per_language", {})
+
+        rows: List[str] = []
+        if per_language:
+            header = [
+                "_Text hits column: lower is better._",
+                "| Foreign language | Blocks | Correct cov ≥50% | Correct avg coverage |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+            rows.extend(header)
+            for lang, groups in sorted(per_language.items()):
+                plain = groups.get("plain", {}) or {}
+                wrapped = groups.get("wrapped", {}) or {}
+                count_plain = int(plain.get("count", 0))
+                count_wrapped = int(wrapped.get("count", 0))
+                count = count_plain + count_wrapped
+                if count <= 0:
+                    continue
+                hits = int(plain.get("detected_correct", 0)) + int(wrapped.get("detected_correct", 0))
+                truth_chars = int(plain.get("truth_chars", 0)) + int(wrapped.get("truth_chars", 0))
+                correct_chars = int(plain.get("correct_chars", 0)) + int(wrapped.get("correct_chars", 0))
                 coverage = _format_pct(_safe_ratio(correct_chars, truth_chars))
-                summary_table.append(
-                    f"| {role_label} {wrapper_label} IoU ≥50% | {_format_hits(hits, count)} hits, mean IoU {_format_float(avg_iou)}, coverage {coverage} |"
+                rows.append(
+                    f"| {lang} | {count} | {_format_hits(hits, count)} | {coverage} |"
                 )
 
-        if wrong_cases > 0:
-            summary_table.append(
-                f"| Wrong fence label fooled | {_format_hits(fooled, wrong_cases)} cases |"
-            )
+        text_cov_line = None
+        text_truth = int(text_stats_overall.get("truth_chars", 0))
+        if text_truth > 0:
+            text_cov_line = f"Text coverage (IoU ≥50%): {_format_pct(_safe_ratio(text_stats_overall.get('correct_chars', 0), text_truth))}"
+            if rows:
+                rows.append("")
+            rows.append(text_cov_line)
 
-        add_section("markdown_mix", wrapper_table + [""] + summary_table)
+        if rows:
+            add_section("restructuredtext_mix", rows)
 
     # pure fragments highlight
     pure_metrics = metrics_by_name.get("pure_fragments")
@@ -2147,19 +2338,18 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
 
 def _render_throughput_table(results: List[ThroughputResult]) -> str:
     lines = [
-        "| Task | Device | Samples | Total Bytes | Throughput | Latency (s) | RSS Δ (MB) |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Task | Device | Samples | Total Bytes | Throughput | Latency (s) |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
     ]
     for res in results:
         lines.append(
-            "| {task} | {device} | {samples} | {bytes} | {through} | {lat:.2f} | {rss} |".format(
+            "| {task} | {device} | {samples} | {bytes} | {through} | {lat:.2f} |".format(
                 task=res.task,
                 device=res.device,
                 samples=res.samples,
                 bytes=res.total_bytes,
                 through=_format_bytes_per_sec(res.throughput),
                 lat=res.elapsed,
-                rss="n/a" if res.rss_delta is None else f"{res.rss_delta:.2f}",
             )
         )
     lines.append("")
@@ -2167,11 +2357,6 @@ def _render_throughput_table(results: List[ThroughputResult]) -> str:
         "Latency is the total wall-clock time to run the benchmark loop over all samples "
         "per benchmark type, excluding the one warmup inference call that triggers JAX’s "
         "JIT compilation beforehand."
-    )
-    lines.append(
-        "RSS Δ (MB) is the difference in the Python process’s resident set size (RSS) "
-        "measured via `psutil` immediately before and after each throughput benchmark, "
-        "approximating the net change in host memory usage attributable to the model and runtime."
     )
     return "\n".join(lines)
 
@@ -2352,6 +2537,104 @@ def _collect_comparison_metrics(args, task_metrics: List[TaskMetrics], throughpu
 
         if md_data:
             data["tasks"]["markdown_mix"] = md_data
+
+    # reStructuredText (same structure as markdown_mix)
+    rst_metrics = metrics_by_name.get("restructuredtext_mix")
+    if rst_metrics and rst_metrics.extras:
+        rst_stats = rst_metrics.extras.get("restructuredtext_segments", {})
+        rst_data: Dict[str, Any] = {}
+
+        per_language = rst_stats.get("per_language", {})
+        plain_per_lang = {}
+        wrapped_per_lang = {}
+        for lang, groups in per_language.items():
+            for wrapper_key, target_dict in (("plain", plain_per_lang), ("wrapped", wrapped_per_lang)):
+                group = groups.get(wrapper_key, {})
+                count = int(group.get("count", 0))
+                if count <= 0:
+                    continue
+                target_dict[lang] = {
+                    "det_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_correct", 0), count)),
+                    "coverage": _float_or_none(_safe_ratio(group.get("correct_chars", 0), group.get("truth_chars", 0))),
+                    "nontext_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_nontext", 0), count)),
+                    "nontext_coverage": _float_or_none(_safe_ratio(group.get("nontext_chars", 0), group.get("truth_chars", 0))),
+                    "text_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_text", 0), count)),
+                    "text_coverage": _float_or_none(_safe_ratio(group.get("text_chars", 0), group.get("truth_chars", 0))),
+                    "support": count,
+                }
+        block_section = {}
+        overall_block = {}
+        for key, label in (("plain", "plain"), ("wrapped", "fenced")):
+            group = rst_stats.get("overall", {}).get(key, {})
+            count = int(group.get("count", 0))
+            if count <= 0:
+                continue
+            overall_block[label] = {
+                "det_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_correct", 0), count)),
+                "coverage": _float_or_none(_safe_ratio(group.get("correct_chars", 0), group.get("truth_chars", 0))),
+                "nontext_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_nontext", 0), count)),
+                "nontext_coverage": _float_or_none(_safe_ratio(group.get("nontext_chars", 0), group.get("truth_chars", 0))),
+                "text_rate@0.5": _float_or_none(_safe_ratio(group.get("detected_text", 0), count)),
+                "text_coverage": _float_or_none(_safe_ratio(group.get("text_chars", 0), group.get("truth_chars", 0))),
+                "support": count,
+            }
+        if overall_block:
+            block_section["overall"] = overall_block
+        if wrapped_per_lang:
+            block_section["fenced_per_language"] = wrapped_per_lang
+        if plain_per_lang:
+            block_section["plain_per_language"] = plain_per_lang
+        if block_section:
+            rst_data["block"] = block_section
+
+        inline_stats = rst_stats.get("inline", {})
+        inline_per_lang = inline_stats.get("per_language", {})
+        inline_section = {}
+        inline_count = int(inline_stats.get("count", 0))
+        if inline_count > 0:
+            inline_section["overall"] = {
+                "det_rate@0.5": _float_or_none(_safe_ratio(inline_stats.get("correct_hits", 0), inline_count)),
+                "coverage": _float_or_none(_safe_ratio(inline_stats.get("correct_chars", 0), inline_stats.get("truth_chars", 0))),
+                "nontext_rate@0.5": _float_or_none(_safe_ratio(inline_stats.get("nontext_hits", 0), inline_count)),
+                "nontext_coverage": _float_or_none(_safe_ratio(inline_stats.get("nontext_chars", 0), inline_stats.get("truth_chars", 0))),
+                "text_rate@0.5": _float_or_none(_safe_ratio(inline_stats.get("text_hits", 0), inline_count)),
+                "text_coverage": _float_or_none(_safe_ratio(inline_stats.get("text_chars", 0), inline_stats.get("truth_chars", 0))),
+                "support": inline_count,
+            }
+        if inline_per_lang:
+            inline_data = {}
+            for lang, entry in inline_per_lang.items():
+                count = int(entry.get("count", 0))
+                if count <= 0:
+                    continue
+                inline_data[lang] = {
+                    "det_rate@0.5": _float_or_none(_safe_ratio(entry.get("correct_hits", 0), count)),
+                    "coverage": _float_or_none(_safe_ratio(entry.get("correct_chars", 0), entry.get("truth_chars", 0))),
+                    "nontext_rate@0.5": _float_or_none(_safe_ratio(entry.get("nontext_hits", 0), count)),
+                    "nontext_coverage": _float_or_none(_safe_ratio(entry.get("nontext_chars", 0), entry.get("truth_chars", 0))),
+                    "text_rate@0.5": _float_or_none(_safe_ratio(entry.get("text_hits", 0), count)),
+                    "text_coverage": _float_or_none(_safe_ratio(entry.get("text_chars", 0), entry.get("truth_chars", 0))),
+                    "support": count,
+                }
+            if inline_data:
+                inline_section["per_language"] = inline_data
+        if inline_section:
+            rst_data["inline"] = inline_section
+
+        wrong = rst_stats.get("wrong_label", {})
+        wrong_cases = int(wrong.get("cases", 0))
+        if wrong_cases > 0:
+            rst_data["wrong_fence_fooled_rate"] = _float_or_none(_safe_ratio(wrong.get("fooled", 0), wrong_cases))
+
+        text_stats = rst_stats.get("text", {})
+        text_truth = int(text_stats.get("truth_chars", 0))
+        union_chars = int(text_stats.get("union_chars", 0))
+        if text_truth or union_chars:
+            rst_data["text_accuracy"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), text_truth))
+            rst_data["text_iou"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), union_chars))
+
+        if rst_data:
+            data["tasks"]["restructuredtext_mix"] = rst_data
 
     # Pure fragments -------------------------------------------------------
     pure_metrics = metrics_by_name.get("pure_fragments")
@@ -2545,12 +2828,12 @@ def write_report(
             any_by_lang = payload_stats.get("any_by_lang", {})
             correct_by_lang = payload_stats.get("by_lang", {})
             top_mis = _top_confusions(
-                metrics.confusion, metrics.label_names, exclude_labels=["__unknown__"]
+                metrics.confusion, metrics.label_names, exclude_labels=["other"]
             )
             languages = [
                 lang
                 for lang in sorted(set(any_by_lang.keys()) | set(correct_by_lang.keys()))
-                if lang and lang != "__unknown__"
+                if lang and lang != "other"
             ]
             if languages:
                 table_lines = [
@@ -2607,12 +2890,38 @@ def write_report(
                 )
                 report_lines.append("")
 
-            purity_scores, misclassifications = _analyze_pure_fragments(metrics)
+            accuracy_scores, misclassifications = _analyze_pure_fragments(metrics)
             report_lines.append("#### Purity Analysis")
             report_lines.append("")
-            report_lines.append("| Language | Purity % | Top Misclassifications |")
-            report_lines.append("| --- | ---: | --- |")
-            for lang, purity in sorted(purity_scores.items(), key=lambda x: x[1], reverse=True):
+            report_lines.append("| Language | Support | Accuracy % | File purity | Top Misclassifications |")
+            report_lines.append("| --- | ---: | ---: | --- | --- |")
+
+            # Merge per-label accuracy, file-level purity, and top misclassifications.
+            # Order rows by descending accuracy, then by label name.
+            per_label_support = metrics.per_label_counts
+            per_label_correct = metrics.per_label_correct
+            host_purity = pure_stats.get("host_byte_purity", {}) if isinstance(pure_stats, dict) else {}
+
+            for lang, acc_pct in sorted(accuracy_scores.items(), key=lambda x: x[1], reverse=True):
+                support = int(per_label_support.get(lang, 0))
+                correct = int(per_label_correct.get(lang, 0))
+                # Sanity check: derive accuracy from confusion vs precomputed percentage.
+                acc = (correct / support) if support else float("nan")
+                if math.isfinite(acc):
+                    acc_pct = acc * 100.0
+                acc_str = _format_pct(acc_pct / 100.0)  # display as percentage
+
+                # File-level purity: fraction of host files where all host-label
+                # characters were predicted correctly.
+                hp = host_purity.get(lang, {})
+                files = int(hp.get("files", 0))
+                pure_files = int(hp.get("pure_files", 0))
+                if files > 0:
+                    file_purity_ratio = pure_files / files
+                    file_purity_str = f"{pure_files}/{files} ({_format_pct(file_purity_ratio)})"
+                else:
+                    file_purity_str = "—"
+
                 misclass_str = ""
                 if lang in misclassifications:
                     top_mistakes = [
@@ -2620,11 +2929,19 @@ def write_report(
                         for label, pct in list(misclassifications[lang].items())[:3]
                     ]
                     misclass_str = ", ".join(top_mistakes)
-                report_lines.append(f"| {lang} | {purity:.1f}% | {misclass_str or '—'} |")
-            report_lines.append("")
 
-            per_label_table = _render_metrics_table(metrics)
-            report_lines.append(per_label_table)
+                report_lines.append(
+                    f"| {lang} | {support} | {acc_str} | {file_purity_str} | {misclass_str or '—'} |"
+                )
+
+            # Optionally include the open-set 'other' bucket for completeness.
+            if "other" in metrics.label_names:
+                support = int(per_label_support.get("other", 0))
+                correct = int(per_label_correct.get("other", 0))
+                acc = (correct / support) if support else float("nan")
+                acc_str = "nan" if (not math.isfinite(acc)) else _format_pct(acc)
+                report_lines.append(f"| other | {support} | {acc_str} | — | — |")
+
             report_lines.append("")
             continue
 
@@ -2753,6 +3070,69 @@ def write_report(
                 report_lines.append(f"Text coverage (IoU ≥50%): {text_cov}")
             report_lines.append("")
 
+        if name == "restructuredtext_mix":
+            markdown_stats = extras.get("restructuredtext_segments", {})
+            threshold = float(markdown_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
+            wrapped_group = markdown_stats.get("overall", {}).get("wrapped", {})
+            plain_group = markdown_stats.get("overall", {}).get("plain", {})
+            report_lines.append("")
+            report_lines.append("_Text hits column: lower is better._")
+            report_lines.append("| Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |")
+            report_lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+
+            def _emit_wrapper_row_rst(label: str, group: Dict[str, Any]) -> None:
+                count = int(group.get("count", 0))
+                if count <= 0:
+                    report_lines.append(f"| {label} | — | — | — | — | — | — | — | — | — |")
+                    return
+                truth_chars = int(group.get("truth_chars", 0))
+                nontext_cov = _format_pct(_safe_ratio(int(group.get("nontext_chars", 0)), truth_chars))
+                correct_cov = _format_pct(_safe_ratio(int(group.get("correct_chars", 0)), truth_chars))
+                nontext_union = int(group.get("union_nontext_chars", 0))
+                correct_union = int(group.get("union_correct_chars", 0))
+                nontext_chars = int(group.get("nontext_chars", 0))
+                correct_chars = int(group.get("correct_chars", 0))
+                nontext_avg_iou = _format_float(_safe_ratio(nontext_chars, nontext_union))
+                correct_avg_iou = _format_float(_safe_ratio(correct_chars, correct_union))
+                nontext_cov_hits = _format_hits(int(group.get("detected_nontext", 0)), count)
+                nontext_iou_hits = _format_hits(int(group.get("detected_nontext_iou", 0)), count)
+                text_hits = _format_hits(int(group.get("detected_text", 0)), count)
+                correct_cov_hits = _format_hits(int(group.get("detected_correct", 0)), count)
+                correct_iou_hits = _format_hits(int(group.get("detected_correct_iou", 0)), count)
+                row = (
+                    f"| {label} | {nontext_cov_hits} | {nontext_iou_hits} | {nontext_cov} | {nontext_avg_iou} | {text_hits} | "
+                    f"{correct_cov_hits} | {correct_iou_hits} | {correct_cov} | {correct_avg_iou} |"
+                )
+                report_lines.append(row)
+
+            for label, group in ((MARKDOWN_FENCED_LABEL, wrapped_group), ("bare code", plain_group)):
+                _emit_wrapper_row_rst(label, group)
+            inline_stats = markdown_stats.get("inline", {})
+            inline_count = int(inline_stats.get("count", 0))
+            if inline_count > 0:
+                inline_group = {
+                    "count": inline_count,
+                    "detected_nontext": inline_stats.get("nontext_hits", 0),
+                    "detected_nontext_iou": inline_stats.get("nontext_iou_hits", 0),
+                    "detected_text": inline_stats.get("text_hits", 0),
+                    "detected_correct": inline_stats.get("correct_hits", 0),
+                    "detected_correct_iou": inline_stats.get("correct_iou_hits", 0),
+                    "truth_chars": inline_stats.get("truth_chars", 0),
+                    "nontext_chars": inline_stats.get("nontext_chars", 0),
+                    "correct_chars": inline_stats.get("correct_chars", 0),
+                    "union_nontext_chars": inline_stats.get("union_nontext_chars", 0),
+                    "union_correct_chars": inline_stats.get("union_correct_chars", 0),
+                }
+                _emit_wrapper_row_rst(MARKDOWN_INLINE_LABEL, inline_group)
+            text_truth = int(markdown_stats.get("text", {}).get("truth_chars", 0))
+            if text_truth > 0:
+                text_cov = _format_pct(
+                    _safe_ratio(markdown_stats.get("text", {}).get("correct_chars", 0), text_truth)
+                )
+                report_lines.append("")
+                report_lines.append(f"Text coverage (IoU ≥50%): {text_cov}")
+            report_lines.append("")
+
         per_label_table = _render_metrics_table(metrics)
         report_lines.append(per_label_table)
         report_lines.append("")
@@ -2788,6 +3168,15 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--dtype", type=str, default=None, help="JAX dtype name for inference (e.g. bfloat16). Defaults to checkpoint config or bfloat16.")
     parser.add_argument("--chunk", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--min-run", type=int, default=1, help="Minimum run-length smoothing for character labels.")
+    parser.add_argument(
+        "--other-threshold",
+        type=float,
+        default=0.3,
+        help=(
+            "Open-set threshold for routing low-confidence predictions to the 'other' class "
+            "(0 disables thresholding)."
+        ),
+    )
     parser.add_argument("--report-path", default=str(REPO_ROOT / "evaluation" / "report.md"))
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for inference windows.")
     parser.add_argument("--max-samples", type=int, default=2000, help="Maximum samples per accuracy task (0 = all).")
@@ -2922,6 +3311,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ds,
                 accuracy_runner,
                 min_run_chars=args.min_run,
+                other_threshold=args.other_threshold,
             )
             elapsed = metrics.extras.get("elapsed_seconds", 0.0)
             print(
