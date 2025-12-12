@@ -15,7 +15,7 @@
 ##### mal_injection
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Avg coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 1091/2000 | 568/2000 | 0.32 | 66.0% |
+| Any non-wrapper | 1090/2000 | 568/2000 | 0.32 | 66.0% |
 | Correct payload | 614/2000 | 574/2000 | 0.27 | 41.6% |
 
 ##### markdown_mix
@@ -43,8 +43,8 @@ _Text hits column: lower is better._
 | yaml | 6 | 6/6 | 95.5% |
 
 ##### pure_fragments
-753/2000 samples stayed fully pure (no foreign chars). 1911/2000 stayed within ≤50% foreign coverage.
-Expected foreign bytes for a 1536-byte fragment: 144.3/1536
+817/1981 host-bearing samples had no misclassified host-label bytes. 1952/1981 stayed within ≤50% host-byte error rate.
+Expected misclassified host bytes for 1536 host-labeled bytes: 95.1/1536
 
 ##### sequence_pair
 First segment coverage 93.7%
@@ -58,13 +58,13 @@ Third segment coverage 84.5%
 ##### needle_64_plus
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 124/142 | 61/142 | 0.48 | 86.3% |
+| Any non-wrapper | 124/142 | 60/142 | 0.48 | 86.3% |
 | Correct payload | 108/142 | 97/142 | 0.67 | 74.5% |
 
 ##### needle_32_63
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage |
 | --- | --- | --- | --- | --- |
-| Any non-wrapper | 51/56 | 19/56 | 0.37 | 85.7% |
+| Any non-wrapper | 51/56 | 19/56 | 0.38 | 85.7% |
 | Correct payload | 43/56 | 41/56 | 0.66 | 70.1% |
 
 ##### needle_16_31
@@ -89,17 +89,17 @@ Monitor-based hosts with synthetic malicious payload injections.
 - Samples: 2000
 - Characters evaluated: 6727462
 - Overall accuracy: 0.8707
-- High confusions: java->javascript_typescript 31851 (12.4%), python->javascript_typescript 28954 (13.7%), text->other 21399 (9.0%), encoding_base64->other 17655 (6.8%), powershell->other 15644 (6.4%)
+- High confusions: java->javascript_typescript 31851 (12.4%), python->javascript_typescript 28945 (13.6%), text->other 21378 (9.0%), encoding_base64->other 17655 (6.8%), powershell->other 15644 (6.4%)
 
 | Language | Non-wrapper cov ≥50% | Non-wrapper coverage (avg) | Non-wrapper IoU ≥50% | Non-wrapper avg IoU | Correct cov ≥50% | Correct coverage (avg) | Correct IoU ≥50% | Correct avg IoU | Top misclassifications |
 | --- | --- | ---: | --- | ---: | --- | ---: | --- | ---: | --- |
 | csharp | 179/188 | 94.5% | 103/188 | 0.59 | 175/188 | 92.3% (overall 93.2%) | 158/188 | 0.81 | other (3.5%), xml (0.9%), java (0.9%) |
-| go | 110/244 | 47.0% | 34/244 | 0.24 | 1/244 | 1.6% (overall 71.1%) | 1/244 | 0.02 | other (6.1%), javascript_typescript (6.0%), shell (2.8%) |
+| go | 109/244 | 47.1% | 34/244 | 0.24 | 1/244 | 1.7% (overall 71.1%) | 1/244 | 0.02 | other (6.1%), javascript_typescript (6.0%), shell (2.8%) |
 | java | 177/212 | 82.6% | 104/212 | 0.51 | 105/212 | 32.7% (overall 77.0%) | 95/212 | 0.43 | javascript_typescript (12.4%), other (4.6%), csharp (1.1%) |
 | javascript_typescript | 112/213 | 63.4% | 44/213 | 0.25 | 73/213 | 52.3% (overall 81.4%) | 70/213 | 0.30 | other (6.4%), dart (1.0%), rust (1.0%) |
 | php | 104/238 | 42.1% | 51/238 | 0.26 | 77/238 | 29.0% (overall 61.1%) | 76/238 | 0.29 | other (6.0%), shell (3.2%), javascript_typescript (2.7%) |
 | powershell | 144/229 | 80.4% | 118/229 | 0.45 | 129/229 | 66.9% (overall 79.0%) | 122/229 | 0.47 | other (6.4%), csharp (4.2%), go (1.5%) |
-| python | 142/246 | 55.6% | 66/246 | 0.32 | 0/246 | 0.0% (overall 66.6%) | 0/246 | 0.00 | javascript_typescript (13.7%), other (5.7%), yaml (1.2%) |
+| python | 142/246 | 55.6% | 66/246 | 0.32 | 0/246 | 0.0% (overall 66.6%) | 0/246 | 0.00 | javascript_typescript (13.6%), other (5.7%), yaml (1.2%) |
 | ruby | 48/223 | 23.9% | 19/223 | 0.11 | 0/223 | 0.0% (overall 58.3%) | 0/223 | 0.00 | other (7.0%), javascript_typescript (4.9%), shell (2.2%) |
 | shell | 75/207 | 37.5% | 29/207 | 0.18 | 54/207 | 24.1% (overall 73.0%) | 52/207 | 0.24 | other (6.8%), c_family (3.1%), restructuredtext (2.7%) |
 
@@ -109,8 +109,8 @@ Monitor markdown documents with natural code/text interleavings.
 
 - Samples: 69
 - Characters evaluated: 193787
-- Overall accuracy: 0.8540
-- High confusions: markdown->other 12894 (10.0%), shell->markdown 2124 (28.8%), other->markdown 1707 (47.1%), html->markdown 1606 (17.8%), other->csharp 767 (21.2%)
+- Overall accuracy: 0.8541
+- High confusions: markdown->other 12891 (10.0%), shell->markdown 2123 (28.8%), other->markdown 1708 (47.2%), html->markdown 1606 (17.8%), other->csharp 767 (21.2%)
 
 _Text hits column: lower is better._
 | Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |
@@ -130,13 +130,13 @@ _Text hits column: lower is better._
 | php | 1727 | 0.9514 |
 | yaml | 11881 | 0.8933 |
 | json | 4195 | 0.8856 |
-| markdown | 128887 | 0.8823 |
+| markdown | 128887 | 0.8824 |
 | csharp | 1385 | 0.8671 |
-| javascript_typescript | 8450 | 0.8363 |
-| html | 9045 | 0.7978 |
+| javascript_typescript | 8450 | 0.8367 |
+| html | 9045 | 0.7976 |
 | c_family | 2979 | 0.7043 |
 | dockerfile | 571 | 0.6935 |
-| shell | 7371 | 0.6367 |
+| shell | 7371 | 0.6368 |
 | css | 849 | 0.3651 |
 | other | 3621 | 0.0561 |
 | ruby | 29 | 0.0000 |
@@ -148,9 +148,9 @@ Full monitor documents with original multi-label segmentations.
 - Samples: 2000
 - Characters evaluated: 5978722
 - Overall accuracy: 0.9316
-- High confusions: text->other 14197 (7.0%), json->other 11462 (8.3%), svg->other 11004 (7.6%), encoding_base32->other 10392 (3.5%), encoding_base64->other 10321 (4.3%)
+- High confusions: text->other 14197 (7.0%), json->other 11455 (8.3%), svg->other 11004 (7.6%), encoding_base32->other 10392 (3.5%), encoding_base64->other 10324 (4.3%)
 
-Expected foreign bytes for a 1536-byte fragment: 144.3/1536
+Expected misclassified host bytes for 1536 host-labeled bytes: 95.1/1536
 
 #### Purity Analysis
 
@@ -186,8 +186,8 @@ Expected foreign bytes for a 1536-byte fragment: 144.3/1536
 | ruby | 91258 | 90.9% | 30/53 (56.6%) | python (1.4%), rust (0.9%), shell (0.1%) |
 | xml | 132754 | 90.6% | 38/59 (64.4%) | html (2.9%), encoding_base64 (1.6%), php (0.3%) |
 | restructuredtext | 128051 | 89.9% | 32/64 (50.0%) | python (2.0%), markdown (2.0%), shell (0.4%) |
-| json | 138795 | 86.8% | 19/60 (31.7%) | html (2.4%), csv (1.3%), yaml (0.6%) |
-| shell | 99990 | 86.2% | 40/54 (74.1%) | c_family (2.5%), restructuredtext (2.0%), yaml (0.9%) |
+| json | 138795 | 86.8% | 19/60 (31.7%) | html (2.5%), csv (1.3%), yaml (0.6%) |
+| shell | 99990 | 86.3% | 40/54 (74.1%) | c_family (2.5%), restructuredtext (2.0%), yaml (0.9%) |
 | markdown | 137549 | 86.0% | 20/61 (32.8%) | restructuredtext (2.7%), yaml (2.0%), csv (0.9%) |
 | dockerfile | 24276 | 85.0% | 40/48 (83.3%) | c_family (7.9%), shell (4.5%) |
 | php | 86782 | 82.5% | 29/54 (53.7%) | csv (11.5%), html (1.1%), javascript_typescript (0.2%) |
@@ -200,7 +200,7 @@ Monitor reStructuredText documents with natural code/text interleavings.
 - Samples: 44
 - Characters evaluated: 164503
 - Overall accuracy: 0.8516
-- High confusions: restructuredtext->other 4610 (3.9%), shell->restructuredtext 4090 (28.0%), shell->c_family 2451 (16.8%), restructuredtext->python 2438 (2.1%), shell->yaml 1786 (12.2%)
+- High confusions: restructuredtext->other 4611 (3.9%), shell->restructuredtext 4089 (28.0%), shell->c_family 2452 (16.8%), restructuredtext->python 2435 (2.1%), shell->yaml 1784 (12.2%)
 
 _Text hits column: lower is better._
 | Wrapper | Non-text cov ≥50% | Non-text IoU ≥50% | Non-text avg coverage | Non-text avg IoU | Text hits | Correct cov ≥50% | Correct IoU ≥50% | Correct avg coverage | Correct avg IoU |
@@ -220,7 +220,7 @@ _Text hits column: lower is better._
 | python | 18236 | 0.8711 |
 | json | 88 | 0.7159 |
 | javascript_typescript | 2349 | 0.4134 |
-| shell | 14615 | 0.3312 |
+| shell | 14615 | 0.3314 |
 | css | 173 | 0.0462 |
 | other | 469 | 0.0000 |
 
@@ -231,7 +231,7 @@ Two-language back-to-back sequences A->B.
 - Samples: 2000
 - Characters evaluated: 12221980
 - Overall accuracy: 0.8973
-- High confusions: dockerfile->shell 57387 (42.9%), php->html 50541 (20.9%), powershell->encoding_base64 30506 (11.0%), text->markdown 26402 (6.1%), restructuredtext->python 25526 (8.0%)
+- High confusions: dockerfile->shell 57387 (42.9%), php->html 50540 (20.9%), powershell->encoding_base64 30505 (11.0%), text->markdown 26397 (6.1%), restructuredtext->python 25521 (8.0%)
 
 | Segment | Coverage |
 | --- | ---: |
@@ -248,7 +248,7 @@ Two-language back-to-back sequences A->B.
 | encoding_base85 | 522333 | 0.9562 |
 | rust | 383831 | 0.9506 |
 | encoding_base58 | 496390 | 0.9493 |
-| encoding_base64 | 382076 | 0.9456 |
+| encoding_base64 | 382076 | 0.9455 |
 | css | 446957 | 0.9455 |
 | go | 462701 | 0.9377 |
 | tex | 441715 | 0.9373 |
@@ -284,7 +284,7 @@ Three-language back-to-back sequences A->B->C.
 - Samples: 2000
 - Characters evaluated: 18434131
 - Overall accuracy: 0.9032
-- High confusions: dockerfile->shell 106283 (45.5%), powershell->encoding_base64 61128 (12.9%), php->html 59927 (20.8%), html->javascript_typescript 53745 (7.5%), text->markdown 42326 (5.8%)
+- High confusions: dockerfile->shell 106285 (45.5%), powershell->encoding_base64 61125 (12.9%), php->html 59928 (20.8%), html->javascript_typescript 53745 (7.5%), text->markdown 42300 (5.8%)
 
 | Segment | Coverage |
 | --- | ---: |
@@ -305,20 +305,20 @@ Three-language back-to-back sequences A->B->C.
 | visual_basic | 593260 | 0.9520 |
 | tex | 553170 | 0.9496 |
 | go | 635827 | 0.9488 |
-| css | 710709 | 0.9442 |
+| css | 710709 | 0.9443 |
 | python | 510050 | 0.9438 |
 | swift | 356029 | 0.9434 |
 | csharp | 327866 | 0.9431 |
-| java | 514322 | 0.9322 |
+| java | 514322 | 0.9321 |
 | sql | 448125 | 0.9319 |
-| xml | 373089 | 0.9298 |
+| xml | 373089 | 0.9299 |
 | dart | 442037 | 0.9280 |
 | scala | 413082 | 0.9278 |
 | ruby | 313731 | 0.9273 |
 | svg | 508314 | 0.9130 |
 | c_family | 574970 | 0.9119 |
 | kotlin | 303075 | 0.9061 |
-| json | 247531 | 0.8724 |
+| json | 247531 | 0.8723 |
 | shell | 193965 | 0.8601 |
 | javascript_typescript | 418293 | 0.8412 |
 | text | 723839 | 0.8221 |
@@ -327,8 +327,8 @@ Three-language back-to-back sequences A->B->C.
 | html | 712768 | 0.7620 |
 | restructuredtext | 430284 | 0.7477 |
 | markdown | 435594 | 0.6978 |
-| php | 287985 | 0.6308 |
-| dockerfile | 233451 | 0.2715 |
+| php | 287985 | 0.6309 |
+| dockerfile | 233451 | 0.2714 |
 | other | 0 | nan |
 
 ### needle_64_plus
@@ -338,7 +338,7 @@ Natural monitor files with a short foreign-language needle sized 64-∞ printabl
 - Samples: 142
 - Characters evaluated: 508694
 - Overall accuracy: 0.7950
-- High confusions: other->shell 31303 (73.2%), markdown->other 9743 (8.3%), encoding_base64->css 6527 (25.7%), html->other 5479 (4.7%), dockerfile->shell 3605 (35.9%)
+- High confusions: other->shell 31300 (73.2%), markdown->other 9744 (8.3%), encoding_base64->css 6522 (25.7%), html->other 5479 (4.7%), dockerfile->shell 3602 (35.9%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
@@ -350,17 +350,17 @@ Natural monitor files with a short foreign-language needle sized 64-∞ printabl
 | csharp | 1019 | 0.9725 |
 | restructuredtext | 33769 | 0.9669 |
 | powershell | 15780 | 0.9531 |
-| svg | 7421 | 0.9435 |
-| yaml | 34549 | 0.9130 |
+| svg | 7421 | 0.9425 |
+| yaml | 34549 | 0.9131 |
 | html | 117089 | 0.9038 |
 | shell | 39586 | 0.8893 |
-| javascript_typescript | 18949 | 0.8785 |
+| javascript_typescript | 18949 | 0.8786 |
 | markdown | 117757 | 0.8574 |
 | python | 3513 | 0.8480 |
 | php | 13851 | 0.7906 |
 | json | 6904 | 0.7701 |
-| encoding_base64 | 25365 | 0.6874 |
-| dockerfile | 10037 | 0.6221 |
+| encoding_base64 | 25365 | 0.6876 |
+| dockerfile | 10037 | 0.6224 |
 | css | 10082 | 0.5793 |
 | other | 42780 | 0.0396 |
 | sql | 421 | 0.0024 |
@@ -369,7 +369,7 @@ Natural monitor files with a short foreign-language needle sized 64-∞ printabl
 
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |
 | --- | --- | --- | ---: | ---: | --- |
-| Any non-wrapper | 124/142 | 61/142 | 0.48 | 86.3% | html (23.4%), other (21.1%), markdown (12.2%) |
+| Any non-wrapper | 124/142 | 60/142 | 0.48 | 86.3% | html (23.4%), other (21.1%), markdown (12.2%) |
 | Correct label | 108/142 | 97/142 | 0.67 | 74.5% | — |
 
 ### needle_32_63
@@ -378,26 +378,26 @@ Natural monitor files with a short foreign-language needle sized 32-63 printable
 
 - Samples: 56
 - Characters evaluated: 151810
-- Overall accuracy: 0.8077
-- High confusions: other->php 9741 (67.5%), markdown->other 3095 (8.7%), html->other 2459 (5.5%), other->html 2198 (15.2%), restructuredtext->other 1620 (10.2%)
+- Overall accuracy: 0.8078
+- High confusions: other->php 9741 (67.5%), markdown->other 3084 (8.7%), html->other 2459 (5.5%), other->html 2195 (15.2%), restructuredtext->other 1620 (10.2%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
 | dockerfile | 3076 | 1.0000 |
-| svg | 4378 | 0.9589 |
-| php | 2544 | 0.9481 |
+| svg | 4378 | 0.9580 |
+| php | 2544 | 0.9477 |
 | html | 44854 | 0.9405 |
 | powershell | 10845 | 0.9306 |
-| markdown | 35638 | 0.9032 |
+| markdown | 35638 | 0.9035 |
 | restructuredtext | 15864 | 0.8957 |
 | css | 560 | 0.8696 |
 | xml | 94 | 0.8298 |
-| yaml | 4119 | 0.8235 |
+| yaml | 4119 | 0.8233 |
 | shell | 10442 | 0.7368 |
 | javascript_typescript | 1157 | 0.6975 |
-| json | 2172 | 0.6220 |
+| json | 2172 | 0.6215 |
 | python | 168 | 0.4464 |
-| other | 14423 | 0.0261 |
+| other | 14423 | 0.0263 |
 | c_family | 1195 | 0.0000 |
 | rust | 145 | 0.0000 |
 | ruby | 80 | 0.0000 |
@@ -405,7 +405,7 @@ Natural monitor files with a short foreign-language needle sized 32-63 printable
 
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |
 | --- | --- | --- | ---: | ---: | --- |
-| Any non-wrapper | 51/56 | 19/56 | 0.37 | 85.7% | shell (30.4%), other (20.5%), restructuredtext (10.0%) |
+| Any non-wrapper | 51/56 | 19/56 | 0.38 | 85.7% | shell (30.4%), other (20.5%), restructuredtext (10.0%) |
 | Correct label | 43/56 | 41/56 | 0.66 | 70.1% | — |
 
 ### needle_16_31
@@ -415,7 +415,7 @@ Natural monitor files with a short foreign-language needle sized 16-31 printable
 - Samples: 56
 - Characters evaluated: 168351
 - Overall accuracy: 0.9067
-- High confusions: html->other 1891 (3.3%), json->other 1842 (19.5%), markdown->other 1669 (3.8%), restructuredtext->other 1667 (10.3%), other->shell 1525 (44.6%)
+- High confusions: html->other 1891 (3.3%), json->other 1842 (19.5%), markdown->other 1668 (3.8%), restructuredtext->other 1667 (10.3%), other->shell 1525 (44.6%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
@@ -430,7 +430,7 @@ Natural monitor files with a short foreign-language needle sized 16-31 printable
 | csharp | 33 | 0.9091 |
 | python | 1104 | 0.8569 |
 | restructuredtext | 16209 | 0.8089 |
-| json | 9470 | 0.8024 |
+| json | 9470 | 0.8026 |
 | css | 383 | 0.4726 |
 | other | 3419 | 0.2150 |
 | encoding_hex | 733 | 0.1514 |
@@ -442,7 +442,7 @@ Natural monitor files with a short foreign-language needle sized 16-31 printable
 
 | Scenario | Coverage ≥50% | IoU ≥50% | Avg IoU | Coverage | Top misclassifications |
 | --- | --- | --- | ---: | ---: | --- |
-| Any non-wrapper | 36/56 | 15/56 | 0.28 | 56.7% | yaml (46.6%), html (16.4%), other (9.3%) |
+| Any non-wrapper | 36/56 | 15/56 | 0.28 | 56.7% | yaml (46.6%), html (16.5%), other (9.3%) |
 | Correct label | 29/56 | 25/56 | 0.42 | 47.9% | — |
 
 ### needle_4_15
@@ -451,8 +451,8 @@ Natural monitor files with a short foreign-language needle sized 4-15 printable 
 
 - Samples: 48
 - Characters evaluated: 118277
-- Overall accuracy: 0.8130
-- High confusions: html->other 7051 (10.5%), css->other 2122 (37.2%), php->html 1876 (20.2%), markdown->html 1324 (8.9%), other->html 1090 (38.8%)
+- Overall accuracy: 0.8131
+- High confusions: html->other 7051 (10.5%), css->other 2120 (37.2%), php->html 1875 (20.2%), markdown->html 1323 (8.9%), other->html 1090 (38.8%)
 
 | Label | Support | Accuracy |
 | --- | ---: | ---: |
@@ -466,7 +466,7 @@ Natural monitor files with a short foreign-language needle sized 4-15 printable 
 | php | 9281 | 0.7421 |
 | javascript_typescript | 1924 | 0.6071 |
 | css | 5697 | 0.4887 |
-| other | 2809 | 0.1096 |
+| other | 2809 | 0.1107 |
 | ruby | 1002 | 0.0000 |
 | go | 842 | 0.0000 |
 | sql | 358 | 0.0000 |
@@ -483,15 +483,15 @@ Natural monitor files with a short foreign-language needle sized 4-15 printable 
 
 | Task | Device | Samples | Total Bytes | Throughput | Latency (s) |
 | --- | --- | ---: | ---: | ---: | ---: |
-| throughput_1024 | cpu | 4 | 4096 | 4.57 KB/s | 0.88 |
-| throughput_10240 | cpu | 4 | 40960 | 32.04 KB/s | 1.25 |
-| throughput_102400 | cpu | 4 | 409600 | 65.66 KB/s | 6.09 |
-| throughput_1048576 | cpu | 4 | 4194304 | 73.45 KB/s | 55.77 |
-| throughput_1024 | cuda | 4 | 4096 | 18.35 KB/s | 0.22 |
-| throughput_10240 | cuda | 4 | 40960 | 75.21 KB/s | 0.53 |
-| throughput_102400 | cuda | 4 | 409600 | 84.89 KB/s | 4.71 |
-| throughput_1048576 | cuda | 4 | 4194304 | 88.31 KB/s | 46.38 |
+| throughput_1024 | cpu | 4 | 4096 | 4.35 KB/s | 0.92 |
+| throughput_10240 | cpu | 4 | 40960 | 30.03 KB/s | 1.33 |
+| throughput_102400 | cpu | 4 | 409600 | 61.13 KB/s | 6.54 |
+| throughput_1048576 | cpu | 4 | 4194304 | 71.76 KB/s | 57.08 |
+| throughput_1024 | cuda | 4 | 4096 | 34.79 KB/s | 0.11 |
+| throughput_10240 | cuda | 4 | 40960 | 78.19 KB/s | 0.51 |
+| throughput_102400 | cuda | 4 | 409600 | 85.90 KB/s | 4.66 |
+| throughput_1048576 | cuda | 4 | 4194304 | 88.54 KB/s | 46.26 |
 
 Latency is the total wall-clock time to run the benchmark loop over all samples per benchmark type, excluding the one warmup inference call that triggers JAX’s JIT compilation beforehand.
 
-Report generated at 2025-12-09 21:48:11
+Report generated at 2025-12-11 16:04:11

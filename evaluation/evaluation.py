@@ -65,7 +65,10 @@ import orbax.checkpoint as ocp  # noqa: E402
 import utils.config as cfg  # noqa: E402
 from utils.model import UNet1D  # noqa: E402
 from utils.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
-from utils.metrics_helper import compute_metrics_from_confusion  # noqa: E402
+try:
+    from utils.metrics_helper import compute_metrics_from_confusion  # noqa: E402
+except Exception:  # pragma: no cover - optional when plotting/summary isn't needed
+    compute_metrics_from_confusion = None  # type: ignore[assignment]
 
 DEFAULT_CHUNK_SIZE = cfg.MODEL_WINDOW_BYTES
 
@@ -1213,41 +1216,42 @@ def evaluate_task(
                 host_label = normalized_segments[0].get("label")
             host_idx = label_to_idx.get(host_label) if host_label else None
             if host_idx is not None:
-                sample_total = int(truth_valid.shape[0])
-                label_stats = None
-                if host_label:
-                    label_stats = pure_stats.setdefault("per_label", {}).setdefault(
-                        host_label,
-                        {"total": 0, "pure": 0, "within": 0, "ratios": []},
-                    )
-                if sample_total > 0:
-                    counts = np.bincount(pred_valid, minlength=len(label_names))
-                    foreign_counts = counts.copy()
-                    foreign_counts[host_idx] = 0
-                    foreign_sum = int(foreign_counts.sum()) if foreign_counts.size else 0
-                    pure_stats["total"] += 1
-                    if label_stats is not None:
-                        label_stats["total"] += 1
-                    if foreign_sum == 0:
-                        pure_stats["perfect"] += 1
-                        if label_stats is not None:
-                            label_stats["pure"] += 1
-                    if sample_total > 0:
-                        foreign_ratio = foreign_sum / sample_total
-                        pure_stats.setdefault("foreign_ratios", []).append(foreign_ratio)
-                        if label_stats is not None:
-                            label_stats["ratios"].append(foreign_ratio)
-                        if foreign_ratio <= pure_stats["threshold"]:
-                            pure_stats["within_threshold"] += 1
-                            if label_stats is not None:
-                                label_stats["within"] += 1
-
-                # File-level purity for the host language: for this host file,
-                # were all host-label characters predicted correctly?
+                # Host-byte-centric purity: only consider bytes whose ground-truth
+                # label matches the host language. Non-host regions are ignored for
+                # the purposes of "pure" / "within_threshold" so that mixed files
+                # (e.g., HTML with embedded JS/CSS) are judged purely on whether the
+                # host content was misclassified.
                 host_mask = (truth_valid == host_idx)
                 host_chars = int(host_mask.sum())
                 if host_chars > 0:
-                    host_correct = int((same_mask & host_mask).sum())
+                    host_pred = pred_valid[host_mask]
+                    label_stats = None
+                    if host_label:
+                        label_stats = pure_stats.setdefault("per_label", {}).setdefault(
+                            host_label,
+                            {"total": 0, "pure": 0, "within": 0, "ratios": []},
+                        )
+                    # Count false negatives on host bytes only.
+                    host_errors = int((host_pred != host_idx).sum())
+                    pure_stats["total"] += 1
+                    if label_stats is not None:
+                        label_stats["total"] += 1
+                    if host_errors == 0:
+                        pure_stats["perfect"] += 1
+                        if label_stats is not None:
+                            label_stats["pure"] += 1
+                    host_error_ratio = host_errors / host_chars if host_chars > 0 else 0.0
+                    pure_stats.setdefault("foreign_ratios", []).append(host_error_ratio)
+                    if label_stats is not None:
+                        label_stats["ratios"].append(host_error_ratio)
+                    if host_error_ratio <= pure_stats["threshold"]:
+                        pure_stats["within_threshold"] += 1
+                        if label_stats is not None:
+                            label_stats["within"] += 1
+
+                    # File-level purity for the host language: for this host file,
+                    # were all host-label characters predicted correctly?
+                    host_correct = host_chars - host_errors
                     host_pure = host_correct == host_chars
                     host_purity = pure_stats.setdefault("host_byte_purity", {}).setdefault(
                         host_label,
@@ -2273,14 +2277,14 @@ def _collect_task_highlights(task_metrics: List[TaskMetrics]) -> List[str]:
         threshold = float(pure_stats.get("threshold", 0.5))
         ratios = pure_stats.get("foreign_ratios", [])
         summary_lines = [
-            f"{perfect}/{total} samples stayed fully pure (no foreign chars). "
-            f"{within}/{total} stayed within ≤{threshold:.0%} foreign coverage.",
+            f"{perfect}/{total} host-bearing samples had no misclassified host-label bytes. "
+            f"{within}/{total} stayed within ≤{threshold:.0%} host-byte error rate.",
         ]
         if ratios:
             mean_ratio = float(sum(ratios)) / max(1, len(ratios))
             expected_bytes = mean_ratio * 1536
             summary_lines.append(
-                f"Expected foreign bytes for a 1536-byte fragment: {expected_bytes:.1f}/1536"
+                f"Expected misclassified host bytes for 1536 host-labeled bytes: {expected_bytes:.1f}/1536"
             )
         add_section("pure_fragments", summary_lines)
 
@@ -2886,7 +2890,7 @@ def write_report(
                 expected_bytes = mean_ratio * 1536
                 report_lines.append("")
                 report_lines.append(
-                    f"Expected foreign bytes for a 1536-byte fragment: {expected_bytes:.1f}/1536"
+                    f"Expected misclassified host bytes for 1536 host-labeled bytes: {expected_bytes:.1f}/1536"
                 )
                 report_lines.append("")
 
