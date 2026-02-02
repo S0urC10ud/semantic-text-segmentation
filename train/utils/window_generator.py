@@ -373,6 +373,8 @@ def _sample_mixed_segment_count(max_segments: int = 3, continue_prob: float = 0.
 
 _DOCKERFILE_LID = cfg.LANG2ID.get("dockerfile")
 _SHELL_LID = cfg.LANG2ID.get("shell")
+_HEX_DIGIT_BYTES = {ord(c) for c in "0123456789abcdefABCDEF"}
+_HEX_WHITESPACE_BYTES = {ord(" "), ord("\t"), ord("\n"), ord("\r")}
 _RUN_OPTION_PREFIXES = (
     "--mount",
     "--network",
@@ -392,8 +394,11 @@ _DOCKER_HEREDOC_PATTERN = re.compile(
 def _finalize_window_arrays(
     x: np.ndarray,
     y: np.ndarray,
+    data_cfg: Optional["DataConfig"] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     _maybe_apply_docker_shell_labels(x, y)
+    if data_cfg is not None:
+        _maybe_augment_hex_segments(x, y, data_cfg)
     return sanitize_tokens(x), y
 
 
@@ -453,6 +458,155 @@ def _relabel_docker_shell_slice(
         abs_start = start + local_start
         abs_end = start + local_end
         labels[abs_start:abs_end] = shell_id
+
+
+def _maybe_augment_hex_segments(
+    tokens: np.ndarray,
+    labels: np.ndarray,
+    data_cfg: Optional["DataConfig"] = None,
+) -> None:
+    """Optionally augment spacing inside encoding_hex segments without changing labels or length.
+
+    This keeps window shapes intact by only shuffling where existing whitespace
+    appears inside hex-like runs; it never inserts or removes characters.
+    """
+    if tokens is None or labels is None or data_cfg is None:
+        return
+
+    prob = float(getattr(data_cfg, "hex_spacing_aug_prob", 0.0) or 0.0)
+    if prob <= 0.0:
+        return
+
+    # Best-effort lookup of the encoding_hex label id using the current mapping.
+    hex_lid: Optional[int] = None
+    if hasattr(cfg, "ID2LANG"):
+        for lid, name in getattr(cfg, "ID2LANG", {}).items():
+            if name == "encoding_hex":
+                hex_lid = int(lid)
+                break
+    if hex_lid is None and hasattr(cfg, "LANG2ID"):
+        hex_lid = getattr(cfg, "LANG2ID", {}).get("encoding_hex")
+        if hex_lid is not None:
+            hex_lid = int(hex_lid)
+    if hex_lid is None:
+        return
+
+    labels_arr = np.asarray(labels)
+    tokens_arr = np.asarray(tokens)
+    if labels_arr.ndim != 1 or tokens_arr.ndim != 1:
+        # This helper is intended for 1D window vectors.
+        return
+
+    hex_label_val = np.uint8(hex_lid)
+    hex_mask = labels_arr == hex_label_val
+    if not np.any(hex_mask):
+        return
+
+    # Apply augmentation to a subset of windows.
+    if random.random() >= prob:
+        return
+
+    length = int(labels_arr.shape[0])
+    i = 0
+    while i < length:
+        if not hex_mask[i] or int(tokens_arr[i]) == int(cfg.PAD_BYTE_ID):
+            i += 1
+            continue
+        start = i
+        i += 1
+        while (
+            i < length
+            and hex_mask[i]
+            and int(tokens_arr[i]) != int(cfg.PAD_BYTE_ID)
+        ):
+            i += 1
+        end = i
+        if end <= start:
+            continue
+        _augment_hex_run(tokens_arr, start, end)
+
+
+def _augment_hex_run(tokens_arr: np.ndarray, start: int, end: int) -> None:
+    """Shuffle whitespace positions within hex-like sub-runs of tokens_arr[start:end].
+
+    This keeps:
+      - overall span length unchanged
+      - label positions untouched (caller scopes to encoding_hex)
+      - number of whitespace vs non-whitespace characters identical
+    """
+    if end <= start:
+        return
+    span = tokens_arr[start:end]
+    n = int(span.shape[0])
+    if n <= 0:
+        return
+
+    idx = 0
+    while idx < n:
+        b = int(span[idx])
+        if b not in _HEX_DIGIT_BYTES and b not in _HEX_WHITESPACE_BYTES:
+            idx += 1
+            continue
+
+        run_start = idx
+        run_end = idx
+        has_digit = False
+        digit_chars: List[str] = []
+        ws_positions: List[int] = []
+
+        while run_end < n:
+            val = int(span[run_end])
+            if val not in _HEX_DIGIT_BYTES and val not in _HEX_WHITESPACE_BYTES:
+                break
+            if val in _HEX_DIGIT_BYTES:
+                digit_chars.append(chr(val))
+                has_digit = True
+            else:
+                ws_positions.append(run_end - run_start)
+            run_end += 1
+
+        run_len = run_end - run_start
+        if has_digit and ws_positions and run_len >= 4:
+            _shuffle_hex_whitespace(span, run_start, run_len, digit_chars, len(ws_positions))
+
+        idx = run_end
+
+
+def _shuffle_hex_whitespace(
+    span: np.ndarray,
+    local_start: int,
+    run_len: int,
+    digit_chars: List[str],
+    ws_count: int,
+) -> None:
+    """Redistribute whitespace within a local hex-digit run while preserving counts."""
+    if ws_count <= 0:
+        return
+    if run_len <= 0 or ws_count >= run_len:
+        return
+    if len(digit_chars) != run_len - ws_count:
+        # Safety check; if counts don't match expectations, leave as-is.
+        return
+
+    indices = list(range(run_len))
+    random.shuffle(indices)
+    ws_positions_set = set(indices[:ws_count])
+
+    digit_idx = 0
+    for offset in range(run_len):
+        pos = local_start + offset
+        if offset in ws_positions_set:
+            r = random.random()
+            if r < 0.8:
+                ch = " "
+            elif r < 0.9:
+                ch = "\n"
+            else:
+                ch = "\t"
+            span[pos] = ord(ch)
+        else:
+            span[pos] = ord(digit_chars[digit_idx])
+            digit_idx += 1
 
 
 def _char_spans_to_byte_spans(
@@ -1504,7 +1658,7 @@ def _make_training_window_internal(
             actual_mode = "mixed"
         metadata["actual_mode"] = actual_mode
         metadata["mode"] = actual_mode
-    x, y = _finalize_window_arrays(x, y)
+    x, y = _finalize_window_arrays(x, y, data_cfg)
     return x, y, metadata
 
 

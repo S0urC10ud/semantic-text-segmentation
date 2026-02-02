@@ -134,6 +134,9 @@ class DataConfig:
     donor_skip_top_max: int = 20
     both_prob: float = 0 # probability to overlay/inject substrings after the window ways built
 
+    # Encoded/hex content augmentation
+    hex_spacing_aug_prob: float = 0.1
+
     def buckets(self) -> List[int]:
         """Generate window size buckets from min to max."""
         if self.window_min_bytes == self.window_max_bytes:

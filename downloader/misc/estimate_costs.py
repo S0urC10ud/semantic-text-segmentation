@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logs-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "gemini_output_logs",
+        default=Path(__file__).resolve().parents[2] / "gemini_output_logs",
         help="Directory containing *_*.json logs (default: gemini_output_logs/ at repo root).",
     )
     parser.add_argument(

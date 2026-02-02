@@ -37,7 +37,6 @@ ALLOWED_LANGS = {
     "markdown",
     "restructuredtext",
     "javascript_typescript",
-    "python"
 }
 ALLOWED_LANGS_LOWER = {lang.lower() for lang in ALLOWED_LANGS}
 
