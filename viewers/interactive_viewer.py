@@ -17,7 +17,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import jax
 from fastapi import FastAPI, HTTPException
@@ -67,9 +67,23 @@ parser.add_argument(
     required=True,
     help="Path to a .msgpack file OR an Orbax checkpoint dir/root"
 )
+parser.add_argument(
+    "--arch",
+    type=str,
+    default=None,
+    choices=("unet1d", "mamba"),
+    help="Model architecture (auto if omitted).",
+)
 parser.add_argument("--model-dim", type=int, default=None, help="Model embedding dimension (auto if omitted).")
 parser.add_argument("--channels", type=str, default=None, help="Comma-separated channel sizes (auto if omitted).")
 parser.add_argument("--dtype", type=str, default=None, help="Model dtype name (auto if omitted).")
+# Mamba-only knobs (ignored for unet1d); auto if omitted.
+parser.add_argument("--mamba-layers", type=int, default=None)
+parser.add_argument("--mamba-d-state", type=int, default=None)
+parser.add_argument("--mamba-expand", type=int, default=None)
+parser.add_argument("--mamba-dt-rank", type=int, default=None)
+parser.add_argument("--mamba-conv", type=int, default=None)
+parser.add_argument("--mamba-bidirectional", action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument(
     "--chunk",
     type=int,
@@ -110,6 +124,15 @@ label_names = auto_hparams.get("label_names")
 if label_names:
     _apply_label_mapping(label_names)
 
+arch_value, arch_source = _resolve_hparam(
+    args.arch,
+    auto_hparams.get("arch"),
+    ckpt_inferred.get("arch"),
+    "unet1d",
+)
+arch = str(arch_value).lower().strip()
+args.arch = arch
+
 model_dim_value, model_dim_source = _resolve_hparam(
     args.model_dim,
     auto_hparams.get("model_dim"),
@@ -129,28 +152,79 @@ if isinstance(dtype_value, str):
 else:
     dtype = str(dtype_value)
 
-channels_cli = None
-if args.channels:
-    channels_cli = [int(x) for x in args.channels.split(",") if x.strip()]
-channels_value, channels_source = _resolve_hparam(
-    channels_cli,
-    auto_hparams.get("channels"),
-    ckpt_inferred.get("channels"),
-    list(DEFAULT_CHANNELS),
-)
-channel_values = [int(x) for x in channels_value]
-channels = tuple(channel_values)
+channels: Tuple[int, ...]
+channels_source = "unused"
+if arch == "unet1d":
+    channels_cli = None
+    if args.channels:
+        channels_cli = [int(x) for x in args.channels.split(",") if x.strip()]
+    channels_value, channels_source = _resolve_hparam(
+        channels_cli,
+        auto_hparams.get("channels"),
+        ckpt_inferred.get("channels"),
+        list(DEFAULT_CHANNELS),
+    )
+    channel_values = [int(x) for x in channels_value]
+    channels = tuple(channel_values)
+else:
+    channels = tuple(DEFAULT_CHANNELS)
 
 args.model_dim = model_dim
 args.dtype = dtype
 args.channels = ",".join(str(ch) for ch in channels)
 
+if arch == "mamba":
+    args.mamba_layers, _ = _resolve_hparam(
+        getattr(args, "mamba_layers", None),
+        auto_hparams.get("mamba_layers"),
+        ckpt_inferred.get("mamba_layers"),
+        6,
+    )
+    args.mamba_d_state, _ = _resolve_hparam(
+        getattr(args, "mamba_d_state", None),
+        auto_hparams.get("mamba_d_state"),
+        ckpt_inferred.get("mamba_d_state"),
+        8,
+    )
+    args.mamba_expand, _ = _resolve_hparam(
+        getattr(args, "mamba_expand", None),
+        auto_hparams.get("mamba_expand"),
+        ckpt_inferred.get("mamba_expand"),
+        1,
+    )
+    args.mamba_dt_rank, _ = _resolve_hparam(
+        getattr(args, "mamba_dt_rank", None),
+        auto_hparams.get("mamba_dt_rank"),
+        ckpt_inferred.get("mamba_dt_rank"),
+        16,
+    )
+    args.mamba_conv, _ = _resolve_hparam(
+        getattr(args, "mamba_conv", None),
+        auto_hparams.get("mamba_conv"),
+        ckpt_inferred.get("mamba_conv"),
+        4,
+    )
+    args.mamba_bidirectional, _ = _resolve_hparam(
+        getattr(args, "mamba_bidirectional", None),
+        auto_hparams.get("mamba_bidirectional"),
+        ckpt_inferred.get("mamba_bidirectional"),
+        True,
+    )
+
 if auto_hparams or ckpt_inferred:
     details = [
+        f"arch={arch} ({arch_source})",
         f"model_dim={model_dim} ({model_dim_source})",
-        f"channels={list(channels)} ({channels_source})",
         f"dtype={dtype} ({dtype_source})",
     ]
+    if arch == "unet1d":
+        details.insert(2, f"channels={list(channels)} ({channels_source})")
+    else:
+        details.append(
+            "mamba="
+            + f"layers={int(args.mamba_layers)},d_state={int(args.mamba_d_state)},expand={int(args.mamba_expand)},"
+            + f"dt_rank={int(args.mamba_dt_rank)},conv={int(args.mamba_conv)},bi={bool(args.mamba_bidirectional)}"
+        )
     label_source = auto_hparams.pop("_label_source", None)
     if label_names:
         origin = label_source if label_source else "wandb"
@@ -198,6 +272,13 @@ try:
         num_classes=num_classes,
         model_dim=args.model_dim,
         channels=channels,
+        arch=args.arch,
+        mamba_layers=int(getattr(args, "mamba_layers", 6) or 6),
+        mamba_d_state=int(getattr(args, "mamba_d_state", 8) or 8),
+        mamba_expand=int(getattr(args, "mamba_expand", 1) or 1),
+        mamba_dt_rank=int(getattr(args, "mamba_dt_rank", 16) or 16),
+        mamba_conv=int(getattr(args, "mamba_conv", 4) or 4),
+        mamba_bidirectional=bool(getattr(args, "mamba_bidirectional", True)),
         dtype_str=args.dtype,
         chunk=args.chunk,
         other_threshold=args.other_threshold,

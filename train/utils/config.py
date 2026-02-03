@@ -152,9 +152,17 @@ class TrainConfig:
     warmup: int = 100
     accum_steps: int = 1
     dtype: jnp.dtype = jnp.bfloat16
+    arch: str = "unet1d"  # 'unet1d' (default) or 'mamba'
     model_dim: int = 128
     channels: Tuple[int, ...] = (128, 256, 384, 512)
     dropout_rate: float = 0.1
+    # Mamba-specific hyperparameters (only used when arch == 'mamba')
+    mamba_layers: int = 6
+    mamba_d_state: int = 8
+    mamba_expand: int = 1
+    mamba_dt_rank: int = 16
+    mamba_conv: int = 4
+    mamba_bidirectional: bool = True
     rng_seed: int = 123
     log_every: int = 50
     eval_every: int = 250

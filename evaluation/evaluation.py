@@ -63,7 +63,7 @@ from flax.errors import ScopeParamShapeError  # noqa: E402
 import orbax.checkpoint as ocp  # noqa: E402
 
 import utils.config as cfg  # noqa: E402
-from utils.model import UNet1D  # noqa: E402
+from utils.model import UNet1D, Mamba1D  # noqa: E402
 from utils.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
 try:
     from utils.metrics_helper import compute_metrics_from_confusion  # noqa: E402
@@ -426,8 +426,15 @@ class SegmenterRunner:
         self,
         checkpoint_path: str,
         *,
+        arch: str = "unet1d",
         model_dim: int,
         channels: Sequence[int],
+        mamba_layers: int = 6,
+        mamba_d_state: int = 8,
+        mamba_expand: int = 1,
+        mamba_dt_rank: int = 16,
+        mamba_conv: int = 4,
+        mamba_bidirectional: bool = True,
         dtype: str = "bfloat16",
         chunk: int = DEFAULT_CHUNK_SIZE,
         device: Optional[str] = None,
@@ -445,11 +452,12 @@ class SegmenterRunner:
             raise ValueError("Chunk size must be positive.")
         self.batch_size = int(batch_size)
         self.num_classes = cfg.NUM_CLASSES
+        self.arch = str(arch).lower().strip()
         dt = getattr(jnp, dtype)
         requested_channels = tuple(int(ch) for ch in channels)
         self._weight_cache: Dict[int, np.ndarray] = {}
 
-        def _initialize_with_channels(channel_values: Sequence[int]):
+        def _initialize_unet(channel_values: Sequence[int]):
             model = UNet1D(
                 num_classes=self.num_classes,
                 emb_dim=model_dim,
@@ -462,21 +470,69 @@ class SegmenterRunner:
             params = _load_params_from_any(checkpoint_path, template)
             return model, params
 
-        try:
-            model, params = _initialize_with_channels(requested_channels)
-        except ScopeParamShapeError:
-            fallback = _load_checkpoint_hparams(Path(checkpoint_path))
-            fallback_channels = fallback.get("channels")
-            fallback_tuple: Tuple[int, ...] = tuple(int(ch) for ch in fallback_channels) if fallback_channels else ()
-            if fallback_tuple and fallback_tuple != requested_channels:
-                model, params = _initialize_with_channels(fallback_tuple)
-                requested_channels = fallback_tuple
-            else:
-                raise
+        def _initialize_mamba(
+            *,
+            layers: int,
+            d_state: int,
+            expand: int,
+            dt_rank: int,
+            conv: int,
+            bidirectional: bool,
+        ):
+            model = Mamba1D(
+                num_classes=self.num_classes,
+                d_model=int(model_dim),
+                n_layers=int(layers),
+                d_state=int(d_state),
+                expand=int(expand),
+                dt_rank=int(dt_rank),
+                d_conv=int(conv),
+                bidirectional=bool(bidirectional),
+                dtype=dt,
+            )
+            dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
+            variables = model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
+            template = variables["params"]
+            params = _load_params_from_any(checkpoint_path, template)
+            return model, params
+
+        if self.arch == "mamba":
+            try:
+                model, params = _initialize_mamba(
+                    layers=mamba_layers,
+                    d_state=mamba_d_state,
+                    expand=mamba_expand,
+                    dt_rank=mamba_dt_rank,
+                    conv=mamba_conv,
+                    bidirectional=mamba_bidirectional,
+                )
+            except ScopeParamShapeError:
+                fallback = _load_checkpoint_hparams(Path(checkpoint_path))
+                model, params = _initialize_mamba(
+                    layers=int(fallback.get("mamba_layers", mamba_layers)),
+                    d_state=int(fallback.get("mamba_d_state", mamba_d_state)),
+                    expand=int(fallback.get("mamba_expand", mamba_expand)),
+                    dt_rank=int(fallback.get("mamba_dt_rank", mamba_dt_rank)),
+                    conv=int(fallback.get("mamba_conv", mamba_conv)),
+                    bidirectional=bool(fallback.get("mamba_bidirectional", mamba_bidirectional)),
+                )
+            requested_channels = ()
+        else:
+            try:
+                model, params = _initialize_unet(requested_channels)
+            except ScopeParamShapeError:
+                fallback = _load_checkpoint_hparams(Path(checkpoint_path))
+                fallback_channels = fallback.get("channels")
+                fallback_tuple: Tuple[int, ...] = tuple(int(ch) for ch in fallback_channels) if fallback_channels else ()
+                if fallback_tuple and fallback_tuple != requested_channels:
+                    model, params = _initialize_unet(fallback_tuple)
+                    requested_channels = fallback_tuple
+                else:
+                    raise
 
         self.model = model
         self.params = params
-        self.channels = tuple(int(ch) for ch in requested_channels)
+        self.channels = tuple(int(ch) for ch in requested_channels) if requested_channels else ()
 
         def apply_fn(tokens: jnp.ndarray):
             return self.model.apply({"params": self.params}, tokens, train=False)
@@ -1920,6 +1976,22 @@ def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
                             dtype_val = config_data.get("dtype", {}).get("value")
                             if isinstance(dtype_val, str):
                                 result["dtype"] = dtype_val.rsplit(".", 1)[-1]
+                            arch_val = config_data.get("arch", {}).get("value")
+                            if isinstance(arch_val, str) and arch_val.strip():
+                                result["arch"] = arch_val.strip()
+                            for key in (
+                                "mamba_layers",
+                                "mamba_d_state",
+                                "mamba_expand",
+                                "mamba_dt_rank",
+                                "mamba_conv",
+                                "mamba_bidirectional",
+                            ):
+                                val = config_data.get(key, {}).get("value")
+                                if isinstance(val, bool):
+                                    result[key] = bool(val)
+                                elif isinstance(val, (int, float)):
+                                    result[key] = int(val)
 
                     summary_path = run_dir / "files" / "wandb-summary.json"
                     if summary_path.exists():
@@ -3167,9 +3239,16 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--device", default="auto", help="Device for accuracy workloads (cpu/gpu/cuda/auto).")
     parser.add_argument("--cpu-device", default="cpu", help="Device name for throughput CPU benchmark.")
     parser.add_argument("--gpu-device", default="cuda", help="Device name for throughput GPU benchmark (ignored if unavailable).")
+    parser.add_argument("--arch", default=None, choices=("unet1d", "mamba"), help="Model architecture (auto if omitted).")
     parser.add_argument("--model-dim", type=int, default=None, help="Model embedding dimension. Defaults to checkpoint config or 256.")
     parser.add_argument("--channels", type=str, default=None, help="Comma-separated channel widths. Defaults to checkpoint config or 96,128,192,256.")
     parser.add_argument("--dtype", type=str, default=None, help="JAX dtype name for inference (e.g. bfloat16). Defaults to checkpoint config or bfloat16.")
+    parser.add_argument("--mamba-layers", type=int, default=None, help="Mamba only: number of layers (auto if omitted).")
+    parser.add_argument("--mamba-d-state", type=int, default=None, help="Mamba only: SSM state size (auto if omitted).")
+    parser.add_argument("--mamba-expand", type=int, default=None, help="Mamba only: expansion factor (auto if omitted).")
+    parser.add_argument("--mamba-dt-rank", type=int, default=None, help="Mamba only: dt low-rank dim (auto if omitted).")
+    parser.add_argument("--mamba-conv", type=int, default=None, help="Mamba only: depthwise conv kernel (auto if omitted).")
+    parser.add_argument("--mamba-bidirectional", action=argparse.BooleanOptionalAction, default=None, help="Mamba only: bidirectional scan.")
     parser.add_argument("--chunk", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--min-run", type=int, default=1, help="Minimum run-length smoothing for character labels.")
     parser.add_argument(
@@ -3230,14 +3309,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if label_names:
             _apply_label_mapping(label_names)
 
+        arch = args.arch if args.arch is not None else auto_hparams.get("arch", None)
+        arch = str(arch).lower().strip() if arch else "unet1d"
+        args.arch = arch
+
         model_dim = args.model_dim if args.model_dim is not None else auto_hparams.get("model_dim", 256)
         dtype = args.dtype if args.dtype is not None else auto_hparams.get("dtype", "bfloat16")
         dtype = dtype.rsplit(".", 1)[-1]
-        if args.channels:
-            channels = [int(ch) for ch in args.channels.split(",") if ch.strip()]
+        if arch == "unet1d":
+            if args.channels:
+                channels = [int(ch) for ch in args.channels.split(",") if ch.strip()]
+            else:
+                channels_source = auto_hparams.get("channels", DEFAULT_CHANNELS)
+                channels = [int(ch) for ch in channels_source]
         else:
-            channels_source = auto_hparams.get("channels", DEFAULT_CHANNELS)
-            channels = [int(ch) for ch in channels_source]
+            channels = [int(ch) for ch in DEFAULT_CHANNELS]
+
+        if arch == "mamba":
+            args.mamba_layers = args.mamba_layers if args.mamba_layers is not None else auto_hparams.get("mamba_layers", 6)
+            args.mamba_d_state = args.mamba_d_state if args.mamba_d_state is not None else auto_hparams.get("mamba_d_state", 8)
+            args.mamba_expand = args.mamba_expand if args.mamba_expand is not None else auto_hparams.get("mamba_expand", 1)
+            args.mamba_dt_rank = args.mamba_dt_rank if args.mamba_dt_rank is not None else auto_hparams.get("mamba_dt_rank", 16)
+            args.mamba_conv = args.mamba_conv if args.mamba_conv is not None else auto_hparams.get("mamba_conv", 4)
+            args.mamba_bidirectional = (
+                args.mamba_bidirectional
+                if args.mamba_bidirectional is not None
+                else bool(auto_hparams.get("mamba_bidirectional", True))
+            )
 
         args.model_dim = model_dim
         args.dtype = dtype
@@ -3245,19 +3343,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if auto_hparams:
             extra = f", classes={len(label_names)}" if label_names else ""
-            print(f"ℹ️  Using checkpoint hyperparameters: model_dim={model_dim}, channels={channels}, dtype={dtype}{extra}", flush=True)
+            if arch == "unet1d":
+                print(
+                    f"ℹ️  Using checkpoint hyperparameters: arch={arch}, model_dim={model_dim}, channels={channels}, dtype={dtype}{extra}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "ℹ️  Using checkpoint hyperparameters: "
+                    f"arch={arch}, model_dim={model_dim}, dtype={dtype}, "
+                    f"mamba_layers={int(args.mamba_layers)}, mamba_d_state={int(args.mamba_d_state)}, "
+                    f"mamba_expand={int(args.mamba_expand)}, mamba_dt_rank={int(args.mamba_dt_rank)}, "
+                    f"mamba_conv={int(args.mamba_conv)}, mamba_bidirectional={bool(args.mamba_bidirectional)}{extra}",
+                    flush=True,
+                )
 
         accuracy_runner = SegmenterRunner(
             args.checkpoint,
+            arch=arch,
             model_dim=model_dim,
             channels=channels,
+            mamba_layers=int(getattr(args, "mamba_layers", 6) or 6),
+            mamba_d_state=int(getattr(args, "mamba_d_state", 8) or 8),
+            mamba_expand=int(getattr(args, "mamba_expand", 1) or 1),
+            mamba_dt_rank=int(getattr(args, "mamba_dt_rank", 16) or 16),
+            mamba_conv=int(getattr(args, "mamba_conv", 4) or 4),
+            mamba_bidirectional=bool(getattr(args, "mamba_bidirectional", True)),
             dtype=dtype,
             chunk=args.chunk,
             device=args.device,
             batch_size=args.batch_size,
         )
-        channels = [int(ch) for ch in getattr(accuracy_runner, "channels", channels)]
-        args.channels = channels
+        runner_channels = getattr(accuracy_runner, "channels", None)
+        if runner_channels:
+            channels = [int(ch) for ch in runner_channels]
+            args.channels = channels
 
         datasets = _collect_datasets(data_root, args.tasks)
         if not datasets:
@@ -3329,8 +3449,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             try:
                 cpu_runner = SegmenterRunner(
                     args.checkpoint,
+                    arch=arch,
                     model_dim=args.model_dim,
                     channels=channels,
+                    mamba_layers=int(getattr(args, "mamba_layers", 6) or 6),
+                    mamba_d_state=int(getattr(args, "mamba_d_state", 8) or 8),
+                    mamba_expand=int(getattr(args, "mamba_expand", 1) or 1),
+                    mamba_dt_rank=int(getattr(args, "mamba_dt_rank", 16) or 16),
+                    mamba_conv=int(getattr(args, "mamba_conv", 4) or 4),
+                    mamba_bidirectional=bool(getattr(args, "mamba_bidirectional", True)),
                     dtype=args.dtype,
                     chunk=args.chunk,
                     device=args.cpu_device,
@@ -3369,8 +3496,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 try:
                     gpu_runner = SegmenterRunner(
                         args.checkpoint,
+                        arch=arch,
                         model_dim=args.model_dim,
                         channels=channels,
+                        mamba_layers=int(getattr(args, "mamba_layers", 6) or 6),
+                        mamba_d_state=int(getattr(args, "mamba_d_state", 8) or 8),
+                        mamba_expand=int(getattr(args, "mamba_expand", 1) or 1),
+                        mamba_dt_rank=int(getattr(args, "mamba_dt_rank", 16) or 16),
+                        mamba_conv=int(getattr(args, "mamba_conv", 4) or 4),
+                        mamba_bidirectional=bool(getattr(args, "mamba_bidirectional", True)),
                         dtype=args.dtype,
                         chunk=args.chunk,
                         device=args.gpu_device,

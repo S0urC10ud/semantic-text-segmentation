@@ -26,7 +26,12 @@ def decay_mask(params):
             return {k: _mask(v, path + (k,)) for k, v in tree.items()}
         name = "/".join(path)
         # No decay for layer norms, biases, or embeddings
-        if "GroupNorm" in name or name.endswith("bias") or "Embed_0/embedding" in name:
+        if (
+            "GroupNorm" in name
+            or "LayerNorm" in name
+            or name.endswith("bias")
+            or "Embed_0/embedding" in name
+        ):
             return False
         return True
     return _mask(params)
@@ -88,6 +93,224 @@ class UNet1D(nn.Module):
         return logits_bf16.astype(jnp.float32)
 
 # ---------------------------
+# Model: Mamba (simple Flax port)
+# ---------------------------
+
+class MambaBlock1D(nn.Module):
+    """A small, self-contained Mamba-style block for sequence mixing.
+
+    Notes:
+      - This is intentionally minimal and pure-JAX/Flax (no custom kernels).
+      - The SSM scan uses `lax.scan` (sequential). It is meant for quick
+        architecture comparisons, not peak throughput.
+      - Set bidirectional=True to make it usable for per-position segmentation.
+    """
+
+    d_model: int
+    d_state: int = 8
+    expand: int = 1
+    dt_rank: int = 16
+    d_conv: int = 4
+    dropout_rate: float = 0.0
+    bidirectional: bool = True
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
+        # Pre-norm
+        h = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x)
+
+        d_inner = int(self.d_model) * int(self.expand)
+
+        # Input projection: (x, gate)
+        xz = nn.Dense(
+            2 * d_inner,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            use_bias=True,
+        )(h)
+        u, gate = jnp.split(xz, 2, axis=-1)
+
+        # Local mixing (depthwise conv)
+        if self.d_conv and int(self.d_conv) > 1:
+            u = nn.Conv(
+                features=d_inner,
+                kernel_size=(int(self.d_conv),),
+                padding="SAME",
+                feature_group_count=d_inner,
+                dtype=self.dtype,
+                param_dtype=jnp.float32,
+                use_bias=True,
+            )(u)
+        u = jax.nn.silu(u)
+
+        # Token-dependent SSM parameters
+        dt_rank = int(self.dt_rank) if int(self.dt_rank) > 0 else max(4, d_inner // 16)
+        x_dbl = nn.Dense(
+            dt_rank + 2 * int(self.d_state),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            use_bias=True,
+        )(u)
+        dt_raw, B, C = jnp.split(
+            x_dbl, [dt_rank, dt_rank + int(self.d_state)], axis=-1
+        )
+        dt = nn.Dense(
+            d_inner,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            use_bias=True,
+        )(dt_raw)
+        dt = jax.nn.softplus(dt).astype(jnp.float32) + 1e-4
+
+        # Learned continuous-time parameters (diagonal A per channel)
+        A_log = self.param(
+            "A_log",
+            nn.initializers.normal(stddev=0.02),
+            (d_inner, int(self.d_state)),
+            jnp.float32,
+        )
+        A = -jnp.exp(A_log)  # (d_inner, d_state), negative for stability
+        D = self.param("D", nn.initializers.ones, (d_inner,), jnp.float32)
+
+        def selective_scan(
+            x_in: jnp.ndarray,
+            dt_in: jnp.ndarray,
+            B_in: jnp.ndarray,
+            C_in: jnp.ndarray,
+        ) -> jnp.ndarray:
+            # x_in: (B, L, d_inner)
+            # dt_in: (B, L, d_inner)
+            # B_in/C_in: (B, L, d_state)
+            #
+            # We avoid a sequential per-token lax.scan (very slow on GPU at long L)
+            # by using an associative scan over affine transforms:
+            #   s_t = a_t * s_{t-1} + b_t
+            # where a_t = exp(dt_t * A), b_t = x_t * dt_t * B_t.
+            x_f32 = x_in.astype(jnp.float32)
+            dt_f32 = dt_in.astype(jnp.float32)
+            B_f32 = B_in.astype(jnp.float32)
+            C_f32 = C_in.astype(jnp.float32)
+
+            # Time-major: (L, B, ...)
+            x_tm = jnp.swapaxes(x_f32, 0, 1)   # (L,B,d_inner)
+            dt_tm = jnp.swapaxes(dt_f32, 0, 1)  # (L,B,d_inner)
+            B_tm = jnp.swapaxes(B_f32, 0, 1)   # (L,B,d_state)
+            C_tm = jnp.swapaxes(C_f32, 0, 1)   # (L,B,d_state)
+
+            a = jnp.exp(dt_tm[:, :, :, None] * A[None, None, :, :])  # (L,B,d_inner,d_state)
+            b = (
+                x_tm[:, :, :, None]
+                * (dt_tm[:, :, :, None] * B_tm[:, :, None, :])
+            )  # (L,B,d_inner,d_state)
+
+            def combine(left, right):
+                a1, b1 = left
+                a2, b2 = right
+                # Compose affine transforms: (a2,b2) ∘ (a1,b1)
+                return a2 * a1, b2 + a2 * b1
+
+            _, state_tm = jax.lax.associative_scan(combine, (a, b), axis=0)
+
+            y_tm = (
+                jnp.sum(state_tm * C_tm[:, :, None, :], axis=-1)
+                + x_tm * D[None, None, :]
+            )  # (L,B,d_inner)
+            return jnp.swapaxes(y_tm, 0, 1)  # (B,L,d_inner)
+
+        y = selective_scan(u, dt, B, C)
+        if self.bidirectional:
+            y_rev = selective_scan(u[:, ::-1, :], dt[:, ::-1, :], B[:, ::-1, :], C[:, ::-1, :])
+            y = y + y_rev[:, ::-1, :]
+
+        y = y.astype(self.dtype)
+
+        # Gating + output projection back to d_model
+        y = y * jax.nn.silu(gate)
+        y = nn.Dense(
+            int(self.d_model),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            use_bias=True,
+        )(y)
+        if self.dropout_rate and float(self.dropout_rate) > 0.0:
+            y = nn.Dropout(rate=float(self.dropout_rate), deterministic=not train)(y)
+        return x + y
+
+
+class Mamba1D(nn.Module):
+    num_classes: int = cfg.NUM_CLASSES
+    d_model: int = 256
+    n_layers: int = 6
+    d_state: int = 8
+    expand: int = 1
+    dt_rank: int = 16
+    d_conv: int = 4
+    bidirectional: bool = True
+    dropout_rate: float = 0.0
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, tokens: jnp.ndarray, train: bool = True):
+        h = nn.Embed(
+            num_embeddings=cfg.NUM_TOKEN_EMBEDDINGS,
+            features=int(self.d_model),
+            embedding_init=nn.initializers.normal(stddev=0.02),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+        )(tokens)
+
+        if self.dropout_rate and float(self.dropout_rate) > 0.0:
+            h = nn.Dropout(rate=float(self.dropout_rate), deterministic=not train)(h)
+
+        for _ in range(int(self.n_layers)):
+            h = MambaBlock1D(
+                d_model=int(self.d_model),
+                d_state=int(self.d_state),
+                expand=int(self.expand),
+                dt_rank=int(self.dt_rank),
+                d_conv=int(self.d_conv),
+                dropout_rate=float(self.dropout_rate),
+                bidirectional=bool(self.bidirectional),
+                dtype=self.dtype,
+            )(h, train=train)
+
+        h = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(h)
+        logits = nn.Dense(
+            int(self.num_classes),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            use_bias=True,
+        )(h)
+        return logits.astype(jnp.float32)
+
+
+def build_model(train_cfg: "TrainConfig", num_classes: int) -> nn.Module:
+    arch = str(getattr(train_cfg, "arch", "unet1d")).lower().strip()
+    if arch in {"unet", "unet1d", "u-net", "u_net"}:
+        return UNet1D(
+            num_classes=num_classes,
+            emb_dim=train_cfg.model_dim,
+            channels=train_cfg.channels,
+            dropout_rate=train_cfg.dropout_rate,
+            dtype=train_cfg.dtype,
+        )
+    if arch in {"mamba", "mamba1d", "bimamba", "ssm"}:
+        return Mamba1D(
+            num_classes=num_classes,
+            d_model=train_cfg.model_dim,
+            n_layers=getattr(train_cfg, "mamba_layers", 6),
+            d_state=getattr(train_cfg, "mamba_d_state", 8),
+            expand=getattr(train_cfg, "mamba_expand", 1),
+            dt_rank=getattr(train_cfg, "mamba_dt_rank", 16),
+            d_conv=getattr(train_cfg, "mamba_conv", 4),
+            bidirectional=getattr(train_cfg, "mamba_bidirectional", True),
+            dropout_rate=train_cfg.dropout_rate,
+            dtype=train_cfg.dtype,
+        )
+    raise ValueError(f"Unknown arch '{arch}'. Expected 'unet1d' or 'mamba'.")
+
+# ---------------------------
 # Training utilities
 # ---------------------------
 
@@ -98,8 +321,7 @@ def count_params(params) -> int:
     return sum([np.prod(x.shape) for x in jtu.tree_leaves(params)])
 
 def create_train_state(rng, cfg: "TrainConfig", num_classes: int):
-    model = UNet1D(num_classes=num_classes, emb_dim=cfg.model_dim,
-                   channels=cfg.channels, dropout_rate=cfg.dropout_rate, dtype=cfg.dtype)
+    model = build_model(cfg, num_classes)
     dummy_tokens = jnp.zeros((1, cfg.MODEL_WINDOW_BYTES), dtype=jnp.int32)
     variables = model.init({"params": rng, "dropout": rng}, dummy_tokens, train=True)
     params = variables["params"]

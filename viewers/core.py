@@ -257,12 +257,29 @@ def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, Any]:
                 result["channels"] = [int(x) for x in channels_val]
             except (TypeError, ValueError):
                 pass
+        arch_val = config_data.get("arch", {}).get("value")
+        if isinstance(arch_val, str) and arch_val.strip():
+            result["arch"] = arch_val.strip()
         model_dim_val = config_data.get("model_dim", {}).get("value")
         if isinstance(model_dim_val, (int, float)):
             result["model_dim"] = int(model_dim_val)
         dtype_val = config_data.get("dtype", {}).get("value")
         if isinstance(dtype_val, str):
             result["dtype"] = dtype_val.rsplit(".", 1)[-1]
+        # Mamba hyperparameters (present only for arch == mamba)
+        for key in (
+            "mamba_layers",
+            "mamba_d_state",
+            "mamba_expand",
+            "mamba_dt_rank",
+            "mamba_conv",
+            "mamba_bidirectional",
+        ):
+            val = config_data.get(key, {}).get("value")
+            if isinstance(val, bool):
+                result[key] = bool(val)
+            elif isinstance(val, (int, float)):
+                result[key] = int(val)
 
         summary_path = run_dir / "files" / "wandb-summary.json"
         if summary_path.exists():
@@ -317,6 +334,17 @@ def _infer_checkpoint_architecture(ckpt_path: Path) -> Dict[str, Any]:
     except Exception:
         return result
 
+    # Architecture (unet1d vs mamba): detect from top-level param keys.
+    try:
+        top_keys = set(params.keys())
+    except Exception:
+        top_keys = set()
+    is_mamba = any(str(k).startswith("MambaBlock1D_") for k in top_keys)
+    if is_mamba:
+        result["arch"] = "mamba"
+    else:
+        result["arch"] = "unet1d"
+
     # Embedding dimension -> model_dim
     try:
         embedding = params["Embed_0"]["embedding"]
@@ -324,6 +352,59 @@ def _infer_checkpoint_architecture(ckpt_path: Path) -> Dict[str, Any]:
         result["dtype"] = getattr(embedding.dtype, "name", str(embedding.dtype))
     except Exception:
         pass
+
+    if is_mamba:
+        # Infer Mamba hyperparameters from the first block.
+        block0 = params.get("MambaBlock1D_0") if isinstance(params, dict) else None
+        if isinstance(block0, dict):
+            try:
+                A_log = block0.get("A_log")
+                if A_log is not None:
+                    result["mamba_d_state"] = int(A_log.shape[-1])
+            except Exception:
+                pass
+            try:
+                in_proj = block0.get("Dense_0", {})
+                kernel = in_proj.get("kernel")
+                if kernel is not None and result.get("model_dim"):
+                    d_model = int(result["model_dim"])
+                    d_inner = int(kernel.shape[-1]) // 2
+                    if d_model > 0:
+                        result["mamba_expand"] = int(max(1, d_inner // d_model))
+            except Exception:
+                pass
+            try:
+                x_dbl = block0.get("Dense_1", {})
+                kernel = x_dbl.get("kernel")
+                if kernel is not None and result.get("mamba_d_state"):
+                    d_state = int(result["mamba_d_state"])
+                    result["mamba_dt_rank"] = int(kernel.shape[-1]) - 2 * d_state
+            except Exception:
+                pass
+            try:
+                conv = block0.get("Conv_0", {})
+                kernel = conv.get("kernel")
+                if kernel is not None:
+                    result["mamba_conv"] = int(kernel.shape[0])
+            except Exception:
+                pass
+        # Count blocks -> mamba_layers
+        try:
+            indices = []
+            for k in top_keys:
+                m = re.match(r"^MambaBlock1D_(\d+)$", str(k))
+                if m:
+                    indices.append(int(m.group(1)))
+            if indices:
+                result["mamba_layers"] = int(max(indices) + 1)
+        except Exception:
+            pass
+        # Final projection -> num_classes
+        try:
+            result["num_classes"] = int(params["Dense_0"]["kernel"].shape[-1])
+        except Exception:
+            pass
+        return result
 
     # Down path channels: walk ConvBlock1D_{0,2,4,...} until we hit the up path
     channels: List[int] = []
@@ -825,6 +906,173 @@ class UNet1D(nn.Module):
         return logits_bf16.astype(jnp.float32)
 
 # ---------------------------
+# Model: Mamba (minimal Flax port; must match training)
+# ---------------------------
+
+class MambaBlock1D(nn.Module):
+    d_model: int
+    d_state: int = 8
+    expand: int = 1
+    dt_rank: int = 16
+    d_conv: int = 4
+    dropout_rate: float = 0.0
+    bidirectional: bool = True
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool = False) -> jnp.ndarray:
+        h = nn.LayerNorm(dtype=self.dtype, param_dtype=self.dtype)(x)
+        d_inner = int(self.d_model) * int(self.expand)
+
+        xz = nn.Dense(
+            2 * d_inner,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            use_bias=True,
+        )(h)
+        u, gate = jnp.split(xz, 2, axis=-1)
+
+        if self.d_conv and int(self.d_conv) > 1:
+            u = nn.Conv(
+                features=d_inner,
+                kernel_size=(int(self.d_conv),),
+                padding="SAME",
+                feature_group_count=d_inner,
+                dtype=self.dtype,
+                param_dtype=self.dtype,
+                use_bias=True,
+            )(u)
+        u = jax.nn.silu(u)
+
+        dt_rank = int(self.dt_rank) if int(self.dt_rank) > 0 else max(4, d_inner // 16)
+        x_dbl = nn.Dense(
+            dt_rank + 2 * int(self.d_state),
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            use_bias=True,
+        )(u)
+        dt_raw, B, C = jnp.split(
+            x_dbl, [dt_rank, dt_rank + int(self.d_state)], axis=-1
+        )
+        dt = nn.Dense(
+            d_inner,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            use_bias=True,
+        )(dt_raw)
+        dt = jax.nn.softplus(dt).astype(jnp.float32) + 1e-4
+
+        A_log = self.param(
+            "A_log",
+            nn.initializers.normal(stddev=0.02),
+            (d_inner, int(self.d_state)),
+            self.dtype,
+        )
+        A = -jnp.exp(A_log.astype(jnp.float32))
+        D = self.param("D", nn.initializers.ones, (d_inner,), self.dtype).astype(jnp.float32)
+
+        def selective_scan(
+            x_in: jnp.ndarray,
+            dt_in: jnp.ndarray,
+            B_in: jnp.ndarray,
+            C_in: jnp.ndarray,
+        ) -> jnp.ndarray:
+            # Match training: associative scan over affine transforms (faster than lax.scan at long L).
+            x_f32 = x_in.astype(jnp.float32)
+            dt_f32 = dt_in.astype(jnp.float32)
+            B_f32 = B_in.astype(jnp.float32)
+            C_f32 = C_in.astype(jnp.float32)
+
+            x_tm = jnp.swapaxes(x_f32, 0, 1)   # (L,B,d_inner)
+            dt_tm = jnp.swapaxes(dt_f32, 0, 1)  # (L,B,d_inner)
+            B_tm = jnp.swapaxes(B_f32, 0, 1)   # (L,B,d_state)
+            C_tm = jnp.swapaxes(C_f32, 0, 1)   # (L,B,d_state)
+
+            a = jnp.exp(dt_tm[:, :, :, None] * A[None, None, :, :])  # (L,B,d_inner,d_state)
+            b = (
+                x_tm[:, :, :, None]
+                * (dt_tm[:, :, :, None] * B_tm[:, :, None, :])
+            )  # (L,B,d_inner,d_state)
+
+            def combine(left, right):
+                a1, b1 = left
+                a2, b2 = right
+                return a2 * a1, b2 + a2 * b1
+
+            _, state_tm = jax.lax.associative_scan(combine, (a, b), axis=0)
+
+            y_tm = (
+                jnp.sum(state_tm * C_tm[:, :, None, :], axis=-1)
+                + x_tm * D[None, None, :]
+            )
+            return jnp.swapaxes(y_tm, 0, 1)
+
+        y = selective_scan(u, dt, B, C)
+        if self.bidirectional:
+            y_rev = selective_scan(u[:, ::-1, :], dt[:, ::-1, :], B[:, ::-1, :], C[:, ::-1, :])
+            y = y + y_rev[:, ::-1, :]
+
+        y = y.astype(self.dtype)
+        y = y * jax.nn.silu(gate)
+        y = nn.Dense(
+            int(self.d_model),
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            use_bias=True,
+        )(y)
+        if self.dropout_rate and float(self.dropout_rate) > 0.0:
+            y = nn.Dropout(rate=float(self.dropout_rate), deterministic=not train)(y)
+        return x + y
+
+
+class Mamba1D(nn.Module):
+    num_classes: int
+    d_model: int = 256
+    n_layers: int = 6
+    d_state: int = 8
+    expand: int = 1
+    dt_rank: int = 16
+    d_conv: int = 4
+    bidirectional: bool = True
+    dropout_rate: float = 0.0
+    dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, tokens: jnp.ndarray, train: bool = False):
+        tok_i32 = tokens.astype(jnp.int32)
+        h = nn.Embed(
+            num_embeddings=NUM_TOKEN_EMBEDDINGS,
+            features=int(self.d_model),
+            embedding_init=nn.initializers.normal(stddev=0.02),
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+        )(tok_i32)
+
+        if self.dropout_rate and float(self.dropout_rate) > 0.0:
+            h = nn.Dropout(rate=float(self.dropout_rate), deterministic=not train)(h)
+
+        for _ in range(int(self.n_layers)):
+            h = MambaBlock1D(
+                d_model=int(self.d_model),
+                d_state=int(self.d_state),
+                expand=int(self.expand),
+                dt_rank=int(self.dt_rank),
+                d_conv=int(self.d_conv),
+                dropout_rate=float(self.dropout_rate),
+                bidirectional=bool(self.bidirectional),
+                dtype=self.dtype,
+            )(h, train=train)
+
+        h = nn.LayerNorm(dtype=self.dtype, param_dtype=self.dtype)(h)
+        logits_bf16 = nn.Dense(
+            int(self.num_classes),
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            use_bias=True,
+        )(h)
+        return logits_bf16.astype(jnp.float32)
+
+# ---------------------------
 # Predictor
 # ---------------------------
 
@@ -839,6 +1087,13 @@ class Predictor:
         num_classes: int,
         model_dim: int,
         channels: Tuple[int, ...],
+        arch: str = "unet1d",
+        mamba_layers: int = 6,
+        mamba_d_state: int = 8,
+        mamba_expand: int = 1,
+        mamba_dt_rank: int = 16,
+        mamba_conv: int = 4,
+        mamba_bidirectional: bool = True,
         dtype_str: str = "bfloat16",
         chunk: int = DEFAULT_CHUNK_SIZE,
         other_threshold: Optional[float] = None,
@@ -850,8 +1105,26 @@ class Predictor:
         if self.chunk <= 0:
             raise ValueError("Chunk size must be positive.")
         self.dtype = getattr(jnp, dtype_str)
-        self.model = UNet1D(num_classes=self.num_classes, emb_dim=int(model_dim),
-                            channels=tuple(channels), dtype=self.dtype)
+        self.arch = str(arch).lower().strip()
+        if self.arch in {"mamba", "mamba1d", "bimamba", "ssm"}:
+            self.model = Mamba1D(
+                num_classes=self.num_classes,
+                d_model=int(model_dim),
+                n_layers=int(mamba_layers),
+                d_state=int(mamba_d_state),
+                expand=int(mamba_expand),
+                dt_rank=int(mamba_dt_rank),
+                d_conv=int(mamba_conv),
+                bidirectional=bool(mamba_bidirectional),
+                dtype=self.dtype,
+            )
+        else:
+            self.model = UNet1D(
+                num_classes=self.num_classes,
+                emb_dim=int(model_dim),
+                channels=tuple(channels),
+                dtype=self.dtype,
+            )
         # Init with dummy to create param structure (int32 tokens to allow PAD_BYTE_ID=256)
         dummy_tokens = jnp.full((1, self.chunk), PAD_BYTE_ID, dtype=jnp.int32)
         variables = self.model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)

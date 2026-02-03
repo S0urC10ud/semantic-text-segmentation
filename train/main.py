@@ -207,11 +207,36 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--accum_steps", type=int, default=1)
+    parser.add_argument(
+        "--arch",
+        type=str,
+        default="unet1d",
+        choices=("unet1d", "mamba"),
+        help="Model architecture (unet1d or mamba).",
+    )
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--channels", type=str, default="32,64,64,128,128,128,128,256")
     parser.add_argument("--dropout_rate", type=float, default=0.15)
+    # Mamba-only knobs (ignored for unet1d). Defaults match TrainConfig.
+    parser.add_argument("--mamba_layers", type=int, default=6)
+    parser.add_argument("--mamba_d_state", type=int, default=8)
+    parser.add_argument("--mamba_expand", type=int, default=1)
+    parser.add_argument("--mamba_dt_rank", type=int, default=16)
+    parser.add_argument("--mamba_conv", type=int, default=4)
+    parser.add_argument(
+        "--mamba_bidirectional",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use bidirectional scan for per-position segmentation.",
+    )
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=2000)
+    parser.add_argument(
+        "--eval_batches",
+        type=int,
+        default=50,
+        help="Number of random validation batches to sample at each eval.",
+    )
     parser.add_argument(
         "--monitor_eval_every",
         type=int,
@@ -388,11 +413,19 @@ def main():
         weight_decay=args.weight_decay,
         warmup=args.warmup,
         accum_steps=args.accum_steps,
+        arch=args.arch,
         model_dim=args.model_dim,
         channels=tuple(map(int, args.channels.split(","))),
         dropout_rate=args.dropout_rate,
+        mamba_layers=int(args.mamba_layers),
+        mamba_d_state=int(args.mamba_d_state),
+        mamba_expand=int(args.mamba_expand),
+        mamba_dt_rank=int(args.mamba_dt_rank),
+        mamba_conv=int(args.mamba_conv),
+        mamba_bidirectional=bool(args.mamba_bidirectional),
         log_every=args.log_every,
         eval_every=args.eval_every,
+        eval_batches=int(args.eval_batches),
         monitor_eval_every=int(monitor_every),
         monitor_eval_limit=int(args.monitor_eval_limit),
         monitor_eval_root=args.monitor_eval_root,
