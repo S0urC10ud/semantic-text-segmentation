@@ -177,6 +177,10 @@ class TrainConfig:
     monitor_eval_limit: int = 4096
     monitor_eval_root: str = "../downloader/monitor_preprocessed"
     monitor_other_threshold: float = 0.0
+    oe_lambda: float = 0.1
+    oe_ratio: float = 0.05
+    oe_source: str = "mixed"
+    oe_heldout_root: str = "../downloader/arrow_out_other"
     MODEL_WINDOW_BYTES = 1536
     # Fine-tuning options (used by train/main.py)
     fine_tune: bool = False

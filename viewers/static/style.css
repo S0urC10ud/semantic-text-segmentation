@@ -216,8 +216,8 @@ textarea.code{
 }
 .bar > i{display:block; height:100%}
 
-/* Tooltip */
-.char { position: relative; cursor: pointer; }
+/* Tooltip + per-char confidence heatmap */
+.char { position: relative; cursor: pointer; display: inline-block; border-radius: 3px; }
 .tooltip {
   display: none;
   position: fixed;

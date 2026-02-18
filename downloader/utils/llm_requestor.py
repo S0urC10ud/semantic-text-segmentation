@@ -26,7 +26,7 @@ from rich.console import Console
 
 console = Console()
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3-flash-preview"
 
 
 class LocalVerificationError(RuntimeError):
@@ -66,6 +66,14 @@ MODEL_PRICING_USD_PER_MTOKENS = {
             {"max_prompt_tokens": None, "rate": 2.50},
         ],
         "notes": None,
+    },
+    "gemini-3-flash-preview": {
+        "prompt": [
+            {"max_prompt_tokens": None, "rate": 0.50},
+        ],
+        "response": [
+            {"max_prompt_tokens": None, "rate": 3.00},
+        ],
     },
 }
 

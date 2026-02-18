@@ -5,7 +5,8 @@
 */
 
 let LABELS = [];
-let STATE = []; // per-example state: { lastJson: null }
+let LABEL_BY_ID = new Map();
+let STATE = []; // per-example state: { lastJson: null, palette: { [id]: color } }
 let tooltip = null;
 let focusMode = false;
 const MODEL_WINDOW = 1536;
@@ -56,15 +57,24 @@ function showTooltip(event) {
   }
   if (!tooltip) tooltip = el('#tooltip');
 
+  let palette = null;
+  const section = target.closest('section.panel.example');
+  if (section) {
+    const exIdx = Number.parseInt(section.dataset.index || '', 10);
+    if (Number.isFinite(exIdx) && STATE[exIdx] && STATE[exIdx].palette) {
+      palette = STATE[exIdx].palette;
+    }
+  }
+
   const probs = JSON.parse(target.dataset.probs || '{}');
   let html = '';
 
   const sortedProbs = Object.entries(probs)
     .map(([key, prob]) => {
       const idx = Number.parseInt(key, 10);
-      const fromLabels = Number.isFinite(idx) ? LABELS[idx] : null;
+      const fromLabels = Number.isFinite(idx) ? LABEL_BY_ID.get(idx) : null;
       const label = fromLabels?.name || String(key);
-      const color = fromLabels?.color || '#888888';
+      const color = (palette && Number.isFinite(idx) && palette[idx]) ? palette[idx] : '#888888';
       return { id: Number.isFinite(idx) ? idx : key, prob, label, color };
     })
     .sort((a, b) => b.prob - a.prob);
@@ -105,12 +115,13 @@ function hideTooltip() {
   if (tooltip) tooltip.style.display = 'none';
 }
 
-function buildLegend(holder){
+function buildLegend(holder, labels){
   holder.innerHTML = '';
-  LABELS.forEach(l => {
+  (labels || []).forEach(l => {
     const chip = document.createElement('div');
     chip.className = 'chip';
-    chip.innerHTML = `<span class="dot" style="background:${l.color}"></span>${esc(l.name)}`;
+    const color = l.color || '#888888';
+    chip.innerHTML = `<span class="dot" style="background:${color}"></span>${esc(l.name)}`;
     holder.appendChild(chip);
   });
 }
@@ -164,8 +175,17 @@ async function runOne(section){
       throw new Error(detail || `Request failed (${res.status})`);
     }
     STATE[idx].lastJson = data;
+    const paletteMap = {};
+    (data.stats || []).forEach(s => {
+      if (!s || typeof s.id !== 'number' || typeof s.color !== 'string') {
+        return;
+      }
+      paletteMap[s.id] = s.color;
+    });
+    STATE[idx].palette = paletteMap;
     render.innerHTML = data.html || '';
     renderStatsInto(stats, data.stats || []);
+    buildLegend(section.querySelector('.legend'), data.stats || []);
     if (timeLabel) {
       const elapsed = typeof data.elapsed_ms === 'number' ? data.elapsed_ms : null;
       if (elapsed !== null && isFinite(elapsed)) {
@@ -313,6 +333,12 @@ async function bootstrap(){
     const res = await fetch('/api/labels');
     const meta = await res.json();
     LABELS = meta.labels || [];
+    LABEL_BY_ID = new Map();
+    LABELS.forEach(l => {
+      if (l && typeof l.id === 'number') {
+        LABEL_BY_ID.set(l.id, l);
+      }
+    });
     el('#device').textContent = (meta.loaded ? 'Loaded ✓ ' : 'Load error ✕ ') + (meta.device || '');
 
     // Build cards
@@ -320,10 +346,10 @@ async function bootstrap(){
     holder.innerHTML = '';
 
     EXAMPLES.forEach((text, i) => {
-      STATE[i] = { lastJson: null };
+      STATE[i] = { lastJson: null, palette: null };
       const sec = createExampleSection(i, text);
       holder.appendChild(sec);
-      buildLegend(sec.querySelector('.legend'));
+      buildLegend(sec.querySelector('.legend'), []);
     });
 
   }catch(err){

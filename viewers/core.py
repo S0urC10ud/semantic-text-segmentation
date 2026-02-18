@@ -553,6 +553,41 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
         return f"rgba(136, 136, 136, {max(0.0, min(alpha, 1.0)):.2f})"
     return f"rgba({r}, {g}, {b}, {max(0.0, min(alpha, 1.0)):.2f})"
 
+def _hex_to_rgba_confidence(hex_color: str, alpha: float, confidence: float) -> str:
+    """
+    Convert a hex color to rgba while scaling saturation by `confidence` in [0, 1].
+
+    Hue stays constant; saturation -> saturation * confidence.
+    Useful for visualising model uncertainty without changing class identity.
+    """
+    import colorsys
+
+    confidence_f = float(confidence) if confidence is not None else 0.0
+    confidence_f = max(0.0, min(confidence_f, 1.0))
+
+    hex_color = (hex_color or "").strip().lstrip("#")
+    if len(hex_color) == 3:
+        hex_color = "".join(ch * 2 for ch in hex_color)
+    if len(hex_color) != 6:
+        return f"rgba(136, 136, 136, {max(0.0, min(alpha, 1.0)):.2f})"
+    try:
+        r_i = int(hex_color[0:2], 16)
+        g_i = int(hex_color[2:4], 16)
+        b_i = int(hex_color[4:6], 16)
+    except ValueError:
+        return f"rgba(136, 136, 136, {max(0.0, min(alpha, 1.0)):.2f})"
+
+    r = r_i / 255.0
+    g = g_i / 255.0
+    b = b_i / 255.0
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    s = max(0.0, min(1.0, s * confidence_f))
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return (
+        f"rgba({int(round(r2 * 255))}, {int(round(g2 * 255))}, {int(round(b2 * 255))}, "
+        f"{max(0.0, min(alpha, 1.0)):.2f})"
+    )
+
 def _looks_like_orbax_step_dir(p: Path) -> bool:
     if not p.is_dir():
         return False
@@ -1096,7 +1131,7 @@ class Predictor:
         mamba_bidirectional: bool = True,
         dtype_str: str = "bfloat16",
         chunk: int = DEFAULT_CHUNK_SIZE,
-        other_threshold: Optional[float] = None,
+        other_threshold: Optional[float] = 0.2,
     ):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -1140,6 +1175,37 @@ class Predictor:
         self.other_threshold: Optional[float] = (
             float(other_threshold) if other_threshold is not None and other_threshold > 0.0 else None
         )
+
+    @staticmethod
+    def threshold_predictions(
+        probs: np.ndarray,
+        *,
+        other_threshold: Optional[float],
+        other_id: int,
+    ) -> np.ndarray:
+        """
+        Apply open-set thresholding on probability vectors.
+
+        For each position:
+          pred = argmax(probs)
+          conf = max(probs)
+          if conf < threshold: pred = other_id
+        """
+        arr = np.asarray(probs, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"threshold_predictions expects shape [N, K], got {arr.shape}"
+            )
+        pred = np.argmax(arr, axis=-1).astype(np.int32)
+        thr = (
+            float(other_threshold)
+            if other_threshold is not None
+            else 0.0
+        )
+        if thr > 0.0 and pred.size > 0:
+            conf = np.max(arr, axis=-1)
+            pred[conf < thr] = int(other_id)
+        return pred
 
     @staticmethod
     def _window_weights(length: int) -> np.ndarray:
@@ -1257,13 +1323,15 @@ class Predictor:
                 lbl = 0
                 probs = {str(i): 0.0 for i in range(self.num_classes)}
             else:
-                vals, counts = np.unique(seg, return_counts=True)
-                lbl = int(vals[np.argmax(counts)])
                 if byte_probs is not None:
-                    # Average probabilities across bytes in the character
+                    # Average probabilities across bytes in the character, then
+                    # derive prediction directly from those averaged probs.
                     avg_probs = np.mean(byte_probs[bpos:bpos+L], axis=0)
+                    lbl = int(np.argmax(avg_probs))
                     probs = {str(i): float(avg_probs[i]) for i in range(self.num_classes)}
                 else:
+                    vals, counts = np.unique(seg, return_counts=True)
+                    lbl = int(vals[np.argmax(counts)])
                     probs = {str(i): 1.0 if i == lbl else 0.0 for i in range(self.num_classes)}
             labels.append(lbl)
             char_probs.append(probs)
@@ -1287,16 +1355,22 @@ class Predictor:
         if thr is None or thr <= 0.0 or not labels or not char_probs:
             return labels, char_probs
         other_id = self.num_classes
-        out_labels = list(labels)
+        probs_arr = np.zeros((len(char_probs), self.num_classes), dtype=np.float32)
         for i, probs in enumerate(char_probs):
             if not probs:
                 continue
-            try:
-                max_prob = max(float(v) for v in probs.values())
-            except Exception:
-                continue
-            if max_prob < thr:
-                out_labels[i] = other_id
+            for key, val in probs.items():
+                try:
+                    idx = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < self.num_classes:
+                    probs_arr[i, idx] = float(val)
+        out_labels = self.threshold_predictions(
+            probs_arr,
+            other_threshold=thr,
+            other_id=other_id,
+        ).tolist()
         return out_labels, char_probs
 
     def _smooth_min_run(self, labels: List[int], min_run: int) -> List[int]:
@@ -1329,9 +1403,11 @@ class Predictor:
         b = _sanitize_model_bytes(np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8))
         byte_labels, byte_probs = self._segment_bytes(b)
         char_labels, char_probs = self._byte_labels_to_char_labels(text, byte_labels, byte_probs)
-        char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
-        # Apply optional virtual 'other' thresholding per character.
+        # Apply open-set thresholding first; when enabled we skip run-length
+        # smoothing to avoid mutating thresholded OTHER predictions.
         char_labels, char_probs = self._apply_other_threshold(char_labels, char_probs)
+        if self.other_threshold is None or self.other_threshold <= 0.0:
+            char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
         segs = []
         if len(char_labels) > 0:
             cur = char_labels[0]; start = 0

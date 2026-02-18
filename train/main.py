@@ -47,12 +47,16 @@ from utils.window_generator import (
 from utils.model import (
     create_train_state,
     train_step,
+    train_step_with_oe,
     eval_step,
     TrainState,
     count_params,
     train_step_no_jit,
+    train_step_with_oe_no_jit,
     microbatch_grad_step,
+    microbatch_grad_step_with_oe,
     microbatch_grad_step_no_jit,
+    microbatch_grad_step_with_oe_no_jit,
     grad_global_norm,
 )
 from utils.preview import build_preview_html
@@ -65,6 +69,7 @@ from utils.metrics_helper import (
 )
 from utils.monitor_eval import load_monitor_memmaps, evaluate_monitor_set
 from utils.token_utils import sanitize_tokens
+from utils.outlier_data import OutlierBatcher
 
 if TYPE_CHECKING:
     from utils.config import DataConfig, TrainConfig
@@ -113,6 +118,37 @@ def resolve_ckpt_paths(path: str):
     base = os.path.basename(blob_abs)
     prefix = base + "-"
     return ckpt_dir_abs, prefix, blob_abs
+
+
+def _find_local_wandb_config(repo_root: Path, run_id: str) -> Path | None:
+    wandb_root = repo_root / "wandb"
+    if not wandb_root.exists():
+        return None
+    candidates = sorted(wandb_root.glob(f"run-*-{run_id}/files/config.yaml"))
+    return candidates[-1] if candidates else None
+
+
+def _read_wandb_config_value(config_path: Path, key: str) -> str | None:
+    """Read a simple top-level `key: { value: ... }` entry from wandb config.yaml."""
+    try:
+        lines = config_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return None
+
+    needle = f"{key}:"
+    for i, line in enumerate(lines):
+        if not line.startswith(" ") and line.strip() == needle:
+            for j in range(i + 1, len(lines)):
+                next_line = lines[j]
+                if next_line and not next_line.startswith(" "):
+                    break
+                stripped = next_line.strip()
+                if stripped.startswith("value:"):
+                    value = stripped.split("value:", 1)[1].strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                        value = value[1:-1]
+                    return value
+    return None
 
 
 def _make_eval_batch(
@@ -167,6 +203,10 @@ def main():
     ckpt_async_manager = None
 
     parser = argparse.ArgumentParser()
+    repo_root = Path(__file__).resolve().parents[1]
+    default_monitor_root = repo_root / "downloader" / "monitor_preprocessed_b"
+    default_fine_tune_train_root = repo_root / "downloader" / "monitor_preprocessed_a"
+    default_fine_tune_val_root = repo_root / "downloader" / "monitor_preprocessed_b"
 
     # Data args
     parser.add_argument(
@@ -241,7 +281,7 @@ def main():
         "--monitor_eval_every",
         type=int,
         default=-1,
-        help="Run monitor validation every N steps (0 disables, -1 = match --eval_every)",
+        help="Run monitor validation after each val eval (0 disables).",
     )
     parser.add_argument(
         "--monitor_eval_limit",
@@ -252,8 +292,8 @@ def main():
     parser.add_argument(
         "--monitor_eval_root",
         type=str,
-        default="../downloader/monitor_preprocessed",
-        help="Path to downloader/monitor_preprocessed (output of 999_prepare_monitor_set.py).",
+        default=str(default_monitor_root),
+        help="Path to downloader/monitor_preprocessed_b (monitor validation memmap).",
     )
     parser.add_argument(
         "--monitor_other_threshold",
@@ -275,11 +315,12 @@ def main():
         nargs="?",
         const="",
         default=None,
-        metavar="RUNID-STEP",
+        metavar="RUNID-STEP|CKPT",
         help=(
             "Enable fine-tuning from a pre-existing W&B run. "
             "Optionally specify 'RUNID-STEP' (e.g. fkbz80vt-468000) to "
-            "load a specific checkpoint step from checkpoints/sweeps."
+            "load a specific checkpoint step from checkpoints/sweeps, "
+            "or pass a local checkpoint path (.msgpack) to fine-tune from."
         ),
     )
     parser.add_argument(
@@ -289,15 +330,24 @@ def main():
         help="Source W&B run id to load the checkpoint from when --fine-tune is set and not resuming a fine-tune run.",
     )
     parser.add_argument(
+        "--fine_tune_ckpt_path",
+        type=str,
+        default="",
+        help=(
+            "Optional local checkpoint path to load from when fine-tuning "
+            "(raw params .msgpack or a Flax checkpoint dir). Overrides --fine_tune_run_id."
+        ),
+    )
+    parser.add_argument(
         "--fine_tune_train_root",
         type=str,
-        default="../downloader/monitor_preprocessed_a",
+        default=str(default_fine_tune_train_root),
         help="Root directory for the fine-tune training memmap (monitor_preprocessed_a).",
     )
     parser.add_argument(
         "--fine_tune_val_root",
         type=str,
-        default="../downloader/monitor_preprocessed_b",
+        default=str(default_fine_tune_val_root),
         help="Root directory for the fine-tune validation/monitor memmap (monitor_preprocessed_b).",
     )
     parser.add_argument("--sweep_id", type=str, default="")
@@ -305,36 +355,99 @@ def main():
     parser.add_argument("--preview_only", action="store_true")
     parser.add_argument("--preview_start", type=int, default=0)
     parser.add_argument("--preview_count", type=int, default=10)
+    parser.add_argument(
+        "--active_learning_store",
+        type=str,
+        default="",
+        help="Optional SQLite label store produced by active_learning/round.py.",
+    )
+    parser.add_argument(
+        "--active_learning_mix_prob",
+        type=float,
+        default=0.1,
+        help="Probability of replacing each training row with active-learning replay data.",
+    )
+    parser.add_argument(
+        "--active_learning_max_windows",
+        type=int,
+        default=1000000,
+        help="Cap the number of replay windows loaded from the active-learning store.",
+    )
+    parser.add_argument(
+        "--oe-lambda",
+        type=float,
+        default=0.1,
+        help="Weight for OE uniform-target loss on outlier batches (0 disables OE).",
+    )
+    parser.add_argument(
+        "--oe-ratio",
+        type=float,
+        default=0.05,
+        help="Probability of adding one outlier batch to a training step.",
+    )
+    parser.add_argument(
+        "--oe-source",
+        type=str,
+        default="mixed",
+        help=(
+            "Outlier sampling mode. Default/expected is 'mixed': sample random and heldout "
+            "OTHER data at 50:50 when heldout is available."
+        ),
+    )
+    parser.add_argument(
+        "--oe-heldout-root",
+        type=str,
+        default=str(repo_root / "downloader" / "arrow_out_other"),
+        help="Root containing heldout Arrow data in <root>/train/<label>/dataset (typically train/other/dataset).",
+    )
+    parser.add_argument(
+        "--fine_tune_use_oe",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable OE outlier augmentation during fine-tuning. "
+            "By default, fine-tuning disables OE and relies on monitor labels (including OTHER) only."
+        ),
+    )
 
     args = parser.parse_args()
 
-    # Interpret --fine-tune argument (optional RUNID-STEP shorthand).
+    # Interpret --fine-tune argument (optional RUNID-STEP shorthand or a local ckpt path).
     fine_tune_raw = getattr(args, "fine_tune", None)
     fine_tune_run_id = getattr(args, "fine_tune_run_id", "")
+    fine_tune_ckpt_path = getattr(args, "fine_tune_ckpt_path", "")
     fine_tune_step = None
     if isinstance(fine_tune_raw, str):
         if fine_tune_raw:
-            # Expect RUNID-STEP (e.g., fkbz80vt-468000)
-            if "-" in fine_tune_raw:
-                run_part, step_part = fine_tune_raw.rsplit("-", 1)
-                if run_part:
-                    fine_tune_run_id = run_part
-                try:
-                    fine_tune_step = int(step_part)
-                except ValueError:
-                    raise ValueError(
-                        "--fine-tune argument must be of the form RUNID-STEP, "
-                        "e.g. fkbz80vt-468000"
-                    )
+            raw = str(fine_tune_raw).strip()
+            raw_path = Path(raw)
+            looks_like_path = (
+                raw.endswith(".msgpack")
+                or "/" in raw
+                or "\\" in raw
+                or raw_path.exists()
+            )
+            if looks_like_path:
+                fine_tune_ckpt_path = raw
             else:
-                # Treat as run id only, no explicit step
-                fine_tune_run_id = fine_tune_raw
+                parts = raw.rsplit("-", 1)
+                if (
+                    len(parts) == 2
+                    and parts[1].isdigit()
+                    and len(parts[0]) == 8
+                    and parts[0].isalnum()
+                ):
+                    fine_tune_run_id = parts[0]
+                    fine_tune_step = int(parts[1])
+                else:
+                    fine_tune_run_id = raw
         else:
             # '--fine-tune' present without RUNID-STEP; rely on --fine_tune_run_id
             pass
-    fine_tune_enabled = (fine_tune_raw is not None) or bool(fine_tune_run_id)
+    fine_tune_enabled = (fine_tune_raw is not None) or bool(fine_tune_run_id) or bool(fine_tune_ckpt_path)
     args.fine_tune = fine_tune_enabled
     args.fine_tune_run_id = fine_tune_run_id
+    args.fine_tune_ckpt_path = fine_tune_ckpt_path
     args.fine_tune_step = fine_tune_step
 
     # Resolve learning rate depending on mode if not explicitly provided.
@@ -343,15 +456,64 @@ def main():
         args.lr = 3e-5 if args.fine_tune else 1e-3
 
     if args.fine_tune and not args.continue_run_id:
-        # For a fresh fine-tune run we require a source W&B run id.
-        if not args.fine_tune_run_id:
+        # For a fresh fine-tune run we require a source run id or an explicit checkpoint path.
+        if not args.fine_tune_run_id and not args.fine_tune_ckpt_path:
             raise ValueError(
-                "--fine-tune requires either RUNID-STEP or --fine_tune_run_id "
-                "when not resuming with --continue."
+                "--fine-tune requires either RUNID-STEP, --fine_tune_run_id, "
+                "or --fine_tune_ckpt_path when not resuming with --continue."
             )
 
     if args.accum_steps < 1:
         raise ValueError("--accum_steps must be >= 1")
+    if args.oe_lambda < 0.0:
+        raise ValueError("--oe-lambda must be >= 0")
+    if args.oe_ratio < 0.0:
+        raise ValueError("--oe-ratio must be >= 0")
+
+    if args.fine_tune and not bool(getattr(args, "fine_tune_use_oe", False)):
+        if float(args.oe_lambda) > 0.0 or float(args.oe_ratio) > 0.0:
+            print(
+                "Fine-tune mode: disabling OE outlier augmentation by default "
+                "(set --fine_tune_use_oe to keep OE enabled).",
+                flush=True,
+            )
+        args.oe_lambda = 0.0
+        args.oe_ratio = 0.0
+
+    def _resolve_cli_path(raw_path: str) -> Path:
+        p = Path(str(raw_path or "").strip()).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p)
+        return p.resolve()
+
+    def _has_heldout_arrow_dataset(root: Path) -> bool:
+        primary = root / "train" / "other" / "dataset"
+        if primary.exists():
+            return True
+        train_root = root / "train"
+        if not train_root.exists() or not train_root.is_dir():
+            return False
+        for child in train_root.iterdir():
+            if child.is_dir() and (child / "dataset").exists():
+                return True
+        return False
+
+    oe_lambda = float(args.oe_lambda)
+    oe_ratio = float(args.oe_ratio)
+    oe_source_raw = str(args.oe_source or "mixed").strip()
+    oe_source = oe_source_raw.lower()
+    if oe_lambda > 0.0 and oe_ratio > 0.0 and oe_source != "random":
+        heldout_hint = ""
+        if oe_source.startswith("heldout:"):
+            heldout_hint = str(oe_source_raw.split(":", 1)[1]).strip()
+        heldout_root_raw = heldout_hint if heldout_hint else str(args.oe_heldout_root)
+        heldout_root = _resolve_cli_path(heldout_root_raw)
+        if not _has_heldout_arrow_dataset(heldout_root):
+            raise FileNotFoundError(
+                "OE is enabled with non-random source "
+                f"('--oe-source {oe_source_raw}'), but no heldout Arrow dataset was found under "
+                f"'{heldout_root}'. Expected at least '<root>/train/other/dataset'."
+            )
 
     selected_langs = None
     if args.langs:
@@ -398,9 +560,7 @@ def main():
     if args.language_pair_prob is not None:
         prob = max(0.0, min(1.0, float(args.language_pair_prob)))
         d_cfg.language_pair_mode_prob = prob
-    monitor_every = args.monitor_eval_every
-    if monitor_every < 0:
-        monitor_every = args.eval_every
+    monitor_every = 0 if args.monitor_eval_every == 0 else args.eval_every
 
     # For fine-tuning, always use the dedicated monitor_preprocessed_b memmap
     # as the monitor/validation set, regardless of any custom monitor_eval_root.
@@ -430,6 +590,10 @@ def main():
         monitor_eval_limit=int(args.monitor_eval_limit),
         monitor_eval_root=args.monitor_eval_root,
         monitor_other_threshold=float(args.monitor_other_threshold),
+        oe_lambda=float(args.oe_lambda),
+        oe_ratio=float(args.oe_ratio),
+        oe_source=str(args.oe_source),
+        oe_heldout_root=str(args.oe_heldout_root),
         ckpt_path=args.ckpt_path,
         sweep_id=args.sweep_id,
         no_jit=args.no_jit,
@@ -476,6 +640,7 @@ def main():
         return
 
     fine_tune_data = None
+    fine_tune_train_files_count = 0
     if args.fine_tune:
         fine_tune_root = Path(args.fine_tune_train_root)
         if not fine_tune_root.exists():
@@ -487,6 +652,7 @@ def main():
             fine_tune_data = load_monitor_memmaps(fine_tune_root)
             meta_ft = fine_tune_data.get("meta", {})
             total_files_ft = meta_ft.get("num_files", len(fine_tune_data["files"]))
+            fine_tune_train_files_count = int(total_files_ft)
             print(
                 f"Fine-tune training enabled: {total_files_ft} files from {fine_tune_root}",
                 flush=True,
@@ -497,6 +663,7 @@ def main():
             ) from e
 
     monitor_data = None
+    monitor_eval_files_count = 0
     if t_cfg.monitor_eval_every > 0:
         monitor_root = Path(t_cfg.monitor_eval_root)
         if monitor_root.exists():
@@ -504,6 +671,7 @@ def main():
                 monitor_data = load_monitor_memmaps(monitor_root)
                 meta = monitor_data.get("meta", {})
                 total_files = meta.get("num_files", len(monitor_data["files"]))
+                monitor_eval_files_count = int(total_files)
                 print(
                     f"Monitor eval enabled: {total_files} files from {monitor_root}",
                     flush=True,
@@ -531,6 +699,24 @@ def main():
         print(f"Resuming W&B run: {args.continue_run_id}", flush=True)
     wandb.init(**wandb_init_kwargs)
     wandb.config.update({**d_cfg.__dict__, **t_cfg.__dict__}, allow_val_change=True)
+    wandb.config.update(
+        {
+            "active_learning_store": args.active_learning_store,
+            "active_learning_mix_prob": float(args.active_learning_mix_prob),
+            "active_learning_max_windows": int(args.active_learning_max_windows),
+            "monitor_train_files": int(fine_tune_train_files_count),
+            "monitor_eval_files": int(monitor_eval_files_count),
+        },
+        allow_val_change=True,
+    )
+    _wandb_safe_log(
+        {
+            "meta/monitor_train_files": int(fine_tune_train_files_count),
+            "meta/monitor_eval_files": int(monitor_eval_files_count),
+        },
+        step=0,
+        commit=False,
+    )
 
     # Derive unique checkpoint path from run id if requested/placeholder-ish
     if t_cfg.ckpt_path == "auto" or "${" in t_cfg.ckpt_path:
@@ -556,11 +742,50 @@ def main():
     # own checkpoint path.
     if t_cfg.fine_tune and not getattr(args, "continue_run_id", ""):
         source_run_id = t_cfg.fine_tune_run_id
-        source_ckpt_path = f"checkpoints/sweeps/{source_run_id}.msgpack"
-        src_ckpt_dir, src_ckpt_prefix, src_ckpt_blob = resolve_ckpt_paths(
-            source_ckpt_path
-        )
+        source_ckpt_path = (getattr(args, "fine_tune_ckpt_path", "") or "").strip()
+        source_ckpt_source = "cli"
+
+        if not source_ckpt_path:
+            if not source_run_id:
+                raise ValueError(
+                    "Fine-tune requested but no source provided. "
+                    "Pass --fine_tune_run_id or --fine_tune_ckpt_path."
+                )
+
+            sweeps_path = (repo_root / "checkpoints" / "sweeps" / f"{source_run_id}.msgpack").resolve()
+            if sweeps_path.exists():
+                source_ckpt_path = str(sweeps_path)
+                source_ckpt_source = "checkpoints/sweeps"
+            else:
+                config_path = _find_local_wandb_config(repo_root, source_run_id)
+                ckpt_from_wandb = (
+                    _read_wandb_config_value(config_path, "ckpt_path")
+                    if config_path is not None
+                    else None
+                )
+                if ckpt_from_wandb:
+                    candidate = Path(ckpt_from_wandb)
+                    if not candidate.is_absolute():
+                        candidate = (repo_root / candidate).resolve()
+                    if candidate.exists():
+                        source_ckpt_path = str(candidate)
+                        source_ckpt_source = f"wandb:{config_path}"
+
+                if not source_ckpt_path:
+                    raise ValueError(
+                        "Could not resolve a fine-tune checkpoint for run id "
+                        f"{source_run_id}. Tried:\n"
+                        f"  - {sweeps_path}\n"
+                        f"  - wandb local config (wandb/run-*-{source_run_id}/files/config.yaml)\n"
+                        "Provide a path explicitly via --fine_tune_ckpt_path."
+                    )
+
+        src_ckpt_dir, src_ckpt_prefix, src_ckpt_blob = resolve_ckpt_paths(source_ckpt_path)
         step_arg = t_cfg.fine_tune_step
+        print(
+            f"Fine-tune source checkpoint: {source_ckpt_path} ({source_ckpt_source})",
+            flush=True,
+        )
 
         # When a specific step is requested (RUNID-STEP), prefer the
         # raw-params snapshot named <run_id>-<step>.msgpack.
@@ -582,13 +807,13 @@ def main():
                 flax_ckpt_path = os.path.join(src_ckpt_dir, f"{src_ckpt_prefix}{step_arg}")
                 if os.path.exists(flax_ckpt_path):
                     print(
-                        f"Restoring fine-tune checkpoint from run {source_run_id} "
-                        f"at step {step_arg}",
+                        f"Restoring fine-tune checkpoint at step {step_arg}",
                         flush=True,
                     )
-                    state = checkpoints.restore_checkpoint(
+                    restored = checkpoints.restore_checkpoint(
                         src_ckpt_dir, state, step=step_arg, prefix=src_ckpt_prefix
                     )
+                    state = state.replace(params=restored.params)
                 else:
                     raise ValueError(
                         f"Requested fine-tune checkpoint step {step_arg} for run "
@@ -597,24 +822,27 @@ def main():
                         f"  - {flax_ckpt_path} (Flax TrainState checkpoint)."
                     )
         else:
-            # No explicit step: restore the latest TrainState checkpoint if present.
-            if os.path.exists(src_ckpt_blob) or os.path.exists(
-                os.path.join(src_ckpt_dir, f"{src_ckpt_prefix}0")
-            ):
+            # No explicit step: load the raw-params blob if present; otherwise fall back to
+            # the latest Flax checkpoint, but only keep its params (do not reuse optimizer state).
+            if os.path.exists(src_ckpt_blob):
                 print(
-                    f"Restoring fine-tune checkpoint from run {source_run_id} "
-                    "(latest step)",
+                    f"Restoring fine-tune params from {src_ckpt_blob}",
                     flush=True,
                 )
-                state = checkpoints.restore_checkpoint(
+                with open(src_ckpt_blob, "rb") as f:
+                    raw = f.read()
+                params = serialization.from_bytes(state.params, raw)
+                state = state.replace(params=params)
+            else:
+                restored = checkpoints.restore_checkpoint(
                     src_ckpt_dir, state, prefix=src_ckpt_prefix
                 )
-            else:
-                print(
-                    f"⚠️  Fine-tune source checkpoint not found at {source_ckpt_path}; "
-                    "starting from randomly initialized weights.",
-                    flush=True,
-                )
+                if restored is state:
+                    raise ValueError(
+                        f"Fine-tune source checkpoint not found at {source_ckpt_path}. "
+                        "Provide --fine_tune_ckpt_path or a RUNID-STEP that exists."
+                    )
+                state = state.replace(params=restored.params)
 
     ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(t_cfg.ckpt_path)
     ckpt_async_manager = checkpoints.AsyncManager() if hasattr(checkpoints, "AsyncManager") else None
@@ -635,9 +863,95 @@ def main():
         data_fetcher = MonitorFineTuneBatcher(fine_tune_data, d_cfg)
     else:
         data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
+
+    al_store_path = (args.active_learning_store or "").strip()
+    al_mix_prob = float(max(0.0, min(1.0, args.active_learning_mix_prob)))
+    if al_store_path and al_mix_prob > 0.0:
+        try:
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            from active_learning.training import ActiveLearningReplay, MixedBatcher
+
+            al_label_to_id = dict(cfg.LANG2ID)
+            if getattr(cfg, "OTHER_CLASS_INDEX", None) is not None:
+                al_label_to_id["other"] = int(cfg.OTHER_CLASS_INDEX)
+            replay = ActiveLearningReplay.from_store(
+                store_path=al_store_path,
+                window_bytes=int(d_cfg.window_max_bytes),
+                pad_byte_id=int(cfg.PAD_BYTE_ID),
+                pad_label_id=int(cfg.PAD_ID),
+                label_to_id=al_label_to_id,
+                max_windows=int(args.active_learning_max_windows),
+                seed=int(args.seed),
+                fallback_label="other",
+            )
+            if replay.size > 0:
+                data_fetcher = MixedBatcher(
+                    data_fetcher,
+                    replay,
+                    mix_prob=al_mix_prob,
+                    seed=int(args.seed),
+                )
+                print(
+                    f"Active-learning replay enabled: {replay.size} windows from {al_store_path} "
+                    f"(mix_prob={al_mix_prob:.2f}).",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Active-learning store '{al_store_path}' contained no usable windows; replay disabled.",
+                    flush=True,
+                )
+        except Exception as e:
+            print(
+                f"⚠️  Active-learning replay disabled (load failure): {e}",
+                flush=True,
+            )
+
+    oe_lambda = float(max(0.0, getattr(t_cfg, "oe_lambda", 0.0)))
+    oe_ratio = float(max(0.0, min(1.0, getattr(t_cfg, "oe_ratio", 0.0))))
+    oe_batcher = None
+    if oe_lambda > 0.0 and oe_ratio > 0.0:
+        oe_batcher = OutlierBatcher(
+            source=str(getattr(t_cfg, "oe_source", "random")),
+            data_root=str(d_cfg.data_root),
+            heldout_root=str(getattr(t_cfg, "oe_heldout_root", "")),
+            window_bytes=int(d_cfg.window_max_bytes),
+            batch_size=int(d_cfg.batch_size),
+            seed=int(args.seed),
+        )
+        oe_desc = oe_batcher.describe()
+        source_mode = str(oe_desc.get("mode", "random"))
+        if source_mode == "random" and str(oe_desc.get("source", "")).strip().lower() not in {
+            "random",
+            "",
+        }:
+            raise RuntimeError(
+                "OE source requested heldout/mixed data, but heldout data was not loaded. "
+                "Refusing to fall back to random-only outliers."
+            )
+        print(
+            "OE enabled: "
+            f"lambda={oe_lambda:.4f}, ratio={oe_ratio:.3f}, "
+            f"source={oe_desc.get('source')}, mode={source_mode}, "
+            f"heldout_langs={oe_desc.get('heldout_langs')}",
+            flush=True,
+        )
+    elif oe_lambda > 0.0:
+        print(
+            f"⚠️  OE lambda set to {oe_lambda:.4f} but oe-ratio is {oe_ratio:.3f}; OE is effectively disabled.",
+            flush=True,
+        )
+
     train_step_fn = train_step_no_jit if t_cfg.no_jit else train_step
+    train_step_oe_fn = train_step_with_oe_no_jit if t_cfg.no_jit else train_step_with_oe
     micro_step_fn = (
         microbatch_grad_step_no_jit if t_cfg.no_jit else microbatch_grad_step
+    )
+    micro_step_oe_fn = (
+        microbatch_grad_step_with_oe_no_jit
+        if t_cfg.no_jit
+        else microbatch_grad_step_with_oe
     )
     accum_steps = max(1, int(t_cfg.accum_steps))
     if accum_steps > 1:
@@ -647,6 +961,157 @@ def main():
             f"(effective batch size ≈ {effective_batch})",
             flush=True,
         )
+
+    def run_val_and_monitor_eval(
+        step: int,
+        *,
+        title: str = "Evaluating",
+        train_loss: float | None = None,
+        train_acc: float | None = None,
+    ) -> tuple[float, float]:
+        """Run val eval and, if enabled, monitor eval; log everything to W&B."""
+        nonlocal rng
+
+        print(f"{title}...", flush=True)
+        rng, eval_rng = jax.random.split(rng)
+
+        val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
+            state=state,
+            dsets_by_lang=dsets["val"],
+            L=d_cfg.window_max_bytes,
+            batch_size=d_cfg.batch_size,
+            batches=t_cfg.eval_batches,
+            data_cfg=d_cfg,
+            rng=eval_rng,
+            eval_step_fn=eval_step,
+        )
+
+        per_class, aggregates = compute_metrics_from_confusion(
+            conf_mat, cfg.NUM_CLASSES, cfg.PAD_ID
+        )
+
+        print(f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}", flush=True)
+        val_metrics = {
+            "val/loss": val_loss,
+            "val/acc": val_acc,
+        }
+        if train_loss is not None:
+            val_metrics["val/train_gap"] = float(train_loss) - val_loss
+        if train_acc is not None:
+            val_metrics["val/acc_gap"] = float(train_acc) - val_acc
+        _wandb_safe_log(val_metrics, step=step, commit=False)
+
+        print_metrics_table(per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID)
+
+        if monitor_data is not None and t_cfg.monitor_eval_every > 0:
+            print("Running monitor evaluation...", flush=True)
+            eval_rng, monitor_rng = jax.random.split(eval_rng)
+            limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)
+            monitor_stats = evaluate_monitor_set(
+                state=state,
+                monitor_data=monitor_data,
+                L=d_cfg.window_max_bytes,
+                batch_size=d_cfg.batch_size,
+                rng=monitor_rng,
+                limit=limit,
+                eval_step_fn=eval_step,
+                other_threshold=t_cfg.monitor_other_threshold,
+            )
+
+            per_class_m, aggregates_m = compute_metrics_from_confusion(
+                monitor_stats["conf_mat"], cfg.NUM_CLASSES, cfg.PAD_ID
+            )
+            print_metrics_table(
+                per_class_m,
+                aggregates_m,
+                cfg.ID2LANG,
+                cfg.NUM_CLASSES,
+                cfg.PAD_ID,
+                title="Monitor",
+            )
+            monitor_scalar_logs = {
+                "monitor/loss": monitor_stats["loss_mean"],
+                "monitor/acc": monitor_stats["acc_mean"],
+                "monitor/windows": monitor_stats["windows"],
+                "monitor/skipped": monitor_stats["skipped"],
+                "monitor/files_used": monitor_stats["files_used"],
+                "monitor/threshold": t_cfg.monitor_other_threshold,
+            }
+            monitor_gap_logs = {
+                "monitor_gap/micro_accuracy": float(aggregates_m["micro"]["acc"] - aggregates["micro"]["acc"]),
+                "monitor_gap/macro_f1": float(aggregates_m["macro"]["f1"] - aggregates["macro"]["f1"]),
+                "monitor_gap/macro_precision": float(aggregates_m["macro"]["precision"] - aggregates["macro"]["precision"]),
+                "monitor_gap/macro_recall": float(aggregates_m["macro"]["recall"] - aggregates["macro"]["recall"]),
+                "monitor_gap/weighted_f1": float(aggregates_m["weighted"]["f1"] - aggregates["weighted"]["f1"]),
+            }
+            monitor_combined_logs = {**monitor_scalar_logs, **monitor_gap_logs}
+            wandb_log_metrics(
+                step,
+                per_class_m,
+                aggregates_m,
+                cfg.ID2LANG,
+                cfg.NUM_CLASSES,
+                cfg.PAD_ID,
+                monitor_stats["conf_mat"],
+                prefix="monitor",
+                extra_logs=monitor_combined_logs,
+                commit=False,
+            )
+
+            if monitor_stats.get("conf_thresh") is not None and monitor_stats.get("acc_thresh_mean") is not None:
+                num_classes_with_other = cfg.NUM_CLASSES + 1
+                per_class_mt, aggregates_mt = compute_metrics_from_confusion(
+                    monitor_stats["conf_thresh"],
+                    num_classes_with_other,
+                    cfg.PAD_ID,
+                )
+                print_metrics_table(
+                    per_class_mt,
+                    aggregates_mt,
+                    cfg.ID2LANG,
+                    cfg.NUM_CLASSES,
+                    cfg.PAD_ID,
+                    title="Monitor (thresholded)",
+                )
+                thresh_logs = {
+                    "monitor_thresh/acc": monitor_stats.get("acc_thresh_mean", 0.0) or 0.0,
+                    "monitor_thresh/threshold": t_cfg.monitor_other_threshold,
+                    "monitor_thresh/windows": monitor_stats["windows"],
+                    "monitor_thresh/skipped": monitor_stats["skipped"],
+                    "monitor_thresh/files_used": monitor_stats["files_used"],
+                    "monitor_gap_thresh/micro_accuracy": float(aggregates_mt["micro"]["acc"] - aggregates["micro"]["acc"]),
+                    "monitor_gap_thresh/macro_f1": float(aggregates_mt["macro"]["f1"] - aggregates["macro"]["f1"]),
+                    "monitor_gap_thresh/macro_precision": float(aggregates_mt["macro"]["precision"] - aggregates["macro"]["precision"]),
+                    "monitor_gap_thresh/macro_recall": float(aggregates_mt["macro"]["recall"] - aggregates["macro"]["recall"]),
+                    "monitor_gap_thresh/weighted_f1": float(aggregates_mt["weighted"]["f1"] - aggregates["weighted"]["f1"]),
+                }
+                wandb_log_metrics(
+                    step,
+                    per_class_mt,
+                    aggregates_mt,
+                    cfg.ID2LANG,
+                    cfg.NUM_CLASSES,
+                    cfg.PAD_ID,
+                    monitor_stats["conf_thresh"],
+                    prefix="monitor_thresh",
+                    extra_logs=thresh_logs,
+                    commit=False,
+                )
+
+        wandb_log_metrics(
+            step,
+            per_class,
+            aggregates,
+            cfg.ID2LANG,
+            cfg.NUM_CLASSES,
+            cfg.PAD_ID,
+            conf_mat,
+            commit=True,
+        )
+        return val_loss, val_acc
+
+    if int(state.step) == 0:
+        run_val_and_monitor_eval(step=0, title="Baseline validation (step 0)")
 
     print("Starting training...", flush=True)
     start_time = time.time()
@@ -697,6 +1162,8 @@ def main():
                 data_time = 0.0
                 compute_time = 0.0
                 grad_norm_value = None
+                oe_losses: list[float] = []
+                oe_batches_used = 0
 
                 rng, step_base_rng = jax.random.split(rng)
 
@@ -706,10 +1173,32 @@ def main():
                     batch_tokens = sanitize_tokens(batch_tokens)
                     data_time = time.time() - data_start
 
-                    compute_start = time.time()
-                    state, loss, acc = train_step_fn(
-                        state, batch_tokens, batch_labels, step_base_rng
+                    step_base_rng, oe_decision_rng = jax.random.split(step_base_rng)
+                    use_oe = (
+                        oe_batcher is not None
+                        and float(jax.random.uniform(oe_decision_rng, ()).item()) < oe_ratio
                     )
+                    compute_start = time.time()
+                    if use_oe:
+                        data_start = time.time()
+                        outlier_tokens = oe_batcher.get()
+                        outlier_tokens = sanitize_tokens(outlier_tokens)
+                        data_time += time.time() - data_start
+                        state, loss, acc, oe_loss = train_step_oe_fn(
+                            state,
+                            batch_tokens,
+                            batch_labels,
+                            outlier_tokens,
+                            oe_lambda,
+                            step_base_rng,
+                        )
+                        oe_losses.append(float(oe_loss))
+                        oe_batches_used += 1
+                        del outlier_tokens
+                    else:
+                        state, loss, acc = train_step_fn(
+                            state, batch_tokens, batch_labels, step_base_rng
+                        )
                     loss_value = float(loss)
                     acc_value = float(acc)
                     compute_time = time.time() - compute_start
@@ -730,11 +1219,33 @@ def main():
                         mb_tokens = sanitize_tokens(mb_tokens)
                         data_time += time.time() - data_start
 
+                        micro_rng, oe_decision_rng = jax.random.split(micro_rng)
+                        use_oe = (
+                            oe_batcher is not None
+                            and float(jax.random.uniform(oe_decision_rng, ()).item()) < oe_ratio
+                        )
                         micro_rng, use_rng = jax.random.split(micro_rng)
                         compute_start = time.time()
-                        grads, micro_loss, micro_acc = micro_step_fn(
-                            state, mb_tokens, mb_labels, use_rng
-                        )
+                        if use_oe:
+                            data_start = time.time()
+                            outlier_tokens = oe_batcher.get()
+                            outlier_tokens = sanitize_tokens(outlier_tokens)
+                            data_time += time.time() - data_start
+                            grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
+                                state,
+                                mb_tokens,
+                                mb_labels,
+                                outlier_tokens,
+                                oe_lambda,
+                                use_rng,
+                            )
+                            oe_losses.append(float(micro_oe_loss))
+                            oe_batches_used += 1
+                            del outlier_tokens
+                        else:
+                            grads, micro_loss, micro_acc = micro_step_fn(
+                                state, mb_tokens, mb_labels, use_rng
+                            )
                         micro_loss_value = float(micro_loss)
                         micro_acc_value = float(micro_acc)
                         compute_time += time.time() - compute_start
@@ -761,6 +1272,7 @@ def main():
                     loss = float(sum(losses) / len(losses))
                     acc = float(sum(accs) / len(accs))
 
+                oe_loss_value = float(sum(oe_losses) / len(oe_losses)) if oe_losses else 0.0
                 step_time = time.time() - step_start
 
                 # LR best-effort
@@ -796,6 +1308,15 @@ def main():
                     "perf/compute_time": compute_time,
                     "perf/total_step_time": step_time,
                 }
+                if oe_lambda > 0.0:
+                    metrics.update(
+                        {
+                            "oe/loss_uniform": float(oe_loss_value),
+                            "oe/active_batches": int(oe_batches_used),
+                            "oe/lambda": float(oe_lambda),
+                            "oe/ratio": float(oe_ratio),
+                        }
+                    )
 
                 if grad_norm_value is not None:
                     rs = _compute_running_stats(
@@ -899,7 +1420,7 @@ def main():
                         per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID
                     )
 
-                    if monitor_data is not None and t_cfg.monitor_eval_every > 0 and step % t_cfg.monitor_eval_every == 0:
+                    if monitor_data is not None and t_cfg.monitor_eval_every > 0:
                         print("Running monitor evaluation...", flush=True)
                         eval_rng, monitor_rng = jax.random.split(eval_rng)
                         limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)

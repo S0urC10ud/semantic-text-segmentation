@@ -298,6 +298,8 @@ body{
   position:relative;
   overflow-wrap:anywhere;
   word-break:break-word;
+  tab-size:4;
+  -moz-tab-size:4;
 }
 .sample-render.dim{
   opacity:0.4;
@@ -340,6 +342,7 @@ body{
 .char{
   display:inline;
   position:relative;
+  border-radius:3px;
 }
 .char.confused{
   color:#c02b39;

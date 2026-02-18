@@ -403,6 +403,16 @@ def accuracy_masked(
     total = jnp.maximum(1, jnp.sum(mask.astype(jnp.int32)))
     return (correct / total).astype(jnp.float32)
 
+
+@jax.jit
+def outlier_uniform_cross_entropy(logits: jnp.ndarray) -> jnp.ndarray:
+    """
+    OE loss for outlier batches: H(U; p) where U is uniform over classes.
+    """
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    return -(log_probs.mean(axis=-1)).mean()
+
+
 @jax.jit
 def train_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.ndarray, rng):
     """Perform a single training step."""
@@ -438,6 +448,84 @@ def train_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, batch_labels
     acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return state, loss, acc
 
+
+@jax.jit
+def train_step_with_oe(
+    state: TrainState,
+    batch_tokens: jnp.ndarray,
+    batch_labels: jnp.ndarray,
+    outlier_tokens: jnp.ndarray,
+    oe_lambda: float,
+    rng,
+):
+    """Single training step with OE regularization."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    dropout_rng_id, dropout_rng_oe = jax.random.split(dropout_rng)
+    oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
+
+    def loss_fn(params):
+        logits_id = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_id},
+        )
+        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+
+        logits_out = state.apply_fn(
+            {"params": params},
+            outlier_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_oe},
+        )
+        ce_uniform = outlier_uniform_cross_entropy(logits_out)
+        total = ce_id + oe_lambda_f * ce_uniform
+        return total, (logits_id, ce_uniform)
+
+    (loss, (logits_id, ce_uniform)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    state = state.apply_gradients(grads=grads)
+    acc = accuracy_masked(logits_id, batch_labels, tokens=batch_tokens)
+    return state, loss, acc, ce_uniform
+
+
+def train_step_with_oe_no_jit(
+    state: TrainState,
+    batch_tokens: jnp.ndarray,
+    batch_labels: jnp.ndarray,
+    outlier_tokens: jnp.ndarray,
+    oe_lambda: float,
+    rng,
+):
+    """Non-JIT version of train_step_with_oe."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    dropout_rng_id, dropout_rng_oe = jax.random.split(dropout_rng)
+    oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
+
+    def loss_fn(params):
+        logits_id = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_id},
+        )
+        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+
+        logits_out = state.apply_fn(
+            {"params": params},
+            outlier_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_oe},
+        )
+        ce_uniform = outlier_uniform_cross_entropy(logits_out)
+        total = ce_id + oe_lambda_f * ce_uniform
+        return total, (logits_id, ce_uniform)
+
+    (loss, (logits_id, ce_uniform)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    state = state.apply_gradients(grads=grads)
+    acc = accuracy_masked(logits_id, batch_labels, tokens=batch_tokens)
+    return state, loss, acc, ce_uniform
+
+
 @jax.jit
 def microbatch_grad_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.ndarray, rng):
     """Compute gradients, loss, and accuracy for a single microbatch without applying updates."""
@@ -457,6 +545,44 @@ def microbatch_grad_step(state: TrainState, batch_tokens: jnp.ndarray, batch_lab
     return grads, loss, acc
 
 
+@jax.jit
+def microbatch_grad_step_with_oe(
+    state: TrainState,
+    batch_tokens: jnp.ndarray,
+    batch_labels: jnp.ndarray,
+    outlier_tokens: jnp.ndarray,
+    oe_lambda: float,
+    rng,
+):
+    """Microbatch gradient step with OE regularization."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    dropout_rng_id, dropout_rng_oe = jax.random.split(dropout_rng)
+    oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
+
+    def loss_fn(params):
+        logits_id = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_id},
+        )
+        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+
+        logits_out = state.apply_fn(
+            {"params": params},
+            outlier_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_oe},
+        )
+        ce_uniform = outlier_uniform_cross_entropy(logits_out)
+        total = ce_id + oe_lambda_f * ce_uniform
+        return total, (logits_id, ce_uniform)
+
+    (loss, (logits_id, ce_uniform)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    acc = accuracy_masked(logits_id, batch_labels, tokens=batch_tokens)
+    return grads, loss, acc, ce_uniform
+
+
 def microbatch_grad_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.ndarray, rng):
     """Non-JIT version of microbatch_grad_step."""
     dropout_rng = jax.random.fold_in(rng, state.step)
@@ -474,6 +600,43 @@ def microbatch_grad_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, ba
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return grads, loss, acc
+
+
+def microbatch_grad_step_with_oe_no_jit(
+    state: TrainState,
+    batch_tokens: jnp.ndarray,
+    batch_labels: jnp.ndarray,
+    outlier_tokens: jnp.ndarray,
+    oe_lambda: float,
+    rng,
+):
+    """Non-JIT version of microbatch_grad_step_with_oe."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    dropout_rng_id, dropout_rng_oe = jax.random.split(dropout_rng)
+    oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
+
+    def loss_fn(params):
+        logits_id = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_id},
+        )
+        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+
+        logits_out = state.apply_fn(
+            {"params": params},
+            outlier_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_oe},
+        )
+        ce_uniform = outlier_uniform_cross_entropy(logits_out)
+        total = ce_id + oe_lambda_f * ce_uniform
+        return total, (logits_id, ce_uniform)
+
+    (loss, (logits_id, ce_uniform)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    acc = accuracy_masked(logits_id, batch_labels, tokens=batch_tokens)
+    return grads, loss, acc, ce_uniform
 
 
 def grad_global_norm(grads) -> jnp.ndarray:

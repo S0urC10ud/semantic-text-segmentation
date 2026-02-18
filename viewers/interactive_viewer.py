@@ -30,8 +30,10 @@ try:
         DEFAULT_CHANNELS,
         DEFAULT_CHUNK_SIZE,
         Predictor,
+        auto_color,
         _apply_label_mapping,
         _hex_to_rgba,
+        _hex_to_rgba_confidence,
         _infer_checkpoint_architecture,
         _load_checkpoint_hparams,
         _normalize_input_text,
@@ -45,8 +47,10 @@ except ImportError:  # pragma: no cover
         DEFAULT_CHANNELS,
         DEFAULT_CHUNK_SIZE,
         Predictor,
+        auto_color,
         _apply_label_mapping,
         _hex_to_rgba,
+        _hex_to_rgba_confidence,
         _infer_checkpoint_architecture,
         _load_checkpoint_hparams,
         _normalize_input_text,
@@ -111,7 +115,7 @@ parser.add_argument("--openapi", action="store_true")
 parser.add_argument(
     "--other-threshold",
     type=float,
-    default=0.3,
+    default=0.2,
     help="If >0, treat characters whose max softmax is below this as a virtual 'other' class.",
 )
 args, _ = parser.parse_known_args()
@@ -350,6 +354,17 @@ def api_segment(req: SegmentRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     elapsed_ms = float((_time.perf_counter() - t0) * 1000.0)
 
+    import collections
+    counts = collections.Counter(char_labels)
+    total = max(1, sum(counts.values()))
+    used_ids = [int(lbl) for (lbl, _count) in counts.most_common()]
+    used_non_other = [lbl for lbl in used_ids if lbl != OTHER_LABEL_ID]
+    id2color_run: Dict[int, str] = {}
+    for idx, lbl in enumerate(used_non_other):
+        id2color_run[lbl] = auto_color(idx, len(used_non_other))
+    if OTHER_LABEL_ID in counts:
+        id2color_run[OTHER_LABEL_ID] = ID2COLOR.get(OTHER_LABEL_ID, "#7f8c8d")
+
     def esc(s: str) -> str:
         return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 .replace('"', "&quot;").replace("'", "&#39;"))
@@ -388,8 +403,7 @@ def api_segment(req: SegmentRequest):
     for (s, e, lbl) in segs:
         raw = text[s:e]
         cls = ID2SLUG.get(lbl, f"class-{lbl}")
-        color = ID2COLOR.get(lbl, "#888888")
-        bg_color = _hex_to_rgba(color, 0.22)
+        color = id2color_run.get(lbl, "#888888")
         border_color = _hex_to_rgba(color, 0.35)
         chars_html = []
         for i, ch in enumerate(raw):
@@ -399,32 +413,38 @@ def api_segment(req: SegmentRequest):
             for win_idx in window_end_map.get(char_idx, []):
                 chars_html.append(marker_html(win_idx, "end"))
             probs = char_probs[char_idx]
-            # Aggregate by canonical label
-            agg: Dict[str, float] = {}
-            for key, value in probs.items():
+            conf = 1.0
+            if isinstance(probs, dict) and probs:
                 try:
-                    label_idx = int(key)
-                except (TypeError, ValueError):
-                    continue
-                base_label = ID2CANONICAL.get(label_idx)
-                if base_label is None:
-                    continue
-                agg[base_label] = agg.get(base_label, 0.0) + float(value)
-            sorted_items = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
+                    key = str(int(lbl))
+                except Exception:
+                    key = str(lbl)
+                try:
+                    conf = float(probs.get(key, 0.0))
+                except Exception:
+                    conf = 0.0
+            char_bg = _hex_to_rgba_confidence(color, 0.22, conf)
+            # Only keep top probabilities to keep HTML light.
+            sorted_items = sorted(
+                ((key, float(value)) for key, value in probs.items()),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
             top_items = sorted_items[:5]
             remaining = sum(prob for _, prob in sorted_items[5:])
-            payload = {label: prob for label, prob in top_items}
+            payload = {key: prob for key, prob in top_items}
             if remaining > 1e-6:
                 payload["others"] = remaining
             probs_attr = esc(json.dumps(payload))
             display_label = esc(ID2NAME.get(lbl, str(lbl)))
             chars_html.append(
-                f'<span class="char" data-probs="{probs_attr}" data-label="{display_label}">{esc(ch)}</span>'
+                f'<span class="char" style="background-color:{char_bg};" '
+                f'data-probs="{probs_attr}" data-label="{display_label}">{esc(ch)}</span>'
             )
         out_html.append(
             f'<span class="seg {cls}" '
             f'data-label="{esc(ID2NAME.get(lbl, str(lbl)))}" '
-            f'style="--seg-color:{color}; background-color:{bg_color}; '
+            f'style="--seg-color:{color}; background-color: transparent !important; '
             f'box-shadow: inset 0 -1px 0 {border_color};">'
             f'{"".join(chars_html)}</span>'
         )
@@ -436,20 +456,15 @@ def api_segment(req: SegmentRequest):
         out_html.append("".join(trailing_markers))
     html_joined = "".join(out_html)
 
-    import collections
-    counts = collections.Counter(char_labels)
-    total = max(1, sum(counts.values()))
-    # Include any labels that appear in the output, including the virtual 'other'.
-    label_ids = sorted(set(list(range(num_classes)) + list(counts.keys())))
     stats = [
         {
             "id": i,
             "name": ID2NAME.get(i, str(i)),
             "count": int(counts.get(i, 0)),
             "pct": float(100.0 * counts.get(i, 0) / total),
-            "color": ID2COLOR.get(i, "#888888"),
+            "color": id2color_run.get(i, "#888888"),
         }
-        for i in label_ids
+        for i in used_ids
     ]
 
     return {

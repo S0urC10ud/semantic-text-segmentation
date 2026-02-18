@@ -96,13 +96,28 @@ def _forward_logits(state, x: jnp.ndarray, rng):
     try_order.append(("vars",               lambda: state.apply_fn(variables_params, x)))
     try_order.append(("params",             lambda: state.apply_fn(state.params, x)))
 
+    def _looks_like_oom(err: Exception) -> bool:
+        txt = str(err).lower()
+        return (
+            "out of memory" in txt
+            or "resource_exhausted" in txt
+            or "cuda_error_out_of_memory" in txt
+            or "allocator" in txt and "ran out of memory" in txt
+        )
+
     last_err = None
+    first_oom_err = None
     for _, fn in try_order:
         try:
             return fn()
         except Exception as e:
             last_err = e
+            if first_oom_err is None and _looks_like_oom(e):
+                first_oom_err = e
+                break
             continue
+    if first_oom_err is not None:
+        raise first_oom_err
     raise last_err
 
 

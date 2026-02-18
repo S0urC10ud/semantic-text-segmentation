@@ -19,7 +19,7 @@ from rich.console import Console
 
 console = Console()
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3-flash-preview"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SEGMENTATIONS_DIR = PROJECT_ROOT / "gemini_segmentations"

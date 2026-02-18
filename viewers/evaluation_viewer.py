@@ -1180,6 +1180,73 @@ _INDEX_HTML = """<!DOCTYPE html>
       });
     }
 
+    function clamp01(val) {
+      const num = Number(val);
+      if (!Number.isFinite(num)) return 0;
+      if (num < 0) return 0;
+      if (num > 1) return 1;
+      return num;
+    }
+
+    function hexToRgb(hex) {
+      if (!hex) return null;
+      let clean = String(hex).trim().replace(/^#/, '');
+      if (clean.length === 3) {
+        clean = clean.split('').map(ch => ch + ch).join('');
+      }
+      if (clean.length !== 6) return null;
+      const value = parseInt(clean, 16);
+      if (!Number.isFinite(value)) return null;
+      return {
+        r: (value >> 16) & 255,
+        g: (value >> 8) & 255,
+        b: value & 255,
+      };
+    }
+
+    function rgbToHsl(rgb) {
+      const r = rgb.r / 255;
+      const g = rgb.g / 255;
+      const b = rgb.b / 255;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const delta = max - min;
+
+      let h = 0;
+      let s = 0;
+      const l = (max + min) / 2;
+
+      if (delta > 1e-8) {
+        s = delta / (1 - Math.abs(2 * l - 1));
+        if (max === r) {
+          h = ((g - b) / delta) % 6;
+        } else if (max === g) {
+          h = (b - r) / delta + 2;
+        } else {
+          h = (r - g) / delta + 4;
+        }
+        h = h * 60;
+        if (h < 0) h += 360;
+      }
+
+      return {h, s, l};
+    }
+
+    function bgColorByConfidence(hex, conf, alpha) {
+      const rgb = hexToRgb(hex) || {r: 136, g: 136, b: 136};
+      const hsl = rgbToHsl(rgb);
+      const confClamped = clamp01(conf);
+      const sat = clamp01(hsl.s * confClamped);
+      const a = clamp01(alpha);
+      return `hsl(${hsl.h.toFixed(1)} ${Math.round(sat * 100)}% ${Math.round(hsl.l * 100)}% / ${a.toFixed(3)})`;
+    }
+
+    function confidenceForLabel(entry, label) {
+      if (!entry || !Array.isArray(entry.probs) || !label) return 0;
+      const found = entry.probs.find((item) => item && item.label === label);
+      return found ? clamp01(found.prob) : 0;
+    }
+
     function renderRow(container, chars, labelKey, labelColors, highlightMismatch = false) {
       container.innerHTML = '';
       const frag = document.createDocumentFragment();
@@ -1191,7 +1258,8 @@ _INDEX_HTML = """<!DOCTYPE html>
         }
         const label = entry[labelKey] || '__unknown__';
         const color = labelColors[label] || '#b2bec3';
-        spanEl.style.backgroundColor = color + '33';
+        const conf = labelKey === 'pred' ? confidenceForLabel(entry, label) : 1.0;
+        spanEl.style.backgroundColor = bgColorByConfidence(color, conf, 0.20);
         spanEl.style.borderBottom = '2px solid ' + color;
         spanEl.textContent = entry.char;
         spanEl.dataset.label = label;

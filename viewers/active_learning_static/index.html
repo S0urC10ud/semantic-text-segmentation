@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Active Learning Viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Active Learning <span>Refinement Viewer</span></div>
+    <div class="controls">
+      <label>Status
+        <select id="statusSelect">
+          <option value="ok">ok</option>
+          <option value="all">all</option>
+          <option value="error">error</option>
+        </select>
+      </label>
+      <label>Round
+        <select id="roundSelect">
+          <option value="">all</option>
+        </select>
+      </label>
+      <label>Queried
+        <select id="queriedSelect">
+          <option value="all">all</option>
+          <option value="yes">queried</option>
+          <option value="no">not queried</option>
+        </select>
+      </label>
+      <label>Search
+        <input id="searchInput" type="search" placeholder="lang, snippet, oracle..." />
+      </label>
+      <button id="refreshBtn" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <h2>Overview</h2>
+      <div id="cards" class="cards"></div>
+      <div class="panel-grid">
+        <div class="subpanel">
+          <h3>Refined Label Distribution</h3>
+          <div id="refinedBars" class="bars"></div>
+        </div>
+        <div class="subpanel">
+          <h3>Predicted Label Distribution</h3>
+          <div id="predBars" class="bars"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Refined → Predicted Confusion (Top Labels)</h2>
+      <div id="confusion" class="matrix-wrap"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Samples</h2>
+      <div id="sampleMeta" class="sample-meta"></div>
+      <table class="sample-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Round</th>
+            <th>Lang</th>
+            <th>Chars</th>
+            <th>Queried</th>
+            <th>Candidates</th>
+            <th>Preview</th>
+          </tr>
+        </thead>
+        <tbody id="sampleRows"></tbody>
+      </table>
+      <div class="pager">
+        <button id="prevPage" type="button">Prev</button>
+        <span id="pageInfo"></span>
+        <button id="nextPage" type="button">Next</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Sample Detail</h2>
+      <div id="detailMeta" class="detail-meta">Select a sample row.</div>
+      <div class="detail-controls">
+        <label>View
+          <select id="detailViewSelect">
+            <option value="trigger">Trigger Spans</option>
+            <option value="prediction">Prediction</option>
+          </select>
+        </label>
+        <label id="pairSelectWrap">Refinement Slice
+          <select id="pairSelect"></select>
+        </label>
+        <button id="deleteSampleBtn" type="button" class="danger-btn" disabled>Delete Selected</button>
+      </div>
+      <div id="deleteStatus" class="delete-status"></div>
+      <div id="triggerView" class="detail-grid">
+        <div class="render-block">
+          <h3>Input + Trigger Highlights</h3>
+          <div id="sourceRender" class="render"></div>
+        </div>
+        <div class="render-block">
+          <h3>Trigger Spans</h3>
+          <div id="triggerRows" class="trigger-list"></div>
+        </div>
+      </div>
+      <div id="predictionView" class="detail-grid hidden">
+        <div class="render-block">
+          <h3>Model Prediction</h3>
+          <div id="predictedRender" class="render"></div>
+        </div>
+        <div class="render-block">
+          <h3>Gemini Refinement</h3>
+          <div id="refinedRender" class="render"></div>
+        </div>
+      </div>
+      <h3>Linked Refinement Snippets</h3>
+      <div id="refinementRows" class="linked-list"></div>
+      <h3>Metadata</h3>
+      <pre id="metadataJson" class="meta-json"></pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

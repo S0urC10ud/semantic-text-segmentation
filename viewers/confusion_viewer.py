@@ -46,6 +46,7 @@ try:
         Predictor,
         _apply_label_mapping,
         _hex_to_rgba,
+        _hex_to_rgba_confidence,
         _infer_checkpoint_architecture,
         _load_checkpoint_hparams,
         _normalize_input_text,
@@ -62,6 +63,7 @@ except ImportError:  # pragma: no cover
         Predictor,
         _apply_label_mapping,
         _hex_to_rgba,
+        _hex_to_rgba_confidence,
         _infer_checkpoint_architecture,
         _load_checkpoint_hparams,
         _normalize_input_text,
@@ -348,12 +350,22 @@ def _build_segments_html(
         raw = text[start:end]
         cls = id2canon.get(lbl, f"class-{lbl}")
         color = id2color.get(lbl, "#888888")
-        bg = _hex_to_rgba(color, 0.22)
         border = _hex_to_rgba(color, 0.35)
         chunk: List[str] = []
         for offset, ch in enumerate(raw):
             char_idx = start + offset
+            if ch == "\n":
+                chunk.append("<br/>")
+                continue
             raw_probs = char_probs[char_idx]
+            conf = 1.0
+            if isinstance(raw_probs, dict) and raw_probs:
+                key = str(int(lbl)) if isinstance(lbl, (int, np.integer)) else str(lbl)
+                try:
+                    conf = float(raw_probs.get(key, 0.0))
+                except Exception:
+                    conf = 0.0
+            char_bg = _hex_to_rgba_confidence(color, 0.22, conf)
             agg: Dict[str, float] = {}
             for key, value in raw_probs.items():
                 try:
@@ -373,13 +385,13 @@ def _build_segments_html(
                 base_class += " confused"
             true_lbl = id2name.get(true_labels[char_idx], str(true_labels[char_idx]))
             chunk.append(
-                f'<span class="{base_class}" data-probs="{payload}" '
+                f'<span class="{base_class}" style="background-color:{char_bg};" data-probs="{payload}" '
                 f'data-label="{display_label}" data-true="{_escape_html(true_lbl)}">'
                 f"{_escape_html(ch)}</span>"
             )
         out_html.append(
             f'<span class="seg {cls}" data-label="{_escape_html(id2name.get(lbl, str(lbl)))}" '
-            f'style="--seg-color:{color}; background-color:{bg}; box-shadow: inset 0 -1px 0 {border};">'
+            f'style="--seg-color:{color}; background-color: transparent !important; box-shadow: inset 0 -1px 0 {border};">'
             f'{"".join(chunk)}</span>'
         )
     return "".join(out_html), stats
@@ -1088,7 +1100,7 @@ parser.add_argument(
 parser.add_argument(
     "--other-threshold",
     type=float,
-    default=0.3,
+    default=0.2,
     help=(
         "If >0, route low-confidence predictions (max softmax below this) "
         "into a virtual 'other' class in both the confusion matrix and sample views."

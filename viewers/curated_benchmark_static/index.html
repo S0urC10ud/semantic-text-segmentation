@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Curated Benchmark Viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Curated Benchmark <span>JSONL Review</span></div>
+    <div class="controls">
+      <label>Status
+        <select id="statusSelect">
+          <option value="all">all</option>
+          <option value="incorrect">incorrect labels</option>
+          <option value="correct">correct labels</option>
+          <option value="failed_segmentation">failed segmentation</option>
+          <option value="issues">issues</option>
+          <option value="errors">errors</option>
+          <option value="ok">ok</option>
+        </select>
+      </label>
+      <label>Page Size
+        <select id="pageSizeSelect">
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </label>
+      <label>Search
+        <input id="searchInput" type="search" placeholder="snippet_id, label, note..." />
+      </label>
+      <label>Gemini Live Run
+        <select id="liveRunSelect">
+          <option value="">prior-only (dataset)</option>
+        </select>
+      </label>
+      <label>Batch
+        <select id="liveBatchSelect" disabled>
+          <option value="">auto</option>
+        </select>
+      </label>
+      <label class="check-label">
+        <input id="runOnlyCheck" type="checkbox" />
+        only selected run samples
+      </label>
+      <button id="reloadBtn" type="button" class="secondary">Reload File</button>
+      <button id="refreshBtn" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <h2>Overview</h2>
+      <div id="datasetMeta" class="dataset-meta"></div>
+      <div id="liveRunMeta" class="dataset-meta"></div>
+      <div id="cards" class="cards"></div>
+      <div class="grid2">
+        <div class="subpanel">
+          <h3>Issue Codes (Top)</h3>
+          <div id="issueCodeRows" class="list-rows"></div>
+        </div>
+        <div class="subpanel">
+          <h3>Truth Label Coverage (chars)</h3>
+          <div id="labelCharRows" class="list-rows"></div>
+        </div>
+      </div>
+      <h3>Parse Errors</h3>
+      <div id="parseErrors" class="parse-errors">No parse errors.</div>
+    </section>
+
+    <section class="panel">
+      <h2>Samples</h2>
+      <div id="sampleMeta" class="sample-meta"></div>
+      <table class="sample-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Line</th>
+            <th>Snippet</th>
+            <th>Task</th>
+            <th>Mixed</th>
+            <th>Len</th>
+            <th>Mismatch</th>
+            <th>Issues</th>
+            <th>Labels</th>
+            <th>Pred Source</th>
+            <th>Preview</th>
+          </tr>
+        </thead>
+        <tbody id="sampleRows"></tbody>
+      </table>
+      <div class="pager">
+        <button id="prevPage" type="button" class="secondary">Prev</button>
+        <span id="pageInfo"></span>
+        <button id="nextPage" type="button" class="secondary">Next</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Sample Detail</h2>
+      <div id="detailMeta" class="detail-meta">Select a sample row.</div>
+      <div class="detail-nav">
+        <button id="detailPrevBtn" type="button" class="secondary">Prev Sample</button>
+        <span id="detailNavInfo"></span>
+        <button id="detailNextBtn" type="button">Next Sample</button>
+      </div>
+      <div id="issueRows" class="issues"></div>
+
+      <div class="detail-grid">
+        <div class="render-block">
+          <h3>Truth Segments</h3>
+          <div id="truthRender" class="render"></div>
+        </div>
+        <div class="render-block">
+          <h3>Predicted Segments</h3>
+          <div id="predictedRender" class="render"></div>
+        </div>
+      </div>
+
+      <div class="render-block">
+        <h3>Truth Diff Mask (highlighted spans differ from prediction)</h3>
+        <div id="diffRender" class="render"></div>
+      </div>
+
+      <div class="grid2">
+        <div class="subpanel">
+          <h3>Truth Segments (offsets)</h3>
+          <div id="truthTable" class="mono-table"></div>
+        </div>
+        <div class="subpanel">
+          <h3>Predicted Segments (offsets)</h3>
+          <div id="predTable" class="mono-table"></div>
+        </div>
+      </div>
+
+      <h3>Metadata</h3>
+      <pre id="metadataJson" class="meta-json"></pre>
+      <h3>Raw JSON</h3>
+      <pre id="rawJson" class="meta-json"></pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=20260218-failed-seg-v2"></script>
+</body>
+</html>

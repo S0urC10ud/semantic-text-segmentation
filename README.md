@@ -35,6 +35,12 @@ Note that the first request takes far longer than the rest because JAX has to tr
 - `viewers/` – Small FastAPI frontends for playing with the model:
   - `interactive_viewer.py` exposes a `/api/segment` endpoint where one can provide custom inputs to the model and see its output probabilities.
   - `confusion_viewer.py`, `evaluation_viewer.py`, `dataset_viewer.py` are focused viewers for confusion matrices, eval runs, and datasets.
+- `active_learning/` – Boundary-focused active learning:
+  - `round.py` runs one refinement round (`infer -> acquire uncertain boundaries -> oracle -> store`).
+  - `acquisition.py` scores candidate boundary spans with entropy + local flip-rate.
+  - `oracle.py` provides a stub oracle and a batched Gemini oracle (requests logged into `gemini_output_logs/` for usage/cost tracking).
+  - `label_store.py` persists outcomes in SQLite and can build replay windows for training.
+  - `meta_trainer.py` runs train/AL loops.
 - `gemini_segmentations/`, `gemini_output_logs/` – Expected locations for LLM‑based segmentations and their logs (used by `obtain_eval_dataset.py` when present).
 
 If you’re trying to understand how things fit together, a good path is:
@@ -131,6 +137,203 @@ python viewers/interactive_viewer.py \
 ```
 
 Then open `http://127.0.0.1:8000` in a browser. The UI will show color‑coded spans, per‑character probabilities, and the sliding windows the model actually processed.
+
+Open-set inference (`OTHER` from low confidence):
+
+```bash
+python viewers/interactive_viewer.py \
+  --ckpt train/checkpoints/seg-unet1d.msgpack \
+  --other-threshold 0.2
+```
+
+Sweep `tau` on monitor validation memmap (`monitor_preprocessed_b`) and pick the best threshold:
+
+```bash
+python evaluation/sweep_tau.py \
+  --checkpoint train/checkpoints/seg-unet1d.msgpack \
+  --monitor-root downloader/monitor_preprocessed_b \
+  --tau-start 0.05 \
+  --tau-end 0.95 \
+  --tau-step 0.05 \
+  --select-by macro_f1
+```
+
+By default, `sweep_tau.py` augments monitor evaluation with true-`OTHER` rows
+from `downloader/arrow_out_other/train/other/dataset` (`--other-limit 1024`).
+Set `--other-limit 0` to disable this augmentation.
+
+OE training (uniform-target loss on outlier batches):
+
+```bash
+python train/main.py \
+  --data_root downloader/arrow_out \
+  --oe-lambda 0.1 \
+  --oe-ratio 0.05
+```
+
+Build a heldout OTHER dataset from non-mapped The Stack languages:
+
+```bash
+python downloader/misc/extract_other.py \
+  --out-root downloader/arrow_out_other \
+  --label other \
+  --split train \
+  --max-samples 200000 \
+  --max-bytes 1536 \
+  --use-auth-token
+```
+
+Use that heldout Arrow dataset during training/fine-tuning:
+
+```bash
+python train/main.py \
+  --data_root downloader/arrow_out \
+  --oe-lambda 0.1 \
+  --oe-ratio 0.05 \
+  --oe-source mixed \
+  --oe-heldout-root downloader/arrow_out_other
+```
+
+### 6. Run one active-learning round (boundary refinement)
+
+Example (no network, deterministic stub oracle):
+
+```bash
+python -m active_learning.round \
+  --ckpt train/checkpoints/seg-unet1d.msgpack \
+  --data-root downloader/arrow_out \
+  --split monitor \
+  --langs html,css,javascript_typescript,python \
+  --store active_learning/label_store.sqlite \
+  --oracle stub \
+  --max-samples-per-lang 16 \
+  --max-candidates-per-sample 3 \
+  --context-chars 250
+```
+
+Gemini-backed refinement (batched requests, logs written to `gemini_output_logs/`):
+
+```bash
+python -m active_learning.round \
+  --ckpt train/checkpoints/seg-unet1d.msgpack \
+  --data-root downloader/arrow_out \
+  --split monitor \
+  --store active_learning/label_store.sqlite \
+  --oracle gemini \
+  --gemini-model gemini-3-flash-preview \
+  --gemini-batch-size 2 \
+  --context-chars 250
+```
+
+By default, `active_learning.round` caps oracle traffic to `3` requests per round
+(`--max-oracle-requests 3`). Use `--unlimited-oracle` to restore unbounded querying.
+
+Build/rebuild the fixed curated benchmark set (reviewable JSON + JSONL + Markdown):
+
+```bash
+python -m active_learning.build_curated_benchmark_set \
+  --target-length 256 \
+  --target-samples 1000 \
+  --seed 11
+```
+
+Outputs:
+- `active_learning/benchmark_data/curated_oracle_segments_v1.json`
+- `active_learning/benchmark_data/curated_oracle_segments_v1.jsonl`
+- `active_learning/benchmark_data/curated_oracle_segments_v1.md`
+
+Review the curated JSONL for annotation mistakes (schema, offsets, overlaps, label inconsistencies):
+
+```bash
+python viewers/curated_benchmark_viewer.py \
+  --jsonl active_learning/benchmark_data/curated_oracle_segments_v1.jsonl \
+  --expected-length 256 \
+  --port 8093
+```
+
+Then open `http://127.0.0.1:8093` and inspect:
+- summary + issue code counts
+- filterable sample table (`all`, `issues`, `errors`, `ok`)
+- per-sample truth/predicted/diff renderings
+- raw JSON and metadata
+- live Gemini benchmark overlays: choose `Gemini Live Run` + `Batch` in the top controls
+  (loaded from `active_learning/benchmark_results/*.json` and linked `gemini_output_logs`)
+
+Benchmark Gemini oracle quality vs batch size (scored, 256-char snippets, mixed + non-mixed):
+
+```bash
+python -m active_learning.benchmark_gemini_batch_size \
+  --samples 128 \
+  --pure-samples 48 \
+  --sample-length 256 \
+  --batch-sizes 1,2,4,8,16,32
+```
+
+By default, `benchmark_gemini_batch_size.py` loads
+`active_learning/benchmark_data/curated_oracle_segments_v1.json`.
+Defaults now use the full curated benchmark (`--samples 0`, `--pure-samples -1`).
+Fallback to dynamic sampling from `evaluation/data` is disabled; the script now fails fast
+if the curated benchmark dataset file is missing.
+
+Important guard: this script does **not** run oracle requests unless you explicitly pass
+`--run-live`; otherwise it only computes the no-cost prior baseline.
+
+Live run (requires explicit consent):
+
+```bash
+python -m active_learning.benchmark_gemini_batch_size \
+  --samples 128 \
+  --pure-samples 48 \
+  --sample-length 256 \
+  --batch-sizes 1,2,4,8,16,32 \
+  --run-live
+```
+
+Train with replayed AL labels mixed into normal batches:
+
+```bash
+python train/main.py \
+  --data_root downloader/arrow_out \
+  --ckpt_path train/checkpoints/seg-unet1d.msgpack \
+  --active_learning_store active_learning/label_store.sqlite \
+  --active_learning_mix_prob 0.25 \
+  --active_learning_max_windows 10000
+```
+
+Full loop (`train -> AL round -> train -> ...`):
+
+```bash
+python -m active_learning.meta_trainer \
+  --rounds 3 \
+  --ckpt-path train/checkpoints/al_loop.msgpack \
+  --data-root downloader/arrow_out \
+  --train-max-minutes 20 \
+  --al-store active_learning/label_store.sqlite \
+  --al-oracle stub
+```
+
+`active_learning.meta_trainer` uses one shared W&B run across all rounds by default.
+Use `--wandb-run-id <RUN_ID>` to pin/reuse a specific run id across invocations, or
+`--wandb-mode per-round` for one run per round.
+Each round runs in this order:
+1) acquire/oracle on the standard train split
+2) monitor fine-tune training (`--fine-tune`) with AL replay enabled
+
+Its AL step defaults to `3` oracle requests per round (`--al-max-oracle-requests 3`);
+use `--al-unlimited-oracle` to disable this cap. Replay mix is scheduled linearly
+from `0` to `--al-mix-prob` (default `0.5`) as stored oracle refinements grow from
+`0` to `--al-mix-full-at-rows` (default `1000`).
+
+### 7. Explore stored active-learning refinements
+
+```bash
+python viewers/active_learning_viewer.py \
+  --store active_learning/label_store.sqlite \
+  --port 8061
+```
+
+Then open `http://127.0.0.1:8061` to inspect summary stats, label distributions,
+refined-vs-predicted confusion, and per-sample predicted/refined renderings.
 
 
 ## Notes
