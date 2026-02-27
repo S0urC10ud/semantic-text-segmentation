@@ -272,7 +272,9 @@ def _segments_from_oracle_rows(rows: Any) -> List[Segment]:
             continue
         if end <= start:
             continue
-        label_raw = row.get("raw_label", row.get("label", "other"))
+        label_raw = row.get("raw_label")
+        if label_raw is None:
+            label_raw = row.get("label", "other")
         label = _canonical_label(str(label_raw))
         out.append(Segment(start=start, end=end, label=label))
     out.sort(key=lambda seg: (int(seg.start), int(seg.end)))
@@ -287,7 +289,10 @@ def _segments_from_oracle_objects(rows: Any) -> List[Segment]:
         try:
             start = int(getattr(row, "start", 0))
             end = int(getattr(row, "end", 0))
-            label = _canonical_label(str(getattr(row, "raw_label", getattr(row, "label", "other"))))
+            raw_label = getattr(row, "raw_label", None)
+            if raw_label is None:
+                raw_label = getattr(row, "label", "other")
+            label = _canonical_label(str(raw_label))
         except Exception:
             continue
         if end <= start:

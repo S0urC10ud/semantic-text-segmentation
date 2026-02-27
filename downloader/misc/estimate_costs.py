@@ -35,6 +35,30 @@ MODEL_PRICING_USD_PER_MTOKENS = {
             {"max_prompt_tokens": None, "rate": 2.50},
         ],
     },
+    "gemini-3-flash": {
+        "prompt": [
+            {"max_prompt_tokens": None, "rate": 0.50},
+        ],
+        "response": [
+            {"max_prompt_tokens": None, "rate": 3.00},
+        ],
+    },
+    "gemini-3-flash-preview": {
+        "prompt": [
+            {"max_prompt_tokens": None, "rate": 0.50},
+        ],
+        "response": [
+            {"max_prompt_tokens": None, "rate": 3.00},
+        ],
+    },
+    "google/gemini-3-flash-preview": {
+        "prompt": [
+            {"max_prompt_tokens": None, "rate": 0.50},
+        ],
+        "response": [
+            {"max_prompt_tokens": None, "rate": 3.00},
+        ],
+    },
 }
 
 

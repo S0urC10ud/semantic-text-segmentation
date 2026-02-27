@@ -696,7 +696,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-score", type=float, default=0.5)
     parser.add_argument("--oracle", choices=("stub", "gemini"), default="gemini")
     parser.add_argument("--gemini-model", type=str, default="gemini-3-flash-preview")
-    parser.add_argument("--gemini-batch-size", type=int, default=16)
+    parser.add_argument("--gemini-batch-size", type=int, default=32)
     parser.add_argument("--gemini-rate-limit-sleep-seconds", type=float, default=65.0)
     parser.add_argument("--gemini-rate-limit-max-retries", type=int, default=8)
     parser.add_argument("--gemini-missing-snippet-retries", type=int, default=2)

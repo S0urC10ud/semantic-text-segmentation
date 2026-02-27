@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 from typing import Dict, Tuple, TYPE_CHECKING
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Unbuffered/stdout-friendly logs
 try:
     sys.stdout.reconfigure(line_buffering=True)

@@ -24,6 +24,9 @@ from bisect import bisect_left
 import html
 from html.parser import HTMLParser
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Keep native threadpools from over-subscribing
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")

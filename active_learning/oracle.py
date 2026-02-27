@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRAIN_ROOT = REPO_ROOT / "train"
@@ -33,14 +36,12 @@ import utils.config as cfg
 ORACLE_RESPONSE_SCHEMA: Dict[str, object] = {
     "type": "object",
     "required": ["snippets"],
-    "additionalProperties": False,
     "properties": {
         "snippets": {
             "type": "array",
             "items": {
                 "type": "object",
                 "required": ["snippet_id", "segments"],
-                "additionalProperties": False,
                 "properties": {
                     "snippet_id": {"type": "string"},
                     "segments": {
@@ -48,7 +49,6 @@ ORACLE_RESPONSE_SCHEMA: Dict[str, object] = {
                         "items": {
                             "type": "object",
                             "required": ["label", "text"],
-                            "additionalProperties": False,
                             "properties": {
                                 "label": {"type": "string"},
                                 "text": {"type": "string"},
@@ -1235,11 +1235,18 @@ class GeminiBoundaryOracle:
                 flush=True,
             )
 
-        failed_states = {
-            "fallback_failed_segmentation",
-            "fallback_oracle_error",
-            "fallback_runtime_error",
-        }
+        if status == "al_oracle_failed":
+            raise RuntimeError(f"Oracle failed completely. Error: {error}")
+            
+        if final_parse_failed_ids or final_missing_ids:
+            summary = self._format_failed_segmentation_summary(
+                parse_failed_ids=final_parse_failed_ids,
+                missing_ids=final_missing_ids,
+                parse_failure_reasons=final_parse_failures,
+            )
+            raise RuntimeError(f"Oracle returned incomplete or unparseable segments. {summary}")
+
+        failed_states = set()
         snippet_sources: Dict[str, str] = {}
         finalized: Dict[str, List[OracleSegment]] = {}
         for snippet in snippets:
@@ -1247,15 +1254,6 @@ class GeminiBoundaryOracle:
             if sid in normalized_map:
                 snippet_sources[sid] = "model"
                 finalized[sid] = list(normalized_map.get(sid, []))
-            elif status == "al_oracle_failed":
-                snippet_sources[sid] = "fallback_oracle_error"
-                finalized[sid] = []
-            elif sid in final_parse_failures:
-                snippet_sources[sid] = "fallback_failed_segmentation"
-                finalized[sid] = []
-            else:
-                snippet_sources[sid] = "fallback_missing_snippet"
-                finalized[sid] = []
         model_output_count = int(sum(1 for state in snippet_sources.values() if state == "model"))
         failed_segmentation_count = int(
             sum(1 for state in snippet_sources.values() if str(state) in failed_states)
@@ -1352,8 +1350,9 @@ class GeminiBoundaryOracle:
             f"- Allowed labels (strict): {allowed_labels}.\n"
             "- If content does not match an allowed label clearly, use 'other'.\n"
             "- Avoid collapsing a whole snippet to a single generic label ('text'/'other') unless truly homogeneous.\n"
-            "- For markdown with frontmatter, keep only the frontmatter block as yaml; markdown headings/body stay markdown.\n"
+            "- For markdown with frontmatter, the frontmatter block should be labeled as yaml. Other yaml-formatted blocks within the document may also be labeled as yaml if they clearly match that format.\n"
             "- Be precise for embedded code: keep wrappers in host language, but label bodies by true language.\n"
+            "- For embedded strings or encodings (e.g., 'key=value'), the 'key=' part and quotes are the host language; only the raw 'value' is the embedded language.\n"
             "- For HTML-like regions, inline event-handler values and javascript: URLs are javascript_typescript.\n"
             "- For HTML-like regions, style attribute values are css; style wrappers remain host/wrapper text.\n"
             "- Example (correct SVG inline-style split):\n"

@@ -382,7 +382,7 @@ class LabelStore:
             if byte_buf.size == 0:
                 continue
 
-            labels = np.full((byte_buf.size,), fallback_id, dtype=np.uint8)
+            labels = np.full((byte_buf.size,), int(pad_label_id), dtype=np.uint8)
             segments = self._segment_dicts(row)
             for seg in segments:
                 try:

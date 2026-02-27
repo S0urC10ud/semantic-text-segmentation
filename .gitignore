@@ -18,6 +18,19 @@ gemini_segmentations/**
 downloader/legacy/**
 downloader/monitor_preprocessed**
 evaluation/data_b/**
+active_learning/benchmark_data/**
+active_learning/benchmark_results/**
+checkpoints/**
+confusion_images/**
+start_stuff.md
+uv.lock
+label_store.sqlite
+comparisons/**
+.env
+.agents/**
+**/preview.html
+active_learning/label_store.sqlite
+
 
 # Virtual environment directories
 # These are managed by tools like venv, uv, or conda and should not be committed.

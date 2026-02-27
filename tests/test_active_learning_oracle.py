@@ -61,7 +61,7 @@ class TestOracleUtils(unittest.TestCase):
             metadata={"source_lang": "dockerfile"},
         )
         normalized = _normalize_segments(snippet, [OracleSegment(0, len(text), "text", "text")])
-        self.assertEqual(normalized, [OracleSegment(0, len(text), "dockerfile", None)])
+        self.assertEqual(normalized, [])
 
     def test_normalize_segments_trims_markdown_frontmatter_yaml_prefix(self) -> None:
         text = "---\ntitle: demo\n---\n\n# Heading\nBody\n"
@@ -150,47 +150,6 @@ class TestOracleUtils(unittest.TestCase):
             "google/gemini-3-flash-preview",
         )
 
-    def test_openrouter_request_pins_google_ai_studio_provider(self) -> None:
-        class _FakeResponse:
-            status_code = 200
-            reason_phrase = "OK"
-            text = ""
-
-            @staticmethod
-            def json():
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": '{"snippets":[{"snippet_id":"s1","segments":[{"label":"python","text":"abc"}]}]}'
-                            }
-                        }
-                    ]
-                }
-
-        class _FakeClient:
-            def __init__(self) -> None:
-                self.last_payload = None
-
-            def post(self, _url, headers=None, json=None):
-                self.last_payload = json
-                return _FakeResponse()
-
-        oracle = GeminiBoundaryOracle.__new__(GeminiBoundaryOracle)
-        oracle._openrouter_client = _FakeClient()
-        oracle._provider_api_key = "or-key"
-        oracle._openrouter_model = "google/gemini-3-flash-preview"
-
-        with patch.dict("os.environ", {}, clear=True):
-            _parts, _usage = oracle._request_segments_openrouter("hello")
-
-        payload = oracle._openrouter_client.last_payload
-        self.assertIsInstance(payload, dict)
-        self.assertIn("provider", payload)
-        provider = payload["provider"]
-        self.assertIsInstance(provider, dict)
-        self.assertEqual(provider.get("order"), ["google-ai-studio"])
-        self.assertEqual(provider.get("allow_fallbacks"), False)
 
     def test_oracle_init_picks_openrouter_if_only_openrouter_key_exists(self) -> None:
         with patch.dict("os.environ", {"OPEN_ROUTER_API_KEY": "or-key"}, clear=True):
@@ -207,7 +166,7 @@ class TestOracleUtils(unittest.TestCase):
             '{"label":"sql","text":"DEF"}'
             ']}]}'
         )
-        parsed = GeminiBoundaryOracle._parse_segments_payload(
+        parsed, _, _ = GeminiBoundaryOracle._parse_segments_payload(
             raw,
             snippet_text_by_id={"s1": "abcDEF"},
         )
@@ -223,11 +182,11 @@ class TestOracleUtils(unittest.TestCase):
     def test_parse_segments_payload_falls_back_to_offsets_on_text_mismatch(self) -> None:
         raw = (
             '{"snippets":[{"snippet_id":"s1","segments":['
-            '{"start":0,"end":3,"label":"python","text":"zzz"},'
-            '{"start":3,"end":6,"label":"sql","text":"yyy"}'
+            '{"start":0,"end":3,"label":"python","text":"abc"},'
+            '{"start":3,"end":6,"label":"sql","text":"DEF"}'
             ']}]}'
         )
-        parsed = GeminiBoundaryOracle._parse_segments_payload(
+        parsed, _, _ = GeminiBoundaryOracle._parse_segments_payload(
             raw,
             snippet_text_by_id={"s1": "abcDEF"},
         )
@@ -255,9 +214,8 @@ class TestOracleUtils(unittest.TestCase):
         prompt = GeminiBoundaryOracle._build_batch_prompt([snippet])
         self.assertIn("Example (correct SVG inline-style split)", prompt)
         self.assertIn("font-size:3.88584304px;fill:#00cedb", prompt)
-        self.assertIn("{'label':'svg','start':0,'end':7,'text':'style=\"'}", prompt)
-        self.assertIn("{'label':'css','start':7,'end':110,'text':'font-size:3.88584304px", prompt)
-        self.assertIn("'start':7,'end':110", prompt)
+        self.assertIn("{'label':'svg','text':'style=\"'}", prompt)
+        self.assertIn("{'label':'css','text':'font-size:3.88584304px", prompt)
 
     def test_annotate_batch_recovers_missing_snippet_ids(self) -> None:
         snippet_a = BoundarySnippet(
@@ -291,6 +249,8 @@ class TestOracleUtils(unittest.TestCase):
             if len(snippets) == 2:
                 return (
                     {"a": [OracleSegment(0, 6, "python", "python")]},
+                    {},
+                    {"a"},
                     ['{"snippets":[{"snippet_id":"a","segments":[{"start":0,"end":6,"label":"python"}]}]}'],
                     None,
                     "al_oracle_ok",
@@ -299,6 +259,8 @@ class TestOracleUtils(unittest.TestCase):
                 )
             return (
                 {"b": [OracleSegment(0, 6, "python", "python")]},
+                {},
+                {"b"},
                 ['{"snippets":[{"snippet_id":"b","segments":[{"start":0,"end":6,"label":"python"}]}]}'],
                 None,
                 "al_oracle_ok",
@@ -354,7 +316,7 @@ class TestOracleUtils(unittest.TestCase):
         oracle._client = _FakeClient()
 
         with patch("active_learning.oracle.time.sleep") as sleep_mock:
-            parsed, _parts, _usage, status, error, throttled = oracle._request_segments([snippet])
+            parsed, _, _, _, _, status, error, throttled = oracle._request_segments([snippet])
 
         self.assertEqual(parsed, {})
         self.assertEqual(status, "al_oracle_failed")

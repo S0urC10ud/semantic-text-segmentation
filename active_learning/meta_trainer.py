@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--al-min-score", type=float, default=0.5)
     parser.add_argument("--al-context-chars", type=int, default=250)
     parser.add_argument("--al-gemini-model", type=str, default="gemini-3-flash-preview")
-    parser.add_argument("--al-gemini-batch-size", type=int, default=2)
+    parser.add_argument("--al-gemini-batch-size", type=int, default=32)
     parser.add_argument("--al-gemini-rate-limit-sleep-seconds", type=float, default=65.0)
     parser.add_argument("--al-gemini-rate-limit-max-retries", type=int, default=8)
     parser.add_argument("--al-gemini-missing-snippet-retries", type=int, default=2)
