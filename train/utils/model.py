@@ -699,3 +699,173 @@ def eval_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.nd
     loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
     acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
     return loss, acc
+
+
+# ---------------------------
+# Multi-GPU (pmap) utilities
+# ---------------------------
+
+def replicate_state(state: TrainState, num_devices: int) -> TrainState:
+    """Replicate a TrainState across `num_devices` for use with jax.pmap."""
+    devices = jax.local_devices()[:num_devices]
+    return jax.device_put_replicated(state, devices)
+
+
+def unreplicate_state(state: TrainState) -> TrainState:
+    """Extract single-device copy from a replicated TrainState (take device 0)."""
+    return jax.tree.map(lambda x: x[0], state)
+
+
+# --- pmap-ed train steps ---
+
+def _p_train_step_impl(state, batch_tokens, batch_labels, rng):
+    """Inner logic for pmap-ed single training step."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng}
+        )
+        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
+        return loss + intrinsic_oe, logits
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    loss = jax.lax.pmean(loss, axis_name="devices")
+    state = state.apply_gradients(grads=grads)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
+    acc = jax.lax.pmean(acc, axis_name="devices")
+    return state, loss, acc
+
+p_train_step = jax.pmap(_p_train_step_impl, axis_name="devices")
+
+
+def _p_train_step_with_oe_impl(state, batch_tokens, batch_labels, outlier_tokens, oe_lambda, rng):
+    """Inner logic for pmap-ed training step with OE regularization."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    dropout_rng_id, dropout_rng_oe = jax.random.split(dropout_rng)
+    oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
+
+    def loss_fn(params):
+        logits_id = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_id},
+        )
+        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        intrinsic_lambda = jnp.where(oe_lambda_f > 0.0, oe_lambda_f, 0.1)
+        intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
+
+        logits_out = state.apply_fn(
+            {"params": params},
+            outlier_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_oe},
+        )
+        ce_uniform = outlier_uniform_cross_entropy(logits_out)
+        total = ce_id + intrinsic_oe + oe_lambda_f * ce_uniform
+        return total, (logits_id, ce_uniform)
+
+    (loss, (logits_id, ce_uniform)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    loss = jax.lax.pmean(loss, axis_name="devices")
+    ce_uniform = jax.lax.pmean(ce_uniform, axis_name="devices")
+    state = state.apply_gradients(grads=grads)
+    acc = accuracy_masked(logits_id, batch_labels, tokens=batch_tokens)
+    acc = jax.lax.pmean(acc, axis_name="devices")
+    return state, loss, acc, ce_uniform
+
+p_train_step_with_oe = jax.pmap(
+    _p_train_step_with_oe_impl,
+    axis_name="devices",
+    in_axes=(0, 0, 0, 0, None, 0),  # oe_lambda is a scalar, not sharded
+)
+
+
+# --- pmap-ed microbatch grad steps ---
+
+def _p_microbatch_grad_step_impl(state, batch_tokens, batch_labels, rng):
+    """Inner logic for pmap-ed microbatch gradient step (no optimizer update)."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng},
+        )
+        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
+        return loss + intrinsic_oe, logits
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    loss = jax.lax.pmean(loss, axis_name="devices")
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
+    acc = jax.lax.pmean(acc, axis_name="devices")
+    return grads, loss, acc
+
+p_microbatch_grad_step = jax.pmap(_p_microbatch_grad_step_impl, axis_name="devices")
+
+
+def _p_microbatch_grad_step_with_oe_impl(state, batch_tokens, batch_labels, outlier_tokens, oe_lambda, rng):
+    """Inner logic for pmap-ed microbatch gradient step with OE."""
+    dropout_rng = jax.random.fold_in(rng, state.step)
+    dropout_rng_id, dropout_rng_oe = jax.random.split(dropout_rng)
+    oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
+
+    def loss_fn(params):
+        logits_id = state.apply_fn(
+            {"params": params},
+            batch_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_id},
+        )
+        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        intrinsic_lambda = jnp.where(oe_lambda_f > 0.0, oe_lambda_f, 0.1)
+        intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
+
+        logits_out = state.apply_fn(
+            {"params": params},
+            outlier_tokens,
+            train=True,
+            rngs={"dropout": dropout_rng_oe},
+        )
+        ce_uniform = outlier_uniform_cross_entropy(logits_out)
+        total = ce_id + intrinsic_oe + oe_lambda_f * ce_uniform
+        return total, (logits_id, ce_uniform)
+
+    (loss, (logits_id, ce_uniform)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    loss = jax.lax.pmean(loss, axis_name="devices")
+    ce_uniform = jax.lax.pmean(ce_uniform, axis_name="devices")
+    acc = accuracy_masked(logits_id, batch_labels, tokens=batch_tokens)
+    acc = jax.lax.pmean(acc, axis_name="devices")
+    return grads, loss, acc, ce_uniform
+
+p_microbatch_grad_step_with_oe = jax.pmap(
+    _p_microbatch_grad_step_with_oe_impl,
+    axis_name="devices",
+    in_axes=(0, 0, 0, 0, None, 0),  # oe_lambda is a scalar, not sharded
+)
+
+
+# --- pmap-ed eval step ---
+
+def _p_eval_step_impl(state, batch_tokens, batch_labels, rng):
+    """Inner logic for pmap-ed evaluation step."""
+    logits = state.apply_fn(
+        {"params": state.params},
+        batch_tokens,
+        train=False,
+        rngs={"dropout": rng}
+    )
+    loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
+    loss = jax.lax.pmean(loss, axis_name="devices")
+    acc = jax.lax.pmean(acc, axis_name="devices")
+    return loss, acc
+
+p_eval_step = jax.pmap(_p_eval_step_impl, axis_name="devices")

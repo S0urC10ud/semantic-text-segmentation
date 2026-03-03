@@ -61,6 +61,14 @@ from utils.model import (
     microbatch_grad_step_no_jit,
     microbatch_grad_step_with_oe_no_jit,
     grad_global_norm,
+    # Multi-GPU (pmap) variants
+    replicate_state,
+    unreplicate_state,
+    p_train_step,
+    p_train_step_with_oe,
+    p_microbatch_grad_step,
+    p_microbatch_grad_step_with_oe,
+    p_eval_step,
 )
 from utils.preview import build_preview_html
 
@@ -412,6 +420,12 @@ def main():
             "By default, fine-tuning disables OE and relies on monitor labels (including OTHER) only."
         ),
     )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=2,
+        help="Number of GPUs for data-parallel training (default: 2). Fails if fewer devices are available.",
+    )
 
     args = parser.parse_args()
 
@@ -472,6 +486,40 @@ def main():
         raise ValueError("--oe-lambda must be >= 0")
     if args.oe_ratio < 0.0:
         raise ValueError("--oe-ratio must be >= 0")
+
+    # --- Multi-GPU validation (fail fast) ---
+    num_devices = args.num_gpus
+    available_devices = jax.device_count()
+    if num_devices > available_devices:
+        raise RuntimeError(
+            f"\n{'='*60}\n"
+            f"  FATAL: Requested --num-gpus={num_devices} but only "
+            f"{available_devices} JAX device(s) available!\n"
+            f"  Detected devices: {jax.devices()}\n"
+            f"{'='*60}"
+        )
+    if num_devices < 1:
+        raise ValueError("--num-gpus must be >= 1")
+    if args.batch_size % num_devices != 0:
+        raise ValueError(
+            f"batch_size ({args.batch_size}) must be divisible by "
+            f"num-gpus ({num_devices}). "
+            f"Try --batch_size={args.batch_size - args.batch_size % num_devices + num_devices}"
+        )
+    per_device_batch = args.batch_size // num_devices
+    use_pmap = num_devices > 1
+
+    if args.no_jit:
+        print(
+            f"\n{'!'*60}\n"
+            f"  WARNING: --no_jit is active! Training will use a SINGLE\n"
+            f"  device without JIT compilation (ignoring --num-gpus={num_devices}).\n"
+            f"  This is for DEBUGGING ONLY and will be extremely slow.\n"
+            f"{'!'*60}\n",
+            flush=True,
+        )
+        use_pmap = False
+        num_devices = 1
 
     if args.fine_tune and not bool(getattr(args, "fine_tune_use_oe", False)):
         if float(args.oe_lambda) > 0.0 or float(args.oe_ratio) > 0.0:
@@ -709,6 +757,8 @@ def main():
             "active_learning_max_windows": int(args.active_learning_max_windows),
             "monitor_train_files": int(fine_tune_train_files_count),
             "monitor_eval_files": int(monitor_eval_files_count),
+            "num_gpus": int(num_devices),
+            "data_parallel": use_pmap,
         },
         allow_val_change=True,
     )
@@ -730,6 +780,12 @@ def main():
 
     # Warm up device early so any XLA/CUDA issues show now
     print("JAX devices:", jax.devices(), flush=True)
+    if use_pmap:
+        print(
+            f"Data-parallel training: {num_devices} GPUs, "
+            f"global batch={args.batch_size}, per-device batch={per_device_batch}",
+            flush=True,
+        )
     _ = jnp.ones((1,)).block_until_ready()
 
     rng = jax.random.PRNGKey(t_cfg.rng_seed)
@@ -870,6 +926,11 @@ def main():
         print("Restoring checkpoint...", flush=True)
         state = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
 
+    # Replicate state across devices for data-parallel training
+    if use_pmap:
+        state = replicate_state(state, num_devices)
+        print(f"State replicated across {num_devices} devices.", flush=True)
+
     # Switch to epoch-based batching
     from utils.epoch_batcher import EpochPrefetchBatcher, MonitorFineTuneBatcher
 
@@ -961,16 +1022,22 @@ def main():
             flush=True,
         )
 
-    train_step_fn = train_step_no_jit if t_cfg.no_jit else train_step
-    train_step_oe_fn = train_step_with_oe_no_jit if t_cfg.no_jit else train_step_with_oe
-    micro_step_fn = (
-        microbatch_grad_step_no_jit if t_cfg.no_jit else microbatch_grad_step
-    )
-    micro_step_oe_fn = (
-        microbatch_grad_step_with_oe_no_jit
-        if t_cfg.no_jit
-        else microbatch_grad_step_with_oe
-    )
+    # Select step functions: pmap (multi-GPU) vs jit (single-GPU) vs no_jit (debug)
+    if use_pmap:
+        train_step_fn = p_train_step
+        train_step_oe_fn = p_train_step_with_oe
+        micro_step_fn = p_microbatch_grad_step
+        micro_step_oe_fn = p_microbatch_grad_step_with_oe
+    elif t_cfg.no_jit:
+        train_step_fn = train_step_no_jit
+        train_step_oe_fn = train_step_with_oe_no_jit
+        micro_step_fn = microbatch_grad_step_no_jit
+        micro_step_oe_fn = microbatch_grad_step_with_oe_no_jit
+    else:
+        train_step_fn = train_step
+        train_step_oe_fn = train_step_with_oe
+        micro_step_fn = microbatch_grad_step
+        micro_step_oe_fn = microbatch_grad_step_with_oe
     accum_steps = max(1, int(t_cfg.accum_steps))
     if accum_steps > 1:
         effective_batch = accum_steps * d_cfg.batch_size
@@ -979,6 +1046,14 @@ def main():
             f"(effective batch size ≈ {effective_batch})",
             flush=True,
         )
+
+    def shard_batch(*arrays):
+        """Reshape arrays for pmap: (B, ...) -> (num_devices, B//num_devices, ...)."""
+        return tuple(a.reshape(num_devices, -1, *a.shape[1:]) for a in arrays)
+
+    def make_pmap_rngs(rng_key):
+        """Split an RNG key into one per device for pmap."""
+        return jax.random.split(rng_key, num_devices)
 
     def run_val_and_monitor_eval(
         step: int,
@@ -993,8 +1068,11 @@ def main():
         print(f"{title}...", flush=True)
         rng, eval_rng = jax.random.split(rng)
 
+        # Eval runs single-device; unreplicate if using pmap
+        eval_state = unreplicate_state(state) if use_pmap else state
+
         val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
-            state=state,
+            state=eval_state,
             dsets_by_lang=dsets["val"],
             L=d_cfg.window_max_bytes,
             batch_size=d_cfg.batch_size,
@@ -1026,7 +1104,7 @@ def main():
             eval_rng, monitor_rng = jax.random.split(eval_rng)
             limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)
             monitor_stats = evaluate_monitor_set(
-                state=state,
+                state=eval_state,
                 monitor_data=monitor_data,
                 L=d_cfg.window_max_bytes,
                 batch_size=d_cfg.batch_size,
@@ -1197,26 +1275,53 @@ def main():
                         and float(jax.random.uniform(oe_decision_rng, ()).item()) < oe_ratio
                     )
                     compute_start = time.time()
+                    if use_pmap:
+                        # Shard batch across devices
+                        batch_tokens, batch_labels = shard_batch(
+                            batch_tokens, batch_labels
+                        )
+                        step_rngs = make_pmap_rngs(step_base_rng)
                     if use_oe:
                         data_start = time.time()
                         outlier_tokens = oe_batcher.get()
                         outlier_tokens = sanitize_tokens(outlier_tokens)
                         data_time += time.time() - data_start
-                        state, loss, acc, oe_loss = train_step_oe_fn(
-                            state,
-                            batch_tokens,
-                            batch_labels,
-                            outlier_tokens,
-                            oe_lambda,
-                            step_base_rng,
-                        )
+                        if use_pmap:
+                            (outlier_tokens,) = shard_batch(outlier_tokens)
+                            state, loss, acc, oe_loss = train_step_oe_fn(
+                                state,
+                                batch_tokens,
+                                batch_labels,
+                                outlier_tokens,
+                                oe_lambda,
+                                step_rngs,
+                            )
+                            loss = float(loss[0])
+                            acc = float(acc[0])
+                            oe_loss = float(oe_loss[0])
+                        else:
+                            state, loss, acc, oe_loss = train_step_oe_fn(
+                                state,
+                                batch_tokens,
+                                batch_labels,
+                                outlier_tokens,
+                                oe_lambda,
+                                step_base_rng,
+                            )
                         oe_losses.append(float(oe_loss))
                         oe_batches_used += 1
                         del outlier_tokens
                     else:
-                        state, loss, acc = train_step_fn(
-                            state, batch_tokens, batch_labels, step_base_rng
-                        )
+                        if use_pmap:
+                            state, loss, acc = train_step_fn(
+                                state, batch_tokens, batch_labels, step_rngs
+                            )
+                            loss = float(loss[0])
+                            acc = float(acc[0])
+                        else:
+                            state, loss, acc = train_step_fn(
+                                state, batch_tokens, batch_labels, step_base_rng
+                            )
                     loss_value = float(loss)
                     acc_value = float(acc)
                     compute_time = time.time() - compute_start
@@ -1244,26 +1349,50 @@ def main():
                         )
                         micro_rng, use_rng = jax.random.split(micro_rng)
                         compute_start = time.time()
+                        if use_pmap:
+                            mb_tokens_s, mb_labels_s = shard_batch(mb_tokens, mb_labels)
+                            use_rngs = make_pmap_rngs(use_rng)
                         if use_oe:
                             data_start = time.time()
                             outlier_tokens = oe_batcher.get()
                             outlier_tokens = sanitize_tokens(outlier_tokens)
                             data_time += time.time() - data_start
-                            grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
-                                state,
-                                mb_tokens,
-                                mb_labels,
-                                outlier_tokens,
-                                oe_lambda,
-                                use_rng,
-                            )
+                            if use_pmap:
+                                (outlier_tokens_s,) = shard_batch(outlier_tokens)
+                                grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
+                                    state,
+                                    mb_tokens_s,
+                                    mb_labels_s,
+                                    outlier_tokens_s,
+                                    oe_lambda,
+                                    use_rngs,
+                                )
+                                micro_loss = float(micro_loss[0])
+                                micro_acc = float(micro_acc[0])
+                                micro_oe_loss = float(micro_oe_loss[0])
+                            else:
+                                grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
+                                    state,
+                                    mb_tokens,
+                                    mb_labels,
+                                    outlier_tokens,
+                                    oe_lambda,
+                                    use_rng,
+                                )
                             oe_losses.append(float(micro_oe_loss))
                             oe_batches_used += 1
                             del outlier_tokens
                         else:
-                            grads, micro_loss, micro_acc = micro_step_fn(
-                                state, mb_tokens, mb_labels, use_rng
-                            )
+                            if use_pmap:
+                                grads, micro_loss, micro_acc = micro_step_fn(
+                                    state, mb_tokens_s, mb_labels_s, use_rngs
+                                )
+                                micro_loss = float(micro_loss[0])
+                                micro_acc = float(micro_acc[0])
+                            else:
+                                grads, micro_loss, micro_acc = micro_step_fn(
+                                    state, mb_tokens, mb_labels, use_rng
+                                )
                         micro_loss_value = float(micro_loss)
                         micro_acc_value = float(micro_acc)
                         compute_time += time.time() - compute_start
@@ -1283,9 +1412,17 @@ def main():
 
                     scale = jnp.asarray(accum_steps, dtype=jnp.float32)
                     grad_accum = jtu.tree_map(lambda g: g / scale, grad_accum)
-                    grad_norm_value = float(grad_global_norm(grad_accum))
+                    if use_pmap:
+                        # Grads are already pmean-ed per device; take device 0 for norm
+                        grad_norm_value = float(grad_global_norm(
+                            jax.tree.map(lambda x: x[0], grad_accum)
+                        ))
+                        # Apply gradients on the replicated state
+                        state = state.apply_gradients(grads=grad_accum)
+                    else:
+                        grad_norm_value = float(grad_global_norm(grad_accum))
+                        state = state.apply_gradients(grads=grad_accum)
                     apply_start = time.time()
-                    state = state.apply_gradients(grads=grad_accum)
                     compute_time += time.time() - apply_start
                     loss = float(sum(losses) / len(losses))
                     acc = float(sum(accs) / len(accs))
@@ -1403,8 +1540,10 @@ def main():
                     rng, eval_rng = jax.random.split(rng)
 
                     # >>> NEW: eval with confusion matrix + metrics <<<
+                    # Eval runs single-device; unreplicate if using pmap
+                    eval_state = unreplicate_state(state) if use_pmap else state
                     val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
-                        state=state,
+                        state=eval_state,
                         dsets_by_lang=dsets["val"],
                         L=d_cfg.window_max_bytes,
                         batch_size=d_cfg.batch_size,
@@ -1443,7 +1582,7 @@ def main():
                         eval_rng, monitor_rng = jax.random.split(eval_rng)
                         limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)
                         monitor_stats = evaluate_monitor_set(
-                            state=state,
+                            state=eval_state,
                             monitor_data=monitor_data,
                             L=d_cfg.window_max_bytes,
                             batch_size=d_cfg.batch_size,
@@ -1547,13 +1686,14 @@ def main():
                         commit=True,
                     )
 
-                    # Save checkpoints (unchanged)
+                    # Save checkpoints — unreplicate if using pmap
                     ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(
                         t_cfg.ckpt_path
                     )
+                    save_state = unreplicate_state(state) if use_pmap else state
                     checkpoints.save_checkpoint(
                         ckpt_dir,
-                        state,
+                        save_state,
                         step=step,
                         prefix=ckpt_prefix,
                         keep=2,
@@ -1564,12 +1704,12 @@ def main():
                     try:
                         os.makedirs(ckpt_dir, exist_ok=True)
                         with open(ckpt_blob, "wb") as f:
-                            f.write(serialization.to_bytes(state.params))
+                            f.write(serialization.to_bytes(save_state.params))
                         base = os.path.basename(ckpt_blob)
                         stem, ext = os.path.splitext(base)
                         hist_path = os.path.join(ckpt_dir, f"{stem}-{step}{ext}")
                         with open(hist_path, "wb") as f:
-                            f.write(serialization.to_bytes(state.params))
+                            f.write(serialization.to_bytes(save_state.params))
                     except Exception as e:
                         print(
                             f"WARNING: writing raw params msgpack failed: {e}",
