@@ -228,7 +228,7 @@ def main():
     # 4KB fixed windows by default
     parser.add_argument("--bucket_step", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=24)
     parser.add_argument("--max_minutes", type=int, default=0)
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
     parser.add_argument("--dont_use_train_windows", action="store_true", default=False,

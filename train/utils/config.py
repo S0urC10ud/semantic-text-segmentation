@@ -93,7 +93,7 @@ class DataConfig:
     # Data source
     data_root: str = "data"
     allow_hf_fallback: bool = False
-    num_proc: int = 2
+    num_proc: int = 24
     seed: int = 42
 
     # Windowing and batching
@@ -113,7 +113,7 @@ class DataConfig:
 
     # Prefetching
     prefetch_batches: int = 4
-    num_workers: int = 2
+    num_workers: int = 24
     bucket_hold_steps: int = 10
 
     # Line injection augmentation
