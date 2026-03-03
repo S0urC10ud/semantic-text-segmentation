@@ -213,7 +213,7 @@ def main():
 
     # Data args
     parser.add_argument(
-        "--data_root", type=str, default="../downloader/arrow_out"
+        "--data_root", type=str, default=str(repo_root / "downloader" / "arrow_out")
     )
     parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -740,6 +740,21 @@ def main():
     num_params = count_params(state.params)
     print(f"Model created with {num_params/1e6:.2f}M parameters.", flush=True)
 
+    def _strict_load_params(target_params, raw_bytes, path_desc=""):
+        from flax.traverse_util import flatten_dict
+        msgpack_dict = serialization.msgpack_restore(raw_bytes)
+        flat_msgpack = flatten_dict(msgpack_dict)
+        flat_target = flatten_dict(serialization.to_state_dict(target_params))
+        missing_keys = set(flat_target.keys()) - set(flat_msgpack.keys())
+        extra_keys = set(flat_msgpack.keys()) - set(flat_target.keys())
+        if missing_keys or extra_keys:
+            raise ValueError(
+                f"Checkpoint structure mismatch for {path_desc}!\n"
+                f"Missing from checkpoint: {missing_keys}\n"
+                f"Extra in checkpoint: {extra_keys}"
+            )
+        return serialization.from_state_dict(target_params, msgpack_dict)
+
     # If we're starting a new fine-tune run (not resuming), load weights
     # from the source W&B run's checkpoint before configuring this run's
     # own checkpoint path.
@@ -803,7 +818,7 @@ def main():
                 )
                 with open(hist_path, "rb") as f:
                     raw = f.read()
-                params = serialization.from_bytes(state.params, raw)
+                params = _strict_load_params(state.params, raw, path_desc=hist_path)
                 state = state.replace(params=params)
             else:
                 # Fallback: try the Flax checkpoint layout
@@ -834,7 +849,7 @@ def main():
                 )
                 with open(src_ckpt_blob, "rb") as f:
                     raw = f.read()
-                params = serialization.from_bytes(state.params, raw)
+                params = _strict_load_params(state.params, raw, path_desc=src_ckpt_blob)
                 state = state.replace(params=params)
             else:
                 restored = checkpoints.restore_checkpoint(

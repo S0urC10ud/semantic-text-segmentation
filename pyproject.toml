@@ -20,11 +20,11 @@ dependencies = [
     "jaxlib==0.8.1",
     # Extra GPU support only on Linux (CUDA 13):
     # These wheels are Linux-only (manylinux_x86_64/aarch64), so we guard them.
-    #'jax-cuda13-plugin[with-cuda]==0.8.1; platform_system == "Linux"',
-    #'jax-cuda13-pjrt==0.8.1; platform_system == "Linux"',
+    'jax-cuda13-plugin[with-cuda]==0.8.1; platform_system == "Linux"',
+    'jax-cuda13-pjrt==0.8.1; platform_system == "Linux"',
     "orbax-checkpoint>=0.6.0",
     "tensorstore>=0.1.67",
-    "wandb==0.21.4",
+    "wandb>=0.21.5",
     "fastapi==0.116.2",
     "uvicorn==0.35.0",
     "matplotlib==3.10.6",
@@ -34,10 +34,10 @@ dependencies = [
     "python-dotenv>=1.2.1",
 ]
 
-#[project.optional-dependencies]
-#gpu = [
-#    "jax[cuda12]>=0.4.30",
-#]
+[project.optional-dependencies]
+gpu = [
+    "jax[cuda12]>=0.4.30",
+]
 
 [project.scripts]
 seg-train = "u_net:main"
