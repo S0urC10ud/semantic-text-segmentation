@@ -20,12 +20,25 @@ if TYPE_CHECKING:
 
 class EpochPrefetchBatcher:
     def __init__(self, dsets_by_lang: Dict[int, hfds.Dataset], data_cfg: "DataConfig"):
-        self.dsets_by_lang = dsets_by_lang
+        import multiprocessing as mp
+        import sys
+        from pathlib import Path
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from train.main import prepare_dsets_by_lang_with_splits
+        
         self.cfg = data_cfg
-        self.q = queue.Queue(maxsize=max(2, data_cfg.prefetch_batches))
-        self.stop_flag = threading.Event()
+        
+        # We cannot pass dsets_by_lang to the worker because it contains hfds.Dataset objects which cannot
+        # be pickled. Instead, we determine token targets in the main thread and pass arguments to the
+        # worker to rebuild the dataset.
+        
+        ctx = mp.get_context("spawn")
+        self.q = ctx.Queue(maxsize=max(2, data_cfg.prefetch_batches))
+        self.stop_flag = ctx.Event()
         self.buckets = data_cfg.buckets()
-        self.threads: List[threading.Thread] = []
+        self.threads: List[mp.Process] = []
 
         # Track per-language token usage to estimate fractional epochs
         self._lang_token_counts = {lang_id: 0 for lang_id in dsets_by_lang.keys()}
@@ -39,11 +52,9 @@ class EpochPrefetchBatcher:
             if length is None or length <= 0:
                 length = 1
             self._token_targets[lang_id] = max_len * length
-        self._lock = threading.Lock()
 
-        # Use fewer worker threads for better determinism
-        for wid in range(max(1, data_cfg.num_workers // 2)):
-            t = threading.Thread(target=self._worker, args=(wid,), daemon=True)
+        for wid in range(max(1, data_cfg.num_workers)):
+            t = ctx.Process(target=self._worker_entry, args=(self.cfg, wid, self.q, self.stop_flag, self.buckets), daemon=True)
             t.start()
             self.threads.append(t)
 
@@ -52,46 +63,64 @@ class EpochPrefetchBatcher:
         if valid.size == 0:
             return
         unique, counts = np.unique(valid, return_counts=True)
-        with self._lock:
-            for lid, cnt in zip(unique.astype(int), counts.astype(int)):
-                if lid in self._lang_token_counts:
-                    self._lang_token_counts[lid] += cnt
+        for lid, cnt in zip(unique.astype(int), counts.astype(int)):
+            if lid in self._lang_token_counts:
+                self._lang_token_counts[lid] += cnt
 
-    def _worker(self, wid: int):
-        random.seed(self.cfg.seed ^ wid ^ int(time.time()))
-        hold = max(1, self.cfg.bucket_hold_steps)
-        L = random.choice(self.buckets)
+    @staticmethod
+    def _worker_entry(cfg_obj, wid, q, stop_flag, buckets):
+        import sys
+        from pathlib import Path
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        
+        from train.main import prepare_dsets_by_lang_with_splits
+        import utils.config as cfg
+        
+        # Reconstruct the dataset entirely within the spawned process
+        dsets = prepare_dsets_by_lang_with_splits(
+            cfg_obj.data_root,
+            use_train_windows=True, # We assume True here for standard training workflow
+            include_languages=None, # It's harder to propagate specific langs, but the main logic relies on standard dirs
+            verbose=False,
+        )
+        dsets_by_lang = dsets["train"]
+
+        random.seed(cfg_obj.seed ^ wid ^ int(time.time()))
+        hold = max(1, cfg_obj.bucket_hold_steps)
+        L = random.choice(buckets)
         k = 0
 
-        while not self.stop_flag.is_set():
+        while not stop_flag.is_set():
             if k % hold == 0:
-                L = random.choice(self.buckets)
+                L = random.choice(buckets)
             k += 1
 
-            xb = np.full((self.cfg.batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
-            yb = np.full((self.cfg.batch_size, L), cfg.PAD_ID, dtype=np.uint8)
+            xb = np.full((cfg_obj.batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
+            yb = np.full((cfg_obj.batch_size, L), cfg.PAD_ID, dtype=np.uint8)
 
-            for i in range(self.cfg.batch_size):
-                x, y = make_training_window(self.dsets_by_lang, L, self.cfg)
+            for i in range(cfg_obj.batch_size):
+                x, y = make_training_window(dsets_by_lang, L, cfg_obj)
                 xb[i], yb[i] = x, y
-                self._update_token_counts(y)
 
             try:
-                self.q.put((xb, yb), timeout=1.0)
+                q.put((xb, yb), timeout=1.0)
             except queue.Full:
-                continue
+                pass
 
     def get_epochs(self) -> Dict[int, float]:
         """Approximate fractional epochs per language based on token usage."""
-        with self._lock:
-            epochs = {}
-            for lang_id, tokens in self._lang_token_counts.items():
-                target = max(1, self._token_targets.get(lang_id, 1))
-                epochs[lang_id] = tokens / target
-            return epochs
+        epochs = {}
+        for lang_id, tokens in self._lang_token_counts.items():
+            target = max(1, self._token_targets.get(lang_id, 1))
+            epochs[lang_id] = tokens / target
+        return epochs
 
     def get(self):
-        return self.q.get()
+        xb, yb = self.q.get()
+        self._update_token_counts(yb)
+        return xb, yb
 
     def close(self):
         self.stop_flag.set()
@@ -102,6 +131,8 @@ class EpochPrefetchBatcher:
                 break
         for t in self.threads:
             t.join(timeout=2.0)
+            if t.is_alive():
+                t.terminate()
 
 
 class MonitorFineTuneBatcher:
@@ -112,32 +143,42 @@ class MonitorFineTuneBatcher:
     """
 
     def __init__(self, monitor_data: Dict[str, np.ndarray], data_cfg: "DataConfig"):
-        self.files = monitor_data["files"]
-        self.segments = monitor_data["segments"]
-        self.contents = monitor_data["contents"]
+        import multiprocessing as mp
+        import sys
+        from pathlib import Path
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+            
         self.cfg = data_cfg
 
-        self.q = queue.Queue(maxsize=max(2, data_cfg.prefetch_batches))
-        self.stop_flag = threading.Event()
-        self.threads: List[threading.Thread] = []
+        ctx = mp.get_context("spawn")
+        self.q = ctx.Queue(maxsize=max(2, data_cfg.prefetch_batches))
+        self.stop_flag = ctx.Event()
+        self.threads: List[mp.Process] = []
 
-        self.total_files = int(len(self.files))
-        self._lock = threading.Lock()
+        self.total_files = int(len(monitor_data["files"]))
         self._processed_windows = 0
+        
+        # NOTE: monitor_data contains numpy memmap arrays. We pass the root path down
+        # rather than the instantiated memmap, because file descriptors/numpy arrays 
+        # may not pickle cleanly to a spawned process.
+        # So we pull the path from meta if it's there, otherwise assume a fallback.
+        monitor_root = monitor_data.get("meta", {}).get("root_path", "")
 
-        # Use fewer worker threads for better determinism
-        for wid in range(max(1, data_cfg.num_workers // 2)):
-            t = threading.Thread(target=self._worker, args=(wid,), daemon=True)
+        for wid in range(max(1, data_cfg.num_workers)):
+            t = ctx.Process(target=self._worker_entry, args=(self.cfg, wid, monitor_root, self.q, self.stop_flag, self.total_files), daemon=True)
             t.start()
             self.threads.append(t)
 
-    def _build_window(self, rng: np.random.Generator, window_len: int):
+    @staticmethod
+    def _build_window(rng: np.random.Generator, window_len: int, files, contents, segments, total_files):
         max_attempts = 32
         for _ in range(max_attempts):
-            if self.total_files <= 0:
+            if total_files <= 0:
                 return None
-            file_idx = int(rng.integers(0, self.total_files))
-            row = self.files[file_idx]
+            file_idx = int(rng.integers(0, total_files))
+            row = files[file_idx]
             byte_len = int(row["byte_len"])
             if byte_len <= 0:
                 continue
@@ -147,7 +188,7 @@ class MonitorFineTuneBatcher:
                 start = int(rng.integers(0, byte_len - window_len + 1))
             end = start + min(window_len, byte_len)
 
-            full_slice = self.contents[
+            full_slice = contents[
                 int(row["byte_start"]) : int(row["byte_start"]) + byte_len
             ]
             x = np.full(window_len, cfg.PAD_BYTE_ID, dtype=np.int32)
@@ -156,7 +197,7 @@ class MonitorFineTuneBatcher:
             y = np.full(window_len, cfg.PAD_ID, dtype=np.uint8)
             seg_start = int(row["seg_start"])
             seg_count = int(row["seg_count"])
-            seg_slice = self.segments[seg_start : seg_start + seg_count]
+            seg_slice = segments[seg_start : seg_start + seg_count]
             for seg in seg_slice:
                 seg_s = int(seg["start"])
                 seg_e = int(seg["end"])
@@ -172,27 +213,48 @@ class MonitorFineTuneBatcher:
             return x, y
         return None
 
-    def _worker(self, wid: int):
-        rng = np.random.default_rng(self.cfg.seed ^ wid ^ int(time.time()))
-        window_len = int(self.cfg.window_max_bytes)
+    @staticmethod
+    def _worker_entry(cfg_obj, wid, monitor_root, q, stop_flag, total_files):
+        import sys
+        from pathlib import Path
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+            
+        from train.utils.model import load_monitor_memmaps
+        import os
+        
+        # Load the memmap exclusively for this child process
+        if monitor_root and os.path.exists(monitor_root):
+             monitor_data = load_monitor_memmaps(Path(monitor_root))
+        else:
+             from train.main import default_fine_tune_train_root
+             monitor_data = load_monitor_memmaps(Path(default_fine_tune_train_root))
+
+        files = monitor_data["files"]
+        segments = monitor_data["segments"]
+        contents = monitor_data["contents"]
+
+        rng = np.random.default_rng(cfg_obj.seed ^ wid ^ int(time.time()))
+        window_len = int(cfg_obj.window_max_bytes)
         if window_len <= 0:
             window_len = cfg.MODEL_WINDOW_BYTES
 
-        while not self.stop_flag.is_set():
+        while not stop_flag.is_set():
             xb = np.full(
-                (self.cfg.batch_size, window_len),
+                (cfg_obj.batch_size, window_len),
                 cfg.PAD_BYTE_ID,
                 dtype=np.int32,
             )
             yb = np.full(
-                (self.cfg.batch_size, window_len),
+                (cfg_obj.batch_size, window_len),
                 cfg.PAD_ID,
                 dtype=np.uint8,
             )
 
             filled = 0
-            while filled < self.cfg.batch_size and not self.stop_flag.is_set():
-                window = self._build_window(rng, window_len)
+            while filled < cfg_obj.batch_size and not stop_flag.is_set():
+                window = MonitorFineTuneBatcher._build_window(rng, window_len, files, contents, segments, total_files)
                 if window is None:
                     # If we repeatedly fail to build a window, just break and
                     # reuse whatever portion we have so far.
@@ -201,28 +263,27 @@ class MonitorFineTuneBatcher:
                 xb[filled] = x
                 yb[filled] = y
                 filled += 1
-                with self._lock:
-                    self._processed_windows += 1
 
             if filled == 0:
                 continue
 
             try:
-                self.q.put((xb, yb), timeout=1.0)
+                q.put((xb, yb, filled), timeout=1.0)
             except queue.Full:
-                continue
+                pass
 
     def get_epochs(self) -> Dict[int, float]:
         """Approximate global epochs over the monitor memmap."""
-        with self._lock:
-            if self.total_files <= 0:
-                return {}
-            epochs = float(self._processed_windows) / float(self.total_files)
+        if self.total_files <= 0:
+            return {}
+        epochs = float(self._processed_windows) / float(self.total_files)
         # Use a single synthetic key for logging.
         return {0: epochs}
 
     def get(self):
-        return self.q.get()
+        xb, yb, filled = self.q.get()
+        self._processed_windows += filled
+        return xb, yb
 
     def close(self):
         self.stop_flag.set()
@@ -233,3 +294,5 @@ class MonitorFineTuneBatcher:
                 break
         for t in self.threads:
             t.join(timeout=2.0)
+            if t.is_alive():
+                t.terminate()

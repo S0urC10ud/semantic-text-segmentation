@@ -2914,41 +2914,65 @@ def make_line_injected_window(dsets_by_lang: Dict[int, hfds.Dataset],
 
 class PrefetchBatcher:
     def __init__(self, dsets_by_lang, data_cfg: "DataConfig"):
-        self.dsets_by_lang = dsets_by_lang
+        import multiprocessing as mp
+        import sys
+        from pathlib import Path
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
         self.cfg = data_cfg
-        # Smaller queue size to prevent memory buildup
-        self.q = queue.Queue(maxsize=max(2, data_cfg.prefetch_batches))
-        self.stop_flag = threading.Event()
+        
+        ctx = mp.get_context("spawn")
+        self.q = ctx.Queue(maxsize=max(2, data_cfg.prefetch_batches))
+        self.stop_flag = ctx.Event()
         self.buckets = data_cfg.buckets()
-        self.threads: List[threading.Thread] = []
+        self.threads: List[mp.Process] = []
         self._gc_counter = 0
-        # Use fewer worker threads
-        for wid in range(max(1, data_cfg.num_workers // 2)):
-            t = threading.Thread(target=self._worker, args=(wid,), daemon=True)
+
+        for wid in range(max(1, data_cfg.num_workers)):
+            t = ctx.Process(target=self._worker_entry, args=(self.cfg, wid, self.q, self.stop_flag, self.buckets), daemon=True)
             t.start()
             self.threads.append(t)
 
-    def _worker(self, wid: int):
-        random.seed(self.cfg.seed ^ wid ^ int(time.time()))
-        hold = max(1, self.cfg.bucket_hold_steps)
-        L = random.choice(self.buckets)
+    @staticmethod
+    def _worker_entry(cfg_obj, wid, q, stop_flag, buckets):
+        import sys
+        from pathlib import Path
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+            
+        from train.main import prepare_dsets_by_lang_with_splits
+        import utils.config as cfg
+        
+        dsets = prepare_dsets_by_lang_with_splits(
+            cfg_obj.data_root,
+            use_train_windows=True,
+            include_languages=None,
+            verbose=False,
+        )
+        dsets_by_lang = dsets["train"]
+
+        random.seed(cfg_obj.seed ^ wid ^ int(time.time()))
+        hold = max(1, cfg_obj.bucket_hold_steps)
+        L = random.choice(buckets)
         k = 0
-        while not self.stop_flag.is_set():
+        while not stop_flag.is_set():
             if k % hold == 0:
-                L = random.choice(self.buckets)
+                L = random.choice(buckets)
             k += 1
 
-            xb = np.full((self.cfg.batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
-            yb = np.full((self.cfg.batch_size, L), cfg.PAD_ID, dtype=np.uint8)
+            xb = np.full((cfg_obj.batch_size, L), cfg.PAD_BYTE_ID, dtype=np.int32)
+            yb = np.full((cfg_obj.batch_size, L), cfg.PAD_ID, dtype=np.uint8)
 
-            for i in range(self.cfg.batch_size):
-                x, y = make_training_window(self.dsets_by_lang, L, self.cfg)
+            for i in range(cfg_obj.batch_size):
+                x, y = make_training_window(dsets_by_lang, L, cfg_obj)
                 xb[i], yb[i] = x, y
 
             try:
-                self.q.put((xb, yb), timeout=1.0)
+                q.put((xb, yb), timeout=1.0)
             except queue.Full:
-                continue
+                pass
 
     def get(self):
         return self.q.get()
@@ -2963,3 +2987,5 @@ class PrefetchBatcher:
                 break
         for t in self.threads:
             t.join(timeout=2.0)
+            if t.is_alive():
+                t.terminate()

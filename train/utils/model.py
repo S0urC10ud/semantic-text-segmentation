@@ -505,7 +505,7 @@ def train_step_with_oe(
             rngs={"dropout": dropout_rng_id},
         )
         ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
-        intrinsic_lambda = float(oe_lambda) if float(oe_lambda) > 0.0 else 0.1
+        intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
         logits_out = state.apply_fn(
@@ -545,7 +545,7 @@ def train_step_with_oe_no_jit(
             rngs={"dropout": dropout_rng_id},
         )
         ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
-        intrinsic_lambda = float(oe_lambda) if float(oe_lambda) > 0.0 else 0.1
+        intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
         logits_out = state.apply_fn(
@@ -606,7 +606,7 @@ def microbatch_grad_step_with_oe(
             rngs={"dropout": dropout_rng_id},
         )
         ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
-        intrinsic_lambda = float(oe_lambda) if float(oe_lambda) > 0.0 else 0.1
+        intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
         logits_out = state.apply_fn(
@@ -665,7 +665,7 @@ def microbatch_grad_step_with_oe_no_jit(
             rngs={"dropout": dropout_rng_id},
         )
         ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
-        intrinsic_lambda = float(oe_lambda) if float(oe_lambda) > 0.0 else 0.1
+        intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
         logits_out = state.apply_fn(
