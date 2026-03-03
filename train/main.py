@@ -69,6 +69,7 @@ from utils.model import (
     p_microbatch_grad_step,
     p_microbatch_grad_step_with_oe,
     p_eval_step,
+    p_apply_gradients,
 )
 from utils.preview import build_preview_html
 
@@ -228,7 +229,7 @@ def main():
     # 4KB fixed windows by default
     parser.add_argument("--bucket_step", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--num_workers", type=int, default=24)
+    parser.add_argument("--num_workers", type=int, default=10)
     parser.add_argument("--max_minutes", type=int, default=0)
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
     parser.add_argument("--dont_use_train_windows", action="store_true", default=False,
@@ -1418,8 +1419,8 @@ def main():
                         grad_norm_value = float(grad_global_norm(
                             jax.tree.map(lambda x: x[0], grad_accum)
                         ))
-                        # Apply gradients on the replicated state
-                        state = state.apply_gradients(grads=grad_accum)
+                        # Apply gradients on the replicated state inside pmap
+                        state = p_apply_gradients(state, grad_accum)
                     else:
                         grad_norm_value = float(grad_global_norm(grad_accum))
                         state = state.apply_gradients(grads=grad_accum)
@@ -1762,9 +1763,10 @@ def main():
         final_reason = "completed"
         if error_reason:
             final_reason = f"error_{error_reason.__class__.__name__}"
+            current_step = int(unreplicate_state(state).step) if use_pmap else int(getattr(state, "step", 0))
             _wandb_safe_log(
                 {"meta/error_message": error_reason},
-                step=int(getattr(state, "step", 0)),
+                step=current_step,
                 commit=False,
             )
         elif stopped_reason:
@@ -1776,13 +1778,14 @@ def main():
             except Exception:
                 pass
 
+        current_step = int(unreplicate_state(state).step) if use_pmap else int(getattr(state, "step", 0))
         _wandb_safe_log(
             {
                 "meta/stopped_reason": final_reason,
                 "meta/pruned": int(pruned),
                 "meta/runtime_minutes": (time.time() - start_time) / 60.0,
             },
-            step=int(getattr(state, "step", 0)),
+            step=current_step,
         )
         wandb.finish()
         print("Training finished.", flush=True)

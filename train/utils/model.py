@@ -716,6 +716,12 @@ def unreplicate_state(state: TrainState) -> TrainState:
     return jax.tree.map(lambda x: x[0], state)
 
 
+@jax.pmap
+def p_apply_gradients(state: TrainState, grads):
+    """Apply gradients to a replicated TrainState under pmap."""
+    return state.apply_gradients(grads=grads)
+
+
 # --- pmap-ed train steps ---
 
 def _p_train_step_impl(state, batch_tokens, batch_labels, rng):
