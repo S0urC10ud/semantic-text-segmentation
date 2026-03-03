@@ -1206,7 +1206,8 @@ def main():
         )
         return val_loss, val_acc
 
-    if int(state.step) == 0:
+    current_step = int(unreplicate_state(state).step) if use_pmap else int(state.step)
+    if current_step == 0:
         run_val_and_monitor_eval(step=0, title="Baseline validation (step 0)")
 
     print("Starting training...", flush=True)
@@ -1228,7 +1229,7 @@ def main():
     try:
         try:
             # +1 to make sure the final eval and checkpoint triggers
-            for step in range(state.step, t_cfg.steps + 1):
+            for step in range(current_step, t_cfg.steps + 1):
                 # Periodic garbage collection
                 if step % 100 == 0:
                     gc.collect()  # Regular Python garbage collection
