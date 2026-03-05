@@ -2942,7 +2942,7 @@ class PrefetchBatcher:
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
             
-        from train.main import prepare_dsets_by_lang_with_splits
+        from train.utils.data import prepare_dsets_by_lang_with_splits
         import utils.config as cfg
         
         dsets = prepare_dsets_by_lang_with_splits(

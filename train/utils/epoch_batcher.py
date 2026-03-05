@@ -26,7 +26,7 @@ class EpochPrefetchBatcher:
         repo_root = str(Path(__file__).resolve().parents[2])
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
-        from train.main import prepare_dsets_by_lang_with_splits
+        from train.utils.data import prepare_dsets_by_lang_with_splits
         
         self.cfg = data_cfg
         
@@ -75,7 +75,7 @@ class EpochPrefetchBatcher:
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
         
-        from train.main import prepare_dsets_by_lang_with_splits
+        from train.utils.data import prepare_dsets_by_lang_with_splits
         import utils.config as cfg
         
         # Reconstruct the dataset entirely within the spawned process
@@ -225,11 +225,12 @@ class MonitorFineTuneBatcher:
         import os
         
         # Load the memmap exclusively for this child process
-        if monitor_root and os.path.exists(monitor_root):
-             monitor_data = load_monitor_memmaps(Path(monitor_root))
-        else:
-             from train.main import default_fine_tune_train_root
-             monitor_data = load_monitor_memmaps(Path(default_fine_tune_train_root))
+        if not monitor_root or not os.path.exists(monitor_root):
+            raise RuntimeError(
+                f"MonitorFineTuneBatcher worker {wid}: monitor_root is missing or "
+                f"does not exist: '{monitor_root}'"
+            )
+        monitor_data = load_monitor_memmaps(Path(monitor_root))
 
         files = monitor_data["files"]
         segments = monitor_data["segments"]
