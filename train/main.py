@@ -940,7 +940,7 @@ def main():
             raise RuntimeError(
                 "Fine-tune mode enabled but fine-tune data failed to load."
             )
-        data_fetcher = MonitorFineTuneBatcher(fine_tune_data, d_cfg)
+        data_fetcher = MonitorFineTuneBatcher(fine_tune_data, d_cfg, monitor_root=args.fine_tune_train_root)
     else:
         data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
 

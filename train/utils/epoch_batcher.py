@@ -142,14 +142,24 @@ class MonitorFineTuneBatcher:
     windows without any mixing/augmentation.
     """
 
-    def __init__(self, monitor_data: Dict[str, np.ndarray], data_cfg: "DataConfig"):
+    def __init__(
+        self,
+        monitor_data: Dict[str, np.ndarray],
+        data_cfg: "DataConfig",
+        monitor_root: str,
+    ):
         import multiprocessing as mp
         import sys
         from pathlib import Path
         repo_root = str(Path(__file__).resolve().parents[2])
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
-            
+
+        if not monitor_root:
+            raise ValueError(
+                "MonitorFineTuneBatcher requires a non-empty monitor_root path."
+            )
+
         self.cfg = data_cfg
 
         ctx = mp.get_context("spawn")
@@ -159,17 +169,28 @@ class MonitorFineTuneBatcher:
 
         self.total_files = int(len(monitor_data["files"]))
         self._processed_windows = 0
-        
-        # NOTE: monitor_data contains numpy memmap arrays. We pass the root path down
-        # rather than the instantiated memmap, because file descriptors/numpy arrays 
-        # may not pickle cleanly to a spawned process.
-        # So we pull the path from meta if it's there, otherwise assume a fallback.
-        monitor_root = monitor_data.get("meta", {}).get("root_path", "")
 
         for wid in range(max(1, data_cfg.num_workers)):
             t = ctx.Process(target=self._worker_entry, args=(self.cfg, wid, monitor_root, self.q, self.stop_flag, self.total_files), daemon=True)
             t.start()
             self.threads.append(t)
+
+        # Wait briefly then verify at least some workers survived startup
+        time.sleep(5)
+        self._check_workers_alive("during startup")
+
+    def _check_workers_alive(self, context: str = ""):
+        """Raise RuntimeError if all worker processes have died."""
+        alive = [t for t in self.threads if t.is_alive()]
+        if not alive:
+            dead_codes = [
+                f"worker-{i} exit={t.exitcode}" for i, t in enumerate(self.threads)
+            ]
+            raise RuntimeError(
+                f"All MonitorFineTuneBatcher workers are dead {context}! "
+                f"Statuses: {', '.join(dead_codes)}. "
+                f"Check stderr for worker tracebacks."
+            )
 
     @staticmethod
     def _build_window(rng: np.random.Generator, window_len: int, files, contents, segments, total_files):
@@ -281,10 +302,16 @@ class MonitorFineTuneBatcher:
         # Use a single synthetic key for logging.
         return {0: epochs}
 
-    def get(self):
-        xb, yb, filled = self.q.get()
-        self._processed_windows += filled
-        return xb, yb
+    def get(self, timeout: float = 30.0):
+        """Get a batch, with timeout and dead-worker detection."""
+        while True:
+            try:
+                xb, yb, filled = self.q.get(timeout=timeout)
+                self._processed_windows += filled
+                return xb, yb
+            except queue.Empty:
+                # Queue was empty for `timeout` seconds — check if workers died
+                self._check_workers_alive("while waiting for batch")
 
     def close(self):
         self.stop_flag.set()
@@ -297,3 +324,4 @@ class MonitorFineTuneBatcher:
             t.join(timeout=2.0)
             if t.is_alive():
                 t.terminate()
+
