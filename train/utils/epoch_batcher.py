@@ -221,7 +221,7 @@ class MonitorFineTuneBatcher:
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
             
-        from train.utils.model import load_monitor_memmaps
+        from train.utils.monitor_eval import load_monitor_memmaps
         import os
         
         # Load the memmap exclusively for this child process
