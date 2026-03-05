@@ -2934,6 +2934,24 @@ class PrefetchBatcher:
             t.start()
             self.threads.append(t)
 
+        # Wait briefly then verify at least some workers survived startup
+        import time as _time
+        _time.sleep(5)
+        self._check_workers_alive("during startup")
+
+    def _check_workers_alive(self, context: str = ""):
+        """Raise RuntimeError if all worker processes have died."""
+        alive = [t for t in self.threads if t.is_alive()]
+        if not alive:
+            dead_codes = [
+                f"worker-{i} exit={t.exitcode}" for i, t in enumerate(self.threads)
+            ]
+            raise RuntimeError(
+                f"All PrefetchBatcher workers are dead {context}! "
+                f"Statuses: {', '.join(dead_codes)}. "
+                f"Check stderr for worker tracebacks."
+            )
+
     @staticmethod
     def _worker_entry(cfg_obj, wid, q, stop_flag, buckets):
         import sys
@@ -2974,8 +2992,13 @@ class PrefetchBatcher:
             except queue.Full:
                 pass
 
-    def get(self):
-        return self.q.get()
+    def get(self, timeout: float = 30.0):
+        """Get a batch, with timeout and dead-worker detection."""
+        while True:
+            try:
+                return self.q.get(timeout=timeout)
+            except queue.Empty:
+                self._check_workers_alive("while waiting for batch")
 
     def close(self):
         self.stop_flag.set()
@@ -2989,3 +3012,4 @@ class PrefetchBatcher:
             t.join(timeout=2.0)
             if t.is_alive():
                 t.terminate()
+

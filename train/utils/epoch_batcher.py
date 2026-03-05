@@ -58,6 +58,23 @@ class EpochPrefetchBatcher:
             t.start()
             self.threads.append(t)
 
+        # Wait briefly then verify at least some workers survived startup
+        time.sleep(5)
+        self._check_workers_alive("during startup")
+
+    def _check_workers_alive(self, context: str = ""):
+        """Raise RuntimeError if all worker processes have died."""
+        alive = [t for t in self.threads if t.is_alive()]
+        if not alive:
+            dead_codes = [
+                f"worker-{i} exit={t.exitcode}" for i, t in enumerate(self.threads)
+            ]
+            raise RuntimeError(
+                f"All EpochPrefetchBatcher workers are dead {context}! "
+                f"Statuses: {', '.join(dead_codes)}. "
+                f"Check stderr for worker tracebacks."
+            )
+
     def _update_token_counts(self, labels: np.ndarray):
         valid = labels[labels != cfg.PAD_ID]
         if valid.size == 0:
@@ -117,10 +134,15 @@ class EpochPrefetchBatcher:
             epochs[lang_id] = tokens / target
         return epochs
 
-    def get(self):
-        xb, yb = self.q.get()
-        self._update_token_counts(yb)
-        return xb, yb
+    def get(self, timeout: float = 30.0):
+        """Get a batch, with timeout and dead-worker detection."""
+        while True:
+            try:
+                xb, yb = self.q.get(timeout=timeout)
+                self._update_token_counts(yb)
+                return xb, yb
+            except queue.Empty:
+                self._check_workers_alive("while waiting for batch")
 
     def close(self):
         self.stop_flag.set()
