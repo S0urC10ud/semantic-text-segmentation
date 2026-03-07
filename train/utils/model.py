@@ -264,7 +264,7 @@ class Mamba1D(nn.Module):
             h = nn.Dropout(rate=float(self.dropout_rate), deterministic=not train)(h)
 
         for _ in range(int(self.n_layers)):
-            h = nn.remat(MambaBlock1D, static_argnames=("train",))(
+            h = nn.remat(MambaBlock1D, static_argnums=(1,))(
                 d_model=int(self.d_model),
                 d_state=int(self.d_state),
                 expand=int(self.expand),
@@ -273,7 +273,7 @@ class Mamba1D(nn.Module):
                 dropout_rate=float(self.dropout_rate),
                 bidirectional=bool(self.bidirectional),
                 dtype=self.dtype,
-            )(h, train=train)
+            )(h, train)
 
         h = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(h)
         logits = nn.Dense(
