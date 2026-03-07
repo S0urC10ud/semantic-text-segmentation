@@ -13,6 +13,7 @@ Then open http://127.0.0.1:8000
 import os
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # Bypass Apple Silicon MPS 1D grouped conv bug
 
 import argparse
 import json
@@ -113,10 +114,12 @@ parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8000)
 parser.add_argument("--openapi", action="store_true")
 parser.add_argument(
+    "--tau",
     "--other-threshold",
+    dest="other_threshold",
     type=float,
-    default=0.2,
-    help="If >0, treat characters whose max softmax is below this as a virtual 'other' class.",
+    default=0.5,
+    help="If >0, treat characters whose max softmax is below this (tau) as a virtual 'other' class.",
 )
 args, _ = parser.parse_known_args()
 
