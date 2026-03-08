@@ -44,13 +44,14 @@ echo "🏋️ Starting FINE-TUNING small Mamba ..."
 echo "  \$(date)"
 echo "=============================="
 
-# IMPORTANT: REPLACE <YOUR_CHECKPOINT> with the actual msgpack file BEFORE running!
+# IMPORTANT: REPLACE iddg3pz9 with the actual msgpack file BEFORE running!
 # Example: "${REPO_DIR}/checkpoints/sweeps/run_id-150000.msgpack"
 python "${REPO_DIR}/train/main.py" \
     --arch mamba --model_dim 256 --mamba_layers 6 --mamba_d_state 16 --mamba_expand 1 \
     --batch_size 32 --accum_steps 1 --lr 2e-5 --steps 150000 --eval_every 250 \
     --monitor_other_threshold 0.5 --num_workers 12 --monitor_eval_limit 512 \
-    --fine-tune "${REPO_DIR}/checkpoints/sweeps/<YOUR_CHECKPOINT>.msgpack" --fine_tune_use_oe
+    --fine-tune "${REPO_DIR}/checkpoints/sweeps/iddg3pz9.msgpack" --fine_tune_use_oe \
+    --continue mdoo1pgt
 
 EXIT_CODE=\$?
 
