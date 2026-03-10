@@ -921,7 +921,18 @@ def main():
 
     ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(t_cfg.ckpt_path)
     ckpt_async_manager = checkpoints.AsyncManager() if hasattr(checkpoints, "AsyncManager") else None
-    if os.path.exists(ckpt_blob) or os.path.exists(
+    
+    if getattr(args, "continue_run_id", ""):
+        print(f"Restoring checkpoint for continued run {args.continue_run_id}...", flush=True)
+        restored = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
+        if restored is state:
+            raise RuntimeError(
+                f"FATAL: --continue was requested for run {args.continue_run_id}, "
+                f"but no Flax checkpoint could be loaded from {ckpt_dir} (prefix: {ckpt_prefix}). "
+                "Failing fast to prevent overwriting the run's history."
+            )
+        state = restored
+    elif os.path.exists(ckpt_blob) or os.path.exists(
         os.path.join(ckpt_dir, f"{ckpt_prefix}0")
     ):
         print("Restoring checkpoint...", flush=True)

@@ -1338,7 +1338,7 @@ class GeminiBoundaryOracle:
         allowed_labels = ", ".join(ALLOWED_LABELS_BY_ID)
         rules = (
             "Task: refine uncertain class boundaries for each snippet.\n"
-            "Return JSON with this schema:\n"
+            "Return valid JSON with this schema:\n"
             "{'snippets':[{'snippet_id':str,'segments':[{'label':str,'text':str}]}]}.\n"
             "Rules:\n"
             "- Prefer segmenting by exact text chunks: provide `text` and `label` for each segment in order.\n"
