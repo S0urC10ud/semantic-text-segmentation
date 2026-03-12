@@ -695,12 +695,24 @@ def _load_params_from_any(ckpt_path: str, params_template_for_msgpack):
             return serialization.from_state_dict(params_template_for_msgpack, candidate)
         except Exception:
             pass
-        # 1d) Last resort: template-free restore with _extract_params_tree
+        # 1d) Last resort: use msgpack_restore without template matching.
+        #     This skips shape/key validation but works when the checkpoint
+        #     was saved with different hyperparameters than the current config.
         try:
             restored = serialization.msgpack_restore(raw)
-            params_dict = _extract_params_tree(restored)
-            return serialization.from_state_dict(params_template_for_msgpack, params_dict)
+            if "params" in restored:
+                candidate = restored["params"]
+            else:
+                candidate = restored
+            # Convert numpy arrays to jax arrays recursively
+            return jax.tree.map(lambda x: jnp.asarray(x) if hasattr(x, 'shape') else x, candidate)
         except Exception as e:
+            # Print diagnostic info to help debug
+            try:
+                diag = serialization.msgpack_restore(raw)
+                print(f"[checkpoint debug] Top-level keys: {sorted(diag.keys())[:10]}", flush=True)
+            except Exception:
+                pass
             raise ValueError(
                 f"Failed to load msgpack checkpoint '{ckpt_path}'. "
                 f"Tried template-based and template-free approaches. Last error: {e}"
