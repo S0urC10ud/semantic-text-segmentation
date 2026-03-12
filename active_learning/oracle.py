@@ -1305,6 +1305,12 @@ class GeminiBoundaryOracle:
             error=error,
         )
 
+        # Extract token counts from usage_metadata for wandb logging.
+        _usage_serialized = llm_requestor._serialize_usage_metadata(usage_metadata)
+        prompt_tokens = int(_usage_serialized.get("prompt_token_count") or 0) if isinstance(_usage_serialized, dict) else 0
+        candidates_tokens = int(_usage_serialized.get("candidates_token_count") or 0) if isinstance(_usage_serialized, dict) else 0
+        total_tokens = int(_usage_serialized.get("total_token_count") or 0) if isinstance(_usage_serialized, dict) else 0
+
         batch_info: Dict[str, object] = {
             "run_id": run_id,
             "status": status,
@@ -1330,6 +1336,9 @@ class GeminiBoundaryOracle:
             },
             "error": error or "",
             "log_path": str(log_path),
+            "prompt_tokens": int(prompt_tokens),
+            "candidates_tokens": int(candidates_tokens),
+            "total_tokens": int(total_tokens),
         }
         return finalized, snippet_sources, batch_info
 

@@ -20,7 +20,10 @@ import flax.serialization as serialization
 import jax
 import jax.numpy as jnp
 import numpy as np
-import orbax.checkpoint as ocp
+try:
+    import orbax.checkpoint as ocp
+except Exception:  # pragma: no cover — orbax version mismatch on some envs
+    ocp = None
 from flax import linen as nn
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -679,6 +682,12 @@ def _load_params_from_any(ckpt_path: str, params_template_for_msgpack):
     step_dir = _find_latest_orbax_step_dir(p)
     if step_dir is None:
         raise FileNotFoundError(f"Checkpoint path not found/unsupported: {ckpt_path}")
+    if ocp is None:
+        raise RuntimeError(
+            f"Checkpoint '{ckpt_path}' appears to be an Orbax directory, "
+            "but orbax-checkpoint failed to import (likely JAX version mismatch). "
+            "Try: pip install --upgrade orbax-checkpoint jax jaxlib"
+        )
     step_dir_abs = step_dir.resolve().as_posix()
     ckptr = ocp.StandardCheckpointer()
 

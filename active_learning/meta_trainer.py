@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import re
 import secrets
 import shlex
 import sqlite3
@@ -13,6 +16,58 @@ from pathlib import Path
 def _run(cmd: list[str]) -> None:
     print("$ " + " ".join(shlex.quote(part) for part in cmd), flush=True)
     subprocess.run(cmd, check=True)
+
+
+def _run_capture(cmd: list[str]) -> str:
+    """Run a command, stream output to the terminal, and return all captured stdout."""
+    print("$ " + " ".join(shlex.quote(part) for part in cmd), flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    lines: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    return "".join(lines)
+
+
+def _parse_round_summary(stdout: str) -> dict[str, object]:
+    """Extract the last JSON object from round.py stdout output."""
+    # round.py prints the summary as the last JSON block via json.dumps().
+    # Walk backwards through lines to find the last complete JSON block.
+    lines = stdout.splitlines()
+    json_candidates: list[str] = []
+    brace_depth = 0
+    collecting = False
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if not collecting:
+            if "}" in stripped:
+                collecting = True
+                brace_depth = 0
+        if collecting:
+            json_candidates.insert(0, lines[i])
+            # Count closing braces as +1 (deeper), opening as -1 (shallower)
+            # since we're walking backwards.
+            brace_depth += stripped.count("}") - stripped.count("{")
+            if brace_depth <= 0:
+                break
+    if not json_candidates:
+        return {}
+    candidate = "\n".join(json_candidates)
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
 
 
 def _generate_wandb_run_id(length: int = 8) -> str:
@@ -34,6 +89,16 @@ def _count_oracle_refinement_rows(store_path: str) -> int:
         return 0
 
 
+def _sqlite_size_mb(store_path: str) -> float:
+    db_path = Path(store_path).expanduser().resolve()
+    if not db_path.exists():
+        return 0.0
+    try:
+        return float(db_path.stat().st_size) / (1024.0 * 1024.0)
+    except OSError:
+        return 0.0
+
+
 def _linear_oracle_mix_prob(
     refinement_rows: int,
     *,
@@ -45,6 +110,15 @@ def _linear_oracle_mix_prob(
     rows = max(0, int(refinement_rows))
     ratio = min(1.0, float(rows) / float(full_at))
     return max_p * ratio
+
+
+def _wandb_safe_log(data: dict, step: int, commit: bool = True) -> None:
+    try:
+        import wandb
+
+        wandb.log(data, step=step, commit=commit)
+    except Exception as e:
+        print(f"Wandb logging failed: {e}", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -128,6 +202,57 @@ def main() -> None:
     elif (args.wandb_run_id or "").strip():
         print("Ignoring --wandb-run-id because --wandb-mode=per-round.", flush=True)
 
+    # ── Initialize wandb for meta-trainer logging ──
+    wandb_available = False
+    try:
+        import wandb
+        from wandb import Settings
+
+        wandb_project = os.getenv("WANDB_PROJECT", "code-segmentation-v2")
+        wandb_kwargs: dict = {
+            "project": wandb_project,
+            "settings": Settings(init_timeout=300, start_method="thread"),
+            "tags": ["active-learning", "meta-trainer"],
+        }
+        if shared_wandb_run_id:
+            wandb_kwargs.update({"id": shared_wandb_run_id, "resume": "allow"})
+        wandb.init(**wandb_kwargs)
+        wandb.config.update(
+            {
+                "al_rounds": int(args.rounds),
+                "al_store": str(args.al_store),
+                "al_split": str(args.al_split),
+                "al_oracle": str(args.al_oracle),
+                "al_gemini_model": str(args.al_gemini_model),
+                "al_gemini_batch_size": int(args.al_gemini_batch_size),
+                "al_max_samples_per_lang": int(args.al_max_samples_per_lang),
+                "al_max_candidates_per_sample": int(args.al_max_candidates_per_sample),
+                "al_mix_prob_max": float(args.al_mix_prob),
+                "al_mix_full_at_rows": int(args.al_mix_full_at_rows),
+                "al_max_oracle_requests": None if args.al_unlimited_oracle else int(args.al_max_oracle_requests),
+                "train_steps_per_round": int(args.train_steps),
+                "ckpt_path": str(ckpt_path),
+            },
+            allow_val_change=True,
+        )
+        wandb_available = True
+        print(f"Wandb initialized for meta-trainer logging (project={wandb_project}).", flush=True)
+    except Exception as e:
+        print(f"⚠️  Wandb init failed; metrics will only be printed: {e}", flush=True)
+
+    # ── Cumulative counters across all rounds ──
+    cumulative = {
+        "llm_total_requests": 0,
+        "llm_retry_requests": 0,
+        "llm_rate_limit_retries": 0,
+        "llm_prompt_tokens": 0,
+        "llm_candidates_tokens": 0,
+        "llm_total_tokens": 0,
+        "llm_failed_batches": 0,
+        "refinements_stored": 0,
+        "oracle_queries_sent": 0,
+    }
+
     for round_idx in range(1, max(1, int(args.rounds)) + 1):
         print(f"\n=== META ROUND {round_idx}/{args.rounds}: acquire + oracle ===", flush=True)
         al_cmd = [
@@ -169,7 +294,10 @@ def main() -> None:
             al_cmd.extend(["--max-oracle-requests", str(max(0, int(args.al_max_oracle_requests)))])
         if args.al_langs:
             al_cmd.extend(["--langs", args.al_langs])
-        _run(al_cmd)
+
+        # Capture stdout so we can parse the JSON summary for wandb logging.
+        al_stdout = _run_capture(al_cmd)
+        round_summary = _parse_round_summary(al_stdout)
 
         refinement_rows = _count_oracle_refinement_rows(args.al_store)
         scheduled_mix_prob = _linear_oracle_mix_prob(
@@ -182,6 +310,72 @@ def main() -> None:
             f"refinement_rows={refinement_rows}, "
             f"mix_prob={scheduled_mix_prob:.4f} "
             f"(max={float(args.al_mix_prob):.3f} @ rows={int(args.al_mix_full_at_rows)}).",
+            flush=True,
+        )
+
+        # ── Update cumulative counters ──
+        cumulative["llm_total_requests"] += int(round_summary.get("llm_total_requests", 0))
+        cumulative["llm_retry_requests"] += int(round_summary.get("llm_retry_requests", 0))
+        cumulative["llm_rate_limit_retries"] += int(round_summary.get("llm_rate_limit_retries", 0))
+        cumulative["llm_prompt_tokens"] += int(round_summary.get("llm_prompt_tokens", 0))
+        cumulative["llm_candidates_tokens"] += int(round_summary.get("llm_candidates_tokens", 0))
+        cumulative["llm_total_tokens"] += int(round_summary.get("llm_total_tokens", 0))
+        cumulative["llm_failed_batches"] += int(round_summary.get("llm_failed_batches", 0))
+        cumulative["refinements_stored"] += int(round_summary.get("stored", 0))
+        cumulative["oracle_queries_sent"] += int(round_summary.get("samples", 0))
+
+        sqlite_mb = _sqlite_size_mb(args.al_store)
+
+        # ── Log AL round metrics to wandb ──
+        al_metrics = {
+            "al/round": int(round_idx),
+            # Per-round stats
+            "al/round_status": str(round_summary.get("status", "unknown")),
+            "al/candidate_snippets": int(round_summary.get("candidate_snippets", 0)),
+            "al/oracle_queries_sent": int(round_summary.get("samples", 0)),
+            "al/oracle_model_outputs": int(round_summary.get("oracle_model_outputs", 0)),
+            "al/oracle_fallback_snippets": int(round_summary.get("oracle_fallback_snippets", 0)),
+            "al/refinements_stored": int(round_summary.get("stored", 0)),
+            "al/inference_samples_scanned": int(round_summary.get("inference_samples", 0)),
+            # Per-round LLM request stats
+            "al/llm_requests": int(round_summary.get("llm_requests", 0)),
+            "al/llm_retry_requests": int(round_summary.get("llm_retry_requests", 0)),
+            "al/llm_total_requests": int(round_summary.get("llm_total_requests", 0)),
+            "al/llm_rate_limit_retries": int(round_summary.get("llm_rate_limit_retries", 0)),
+            "al/llm_failed_batches": int(round_summary.get("llm_failed_batches", 0)),
+            # Per-round LLM token stats
+            "al/llm_prompt_tokens": int(round_summary.get("llm_prompt_tokens", 0)),
+            "al/llm_candidates_tokens": int(round_summary.get("llm_candidates_tokens", 0)),
+            "al/llm_total_tokens": int(round_summary.get("llm_total_tokens", 0)),
+            # Cumulative totals
+            "al/cumulative_llm_total_requests": int(cumulative["llm_total_requests"]),
+            "al/cumulative_llm_retry_requests": int(cumulative["llm_retry_requests"]),
+            "al/cumulative_llm_rate_limit_retries": int(cumulative["llm_rate_limit_retries"]),
+            "al/cumulative_llm_prompt_tokens": int(cumulative["llm_prompt_tokens"]),
+            "al/cumulative_llm_candidates_tokens": int(cumulative["llm_candidates_tokens"]),
+            "al/cumulative_llm_total_tokens": int(cumulative["llm_total_tokens"]),
+            "al/cumulative_llm_failed_batches": int(cumulative["llm_failed_batches"]),
+            "al/cumulative_refinements_stored": int(cumulative["refinements_stored"]),
+            "al/cumulative_oracle_queries_sent": int(cumulative["oracle_queries_sent"]),
+            # Global state
+            "al/total_refinement_rows": int(refinement_rows),
+            "al/sqlite_size_mb": float(round(sqlite_mb, 3)),
+            "al/replay_mix_prob": float(scheduled_mix_prob),
+        }
+        if wandb_available:
+            _wandb_safe_log(al_metrics, step=round_idx, commit=True)
+        print(
+            f"AL round {round_idx} metrics: "
+            f"queries={al_metrics['al/oracle_queries_sent']}, "
+            f"stored={al_metrics['al/refinements_stored']}, "
+            f"llm_requests={al_metrics['al/llm_total_requests']}, "
+            f"llm_tokens={al_metrics['al/llm_total_tokens']}, "
+            f"retries={al_metrics['al/llm_retry_requests']}, "
+            f"rate_limit_retries={al_metrics['al/llm_rate_limit_retries']}, "
+            f"failed_batches={al_metrics['al/llm_failed_batches']}, "
+            f"sqlite={sqlite_mb:.2f}MB, "
+            f"cum_requests={cumulative['llm_total_requests']}, "
+            f"cum_tokens={cumulative['llm_total_tokens']}",
             flush=True,
         )
 
@@ -217,6 +411,23 @@ def main() -> None:
     if shared_wandb_run_id:
         finished += f" | shared_wandb_run_id: {shared_wandb_run_id}"
     print(finished, flush=True)
+    print(
+        "Cumulative stats: "
+        f"llm_requests={cumulative['llm_total_requests']}, "
+        f"llm_tokens={cumulative['llm_total_tokens']}, "
+        f"retries={cumulative['llm_retry_requests']}, "
+        f"rate_limit_retries={cumulative['llm_rate_limit_retries']}, "
+        f"failed_batches={cumulative['llm_failed_batches']}, "
+        f"refinements={cumulative['refinements_stored']}, "
+        f"queries={cumulative['oracle_queries_sent']}",
+        flush=True,
+    )
+
+    if wandb_available:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -667,6 +667,46 @@ def run_one_round(
         f"Marked {queried_marked} inference samples as queried after storing refinements.",
         flush=True,
     )
+    # ── Aggregate oracle batch-level diagnostics for wandb logging ──
+    _oracle_stats: Dict[str, object] = {}
+    if isinstance(oracle_batches, list) and oracle_batches:
+        _oracle_stats = {
+            "llm_requests": int(len(oracle_batches)),
+            "llm_retry_requests": int(
+                sum(int(b.get("missing_retry_requests", 0)) for b in oracle_batches)
+                + sum(int(b.get("parse_failed_retry_requests", 0)) for b in oracle_batches)
+            ),
+            "llm_rate_limit_retries": int(
+                sum(int(b.get("rate_limit_retries", 0)) for b in oracle_batches)
+            ),
+            "llm_total_requests": int(
+                len(oracle_batches)
+                + sum(int(b.get("missing_retry_requests", 0)) for b in oracle_batches)
+                + sum(int(b.get("parse_failed_retry_requests", 0)) for b in oracle_batches)
+            ),
+            "llm_prompt_tokens": int(
+                sum(int(b.get("prompt_tokens", 0)) for b in oracle_batches)
+            ),
+            "llm_candidates_tokens": int(
+                sum(int(b.get("candidates_tokens", 0)) for b in oracle_batches)
+            ),
+            "llm_total_tokens": int(
+                sum(int(b.get("total_tokens", 0)) for b in oracle_batches)
+            ),
+            "llm_failed_batches": int(len(failed_batches)),
+            "llm_initial_missing": int(
+                sum(int(b.get("initial_missing_snippets", 0)) for b in oracle_batches)
+            ),
+            "llm_initial_parse_failed": int(
+                sum(int(b.get("initial_parse_failed_snippets", 0)) for b in oracle_batches)
+            ),
+            "llm_recovered_missing": int(
+                sum(int(b.get("recovered_missing_snippets", 0)) for b in oracle_batches)
+            ),
+            "llm_recovered_parse_failed": int(
+                sum(int(b.get("recovered_parse_failed_snippets", 0)) for b in oracle_batches)
+            ),
+        }
     return {
         "round_id": round_id,
         "status": "ok",
@@ -680,6 +720,7 @@ def run_one_round(
         "oracle_model_outputs": int(model_output_snippets),
         "oracle_fallback_snippets": int(len(queried_snippets) - model_output_snippets),
         "timestamp": _now_utc(),
+        **_oracle_stats,
     }
 
 
