@@ -260,6 +260,7 @@ def _build_snippets_for_sample(
         context_chars=int(context_chars),
         top_k=int(max_candidates_per_sample),
         min_score=float(min_score),
+        other_id=getattr(cfg, "OTHER_CLASS_INDEX", None),
     )
     sample_hash = _hash_text(normalized)
     out: List[tuple[BoundarySnippet, CandidateSpan]] = []
@@ -290,6 +291,7 @@ def _build_snippets_for_sample(
                 "score": float(cand.score),
                 "entropy_mean": float(cand.entropy_mean),
                 "flip_rate": float(cand.flip_rate),
+                "is_other_boundary": bool(cand.is_other_boundary),
                 "left_label_id": int(cand.left_label),
                 "right_label_id": int(cand.right_label),
                 "left_label": id2lang.get(int(cand.left_label), "other"),
@@ -413,6 +415,7 @@ def run_one_round(
                     "score": float(cand.score),
                     "entropy_mean": float(cand.entropy_mean),
                     "flip_rate": float(cand.flip_rate),
+                    "is_other_boundary": bool(cand.is_other_boundary),
                     "left_label_id": int(cand.left_label),
                     "right_label_id": int(cand.right_label),
                     "left_label": cfg.ID2LANG.get(int(cand.left_label), "other"),

@@ -18,6 +18,7 @@ class CandidateSpan:
     flip_rate: float
     left_label: int
     right_label: int
+    is_other_boundary: bool = False
 
 
 def normalized_entropy(probs: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -80,12 +81,24 @@ def select_candidate_spans(
     min_score: float = 0.2,
     top_k: int = 16,
     min_gap_chars: int = 24,
+    other_id: int | None = None,
+    otherness_weight: float = 1.0,
 ) -> List[CandidateSpan]:
     """
     Select boundary-centric candidate spans from model probabilities.
 
-    Score per boundary = entropy_weight * mean_entropy(local) +
-                         flip_weight * flip_rate(local).
+    For *normal* boundaries (neither side is ``other_id``):
+        score = entropy_weight * mean_entropy(local) +
+                flip_weight * flip_rate(local).
+
+    For *other-adjacent* boundaries (one or both sides == ``other_id``):
+        score = otherness_weight * (1 - mean_entropy(local)).
+
+    The "other" class is trained via OE to output a uniform distribution
+    (maximum entropy).  Using ``1 - entropy`` as the score means regions
+    where the model already outputs uniform (correct) get a *low* score,
+    while regions where the model wrongly outputs peaked predictions for
+    content that should be "other" get a *high* score.
     """
     arr = np.asarray(probs, dtype=np.float32)
     if arr.ndim != 2 or arr.shape[0] == 0:
@@ -111,12 +124,28 @@ def select_candidate_spans(
         local_right = min(n, boundary + int(boundary_radius) + 1)
         ent_mean = float(np.mean(ent[local_left:local_right])) if local_right > local_left else 0.0
         flip = _flip_rate_around(pred, boundary, int(boundary_radius))
-        score = float(entropy_weight) * ent_mean + float(flip_weight) * flip
-        if score < float(min_score):
-            continue
 
         left_label = int(pred[max(0, boundary - 1)])
         right_label = int(pred[min(n - 1, boundary)])
+
+        # Detect whether this boundary involves the "other" class.
+        is_other = (
+            other_id is not None
+            and (left_label == other_id or right_label == other_id)
+        )
+
+        if is_other:
+            # For "other"-adjacent boundaries: score = 1 - entropy.
+            # Model already outputs uniform → score ≈ 0 (correct, skip).
+            # Model outputs peaked → score ≈ 1 (wrong, needs oracle).
+            score = float(otherness_weight) * (1.0 - ent_mean)
+        else:
+            # Normal boundary: high entropy + high flip rate → high score.
+            score = float(entropy_weight) * ent_mean + float(flip_weight) * flip
+
+        if score < float(min_score):
+            continue
+
         start = max(0, int(boundary) - int(context_chars))
         end = min(n, int(boundary) + int(context_chars))
         if end <= start:
@@ -132,6 +161,7 @@ def select_candidate_spans(
                 flip_rate=flip,
                 left_label=left_label,
                 right_label=right_label,
+                is_other_boundary=is_other,
             )
         )
 

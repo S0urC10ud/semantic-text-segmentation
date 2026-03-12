@@ -128,6 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rounds", type=int, default=300)
     parser.add_argument("--python", type=str, default=sys.executable)
     parser.add_argument("--ckpt-path", type=str, default="train/checkpoints/al_loop.msgpack")
+    parser.add_argument("--arch", type=str, default=None, choices=("unet1d", "mamba"),
+                        help="Model architecture (auto-detected from checkpoint if omitted).")
     parser.add_argument("--data-root", type=str, default="downloader/arrow_out")
     parser.add_argument("--train-max-minutes", type=int, default=10)
     parser.add_argument("--train-steps", type=int, default=10_000)
@@ -288,6 +290,8 @@ def main() -> None:
             "--gemini-missing-snippet-retries",
             str(args.al_gemini_missing_snippet_retries),
         ]
+        if args.arch:
+            al_cmd.extend(["--arch", args.arch])
         if args.al_unlimited_oracle:
             al_cmd.append("--unlimited-oracle")
         else:
