@@ -336,6 +336,9 @@ def _infer_checkpoint_architecture(ckpt_path: Path) -> Dict[str, Any]:
         params = serialization.msgpack_restore(p.read_bytes())
     except Exception:
         return result
+    if isinstance(params, Mapping) and "params" in params:
+        params = params["params"]
+    params = _normalize_checkpoint_param_tree(params)
 
     # Architecture (unet1d vs mamba): detect from top-level param keys.
     try:
@@ -444,6 +447,28 @@ def _infer_checkpoint_architecture(ckpt_path: Path) -> Dict[str, Any]:
         pass
 
     return result
+
+
+def _normalize_checkpoint_param_tree(candidate, template=None):
+    """
+    Canonicalize checkpoint module names that differ only because training used
+    `nn.remat(...)`, which prefixes saved Mamba block names with `Checkpoint`.
+    """
+    if not isinstance(candidate, Mapping):
+        return candidate
+    template_map = template if isinstance(template, Mapping) else None
+    changed = False
+    normalized = {}
+    for key, value in candidate.items():
+        new_key = key
+        if isinstance(key, str) and key.startswith("CheckpointMambaBlock1D_"):
+            stripped = key[len("Checkpoint"):]
+            if template_map is None or stripped in template_map:
+                new_key = stripped
+        child_template = template_map.get(new_key) if template_map is not None else None
+        normalized[new_key] = _normalize_checkpoint_param_tree(value, child_template)
+        changed = changed or new_key != key
+    return normalized if changed else candidate
 
 def _resolve_hparam(cli_value, wandb_value, inferred_value, default_value):
     """Pick a hyperparameter value while recording its source."""
@@ -692,6 +717,7 @@ def _load_params_from_any(ckpt_path: str, params_template_for_msgpack):
                 candidate = restored["params"]
             else:
                 candidate = restored
+            candidate = _normalize_checkpoint_param_tree(candidate, params_template_for_msgpack)
             return serialization.from_state_dict(params_template_for_msgpack, candidate)
         except Exception:
             pass
@@ -704,6 +730,7 @@ def _load_params_from_any(ckpt_path: str, params_template_for_msgpack):
                 candidate = restored["params"]
             else:
                 candidate = restored
+            candidate = _normalize_checkpoint_param_tree(candidate, params_template_for_msgpack)
             # Convert numpy arrays to jax arrays recursively
             return jax.tree.map(lambda x: jnp.asarray(x) if hasattr(x, 'shape') else x, candidate)
         except Exception as e:
