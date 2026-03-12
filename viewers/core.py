@@ -672,11 +672,39 @@ def _load_params_from_any(ckpt_path: str, params_template_for_msgpack):
     if p.is_file():
         with open(p, "rb") as f:
             raw = f.read()
+        # 1a) Template-based restore: raw params at top level
         try:
             return serialization.from_bytes(params_template_for_msgpack, raw)
         except Exception:
+            pass
+        # 1b) Template-based restore: params wrapped in {"params": ...}
+        try:
             dct = serialization.from_bytes({"params": params_template_for_msgpack}, raw)
             return dct["params"]
+        except Exception:
+            pass
+        # 1c) Template-free restore: load dict, then extract params subtree
+        try:
+            restored = serialization.msgpack_restore(raw)
+            # The checkpoint might be raw params, or wrapped in {"params": ...},
+            # or be a full TrainState with nested params.
+            if "params" in restored:
+                candidate = restored["params"]
+            else:
+                candidate = restored
+            return serialization.from_state_dict(params_template_for_msgpack, candidate)
+        except Exception:
+            pass
+        # 1d) Last resort: template-free restore with _extract_params_tree
+        try:
+            restored = serialization.msgpack_restore(raw)
+            params_dict = _extract_params_tree(restored)
+            return serialization.from_state_dict(params_template_for_msgpack, params_dict)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load msgpack checkpoint '{ckpt_path}'. "
+                f"Tried template-based and template-free approaches. Last error: {e}"
+            ) from e
 
     # --- Case 2: an Orbax directory (step dir or its parent) ---
     step_dir = _find_latest_orbax_step_dir(p)
