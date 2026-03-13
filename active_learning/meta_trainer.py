@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import sqlite3
 import string
 import subprocess
@@ -121,6 +122,53 @@ def _wandb_safe_log(data: dict, step: int, commit: bool = True) -> None:
         print(f"Wandb logging failed: {e}", flush=True)
 
 
+def _resolve_ckpt_paths(path: str) -> tuple[Path, str, Path]:
+    blob_abs = Path(path).expanduser().resolve()
+    ckpt_dir_abs = blob_abs.parent
+    prefix = blob_abs.name + "-"
+    return ckpt_dir_abs, prefix, blob_abs
+
+
+def _latest_train_checkpoint_step(path: str) -> int:
+    ckpt_dir, prefix, _ = _resolve_ckpt_paths(path)
+    if not ckpt_dir.exists():
+        return 0
+    latest = 0
+    for entry in ckpt_dir.iterdir():
+        name = entry.name
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix):]
+        if suffix.isdigit():
+            latest = max(latest, int(suffix))
+    return latest
+
+
+def _ensure_bootstrap_checkpoint(target_path: str, init_path: str | None) -> None:
+    target = Path(target_path).expanduser().resolve()
+    if target.exists():
+        return
+    if not init_path:
+        raise FileNotFoundError(
+            f"Checkpoint not found at {target}. Pass --init-ckpt-path to bootstrap a fresh run."
+        )
+    source = Path(init_path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Bootstrap checkpoint not found: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    print(f"Bootstrapped checkpoint: {source} -> {target}", flush=True)
+
+
+def _compute_train_target_step(current_step: int, additional_updates: int) -> int:
+    updates = max(0, int(additional_updates))
+    if updates == 0:
+        return max(0, int(current_step))
+    # train/main.py loops inclusively over `range(current_step, steps + 1)`,
+    # so subtract one here to request exactly `additional_updates` optimizer steps.
+    return max(0, int(current_step) + updates - 1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train -> active-learning -> train loop using the default training script."
@@ -128,6 +176,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rounds", type=int, default=300)
     parser.add_argument("--python", type=str, default=sys.executable)
     parser.add_argument("--ckpt-path", type=str, default="train/checkpoints/al_loop.msgpack")
+    parser.add_argument(
+        "--init-ckpt-path",
+        type=str,
+        default="",
+        help=(
+            "Optional source checkpoint used to bootstrap --ckpt-path when starting a fresh run "
+            "with a new checkpoint path."
+        ),
+    )
     parser.add_argument("--arch", type=str, default=None, choices=("unet1d", "mamba"),
                         help="Model architecture (auto-detected from checkpoint if omitted).")
     parser.add_argument("--data-root", type=str, default="downloader/arrow_out")
@@ -144,7 +201,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--wandb-run-id",
         type=str,
         default="",
-        help="Optional W&B run id for shared mode; if omitted, one is generated.",
+        help="Optional shared W&B run id for child training processes; if omitted, one is generated.",
+    )
+    parser.add_argument(
+        "--wandb-parent-run-id",
+        type=str,
+        default="",
+        help="Optional W&B run id for the parent meta-trainer process; if omitted, one is generated.",
     )
 
     parser.add_argument("--al-store", type=str, default="active_learning/label_store.sqlite")
@@ -194,15 +257,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     ckpt_path = str(Path(args.ckpt_path))
+    init_ckpt_path = (args.init_ckpt_path or "").strip() or None
+    _ensure_bootstrap_checkpoint(ckpt_path, init_ckpt_path)
     shared_wandb_run_id = ""
+    parent_wandb_run_id = (args.wandb_parent_run_id or "").strip() or _generate_wandb_run_id()
+    initial_train_step = _latest_train_checkpoint_step(ckpt_path)
+    shared_schedule_final_step = _compute_train_target_step(
+        initial_train_step,
+        int(args.rounds) * int(args.train_steps),
+    )
     if args.wandb_mode == "shared":
         shared_wandb_run_id = (args.wandb_run_id or "").strip() or _generate_wandb_run_id()
         print(
-            f"Using shared W&B run id across all rounds: {shared_wandb_run_id}",
+            f"Using shared child W&B run id across all rounds: {shared_wandb_run_id}",
             flush=True,
         )
     elif (args.wandb_run_id or "").strip():
         print("Ignoring --wandb-run-id because --wandb-mode=per-round.", flush=True)
+    print(
+        f"Using parent W&B run id for meta-trainer logging: {parent_wandb_run_id}",
+        flush=True,
+    )
 
     # ── Initialize wandb for meta-trainer logging ──
     wandb_available = False
@@ -215,12 +290,14 @@ def main() -> None:
             "project": wandb_project,
             "settings": Settings(init_timeout=300, start_method="thread"),
             "tags": ["active-learning", "meta-trainer"],
+            "id": parent_wandb_run_id,
+            "resume": "allow",
         }
-        if shared_wandb_run_id:
-            wandb_kwargs.update({"id": shared_wandb_run_id, "resume": "allow"})
         wandb.init(**wandb_kwargs)
         wandb.config.update(
             {
+                "parent_wandb_run_id": str(parent_wandb_run_id),
+                "child_wandb_run_id": str(shared_wandb_run_id) if shared_wandb_run_id else None,
                 "al_rounds": int(args.rounds),
                 "al_store": str(args.al_store),
                 "al_split": str(args.al_split),
@@ -233,6 +310,7 @@ def main() -> None:
                 "al_mix_full_at_rows": int(args.al_mix_full_at_rows),
                 "al_max_oracle_requests": None if args.al_unlimited_oracle else int(args.al_max_oracle_requests),
                 "train_steps_per_round": int(args.train_steps),
+                "train_schedule_steps": int(shared_schedule_final_step) if shared_wandb_run_id else None,
                 "ckpt_path": str(ckpt_path),
             },
             allow_val_change=True,
@@ -251,11 +329,15 @@ def main() -> None:
         "llm_candidates_tokens": 0,
         "llm_total_tokens": 0,
         "llm_failed_batches": 0,
+        "llm_final_parse_failed": 0,
+        "llm_final_missing": 0,
+        "oracle_skipped_snippets": 0,
         "refinements_stored": 0,
         "oracle_queries_sent": 0,
     }
 
     for round_idx in range(1, max(1, int(args.rounds)) + 1):
+        current_train_step = _latest_train_checkpoint_step(ckpt_path)
         print(f"\n=== META ROUND {round_idx}/{args.rounds}: acquire + oracle ===", flush=True)
         al_cmd = [
             args.python,
@@ -325,6 +407,9 @@ def main() -> None:
         cumulative["llm_candidates_tokens"] += int(round_summary.get("llm_candidates_tokens", 0))
         cumulative["llm_total_tokens"] += int(round_summary.get("llm_total_tokens", 0))
         cumulative["llm_failed_batches"] += int(round_summary.get("llm_failed_batches", 0))
+        cumulative["llm_final_parse_failed"] += int(round_summary.get("llm_final_parse_failed", 0))
+        cumulative["llm_final_missing"] += int(round_summary.get("llm_final_missing", 0))
+        cumulative["oracle_skipped_snippets"] += int(round_summary.get("oracle_skipped_snippets", 0))
         cumulative["refinements_stored"] += int(round_summary.get("stored", 0))
         cumulative["oracle_queries_sent"] += int(round_summary.get("samples", 0))
 
@@ -339,6 +424,7 @@ def main() -> None:
             "al/oracle_queries_sent": int(round_summary.get("samples", 0)),
             "al/oracle_model_outputs": int(round_summary.get("oracle_model_outputs", 0)),
             "al/oracle_fallback_snippets": int(round_summary.get("oracle_fallback_snippets", 0)),
+            "al/oracle_skipped_snippets": int(round_summary.get("oracle_skipped_snippets", 0)),
             "al/refinements_stored": int(round_summary.get("stored", 0)),
             "al/inference_samples_scanned": int(round_summary.get("inference_samples", 0)),
             # Per-round LLM request stats
@@ -347,6 +433,8 @@ def main() -> None:
             "al/llm_total_requests": int(round_summary.get("llm_total_requests", 0)),
             "al/llm_rate_limit_retries": int(round_summary.get("llm_rate_limit_retries", 0)),
             "al/llm_failed_batches": int(round_summary.get("llm_failed_batches", 0)),
+            "al/llm_final_parse_failed": int(round_summary.get("llm_final_parse_failed", 0)),
+            "al/llm_final_missing": int(round_summary.get("llm_final_missing", 0)),
             # Per-round LLM token stats
             "al/llm_prompt_tokens": int(round_summary.get("llm_prompt_tokens", 0)),
             "al/llm_candidates_tokens": int(round_summary.get("llm_candidates_tokens", 0)),
@@ -359,6 +447,9 @@ def main() -> None:
             "al/cumulative_llm_candidates_tokens": int(cumulative["llm_candidates_tokens"]),
             "al/cumulative_llm_total_tokens": int(cumulative["llm_total_tokens"]),
             "al/cumulative_llm_failed_batches": int(cumulative["llm_failed_batches"]),
+            "al/cumulative_llm_final_parse_failed": int(cumulative["llm_final_parse_failed"]),
+            "al/cumulative_llm_final_missing": int(cumulative["llm_final_missing"]),
+            "al/cumulative_oracle_skipped_snippets": int(cumulative["oracle_skipped_snippets"]),
             "al/cumulative_refinements_stored": int(cumulative["refinements_stored"]),
             "al/cumulative_oracle_queries_sent": int(cumulative["oracle_queries_sent"]),
             # Global state
@@ -367,7 +458,7 @@ def main() -> None:
             "al/replay_mix_prob": float(scheduled_mix_prob),
         }
         if wandb_available:
-            _wandb_safe_log(al_metrics, step=round_idx, commit=True)
+            _wandb_safe_log(al_metrics, step=int(round_idx), commit=True)
         print(
             f"AL round {round_idx} metrics: "
             f"queries={al_metrics['al/oracle_queries_sent']}, "
@@ -377,6 +468,9 @@ def main() -> None:
             f"retries={al_metrics['al/llm_retry_requests']}, "
             f"rate_limit_retries={al_metrics['al/llm_rate_limit_retries']}, "
             f"failed_batches={al_metrics['al/llm_failed_batches']}, "
+            f"parse_failed_skipped={al_metrics['al/llm_final_parse_failed']}, "
+            f"missing_skipped={al_metrics['al/llm_final_missing']}, "
+            f"oracle_skipped={al_metrics['al/oracle_skipped_snippets']}, "
             f"sqlite={sqlite_mb:.2f}MB, "
             f"cum_requests={cumulative['llm_total_requests']}, "
             f"cum_tokens={cumulative['llm_total_tokens']}",
@@ -384,6 +478,8 @@ def main() -> None:
         )
 
         print(f"\n=== META ROUND {round_idx}/{args.rounds}: train (monitor + AL replay) ===", flush=True)
+        train_target_step = _compute_train_target_step(current_train_step, int(args.train_steps))
+        should_continue_shared_run = bool(shared_wandb_run_id) and current_train_step > 0
         train_cmd = [
             args.python,
             "train/main.py",
@@ -392,7 +488,7 @@ def main() -> None:
             "--ckpt_path",
             ckpt_path,
             "--steps",
-            str(args.train_steps),
+            str(train_target_step),
             "--max_minutes",
             str(args.train_max_minutes),
             "--fine-tune",
@@ -406,14 +502,23 @@ def main() -> None:
             str(args.al_max_windows),
         ]
         if shared_wandb_run_id:
+            train_cmd.extend(["--schedule_steps", str(shared_schedule_final_step)])
+        if should_continue_shared_run:
             train_cmd.extend(["--continue", shared_wandb_run_id])
+        elif shared_wandb_run_id:
+            train_cmd.extend(["--wandb-run-id", shared_wandb_run_id])
+            print(
+                f"Starting fresh shared W&B run {shared_wandb_run_id} from params at {ckpt_path}.",
+                flush=True,
+            )
         if args.train_extra_args.strip():
             train_cmd.extend(shlex.split(args.train_extra_args))
         _run(train_cmd)
 
     finished = f"\nFinished {args.rounds} rounds. Checkpoint: {ckpt_path} | label store: {args.al_store}"
     if shared_wandb_run_id:
-        finished += f" | shared_wandb_run_id: {shared_wandb_run_id}"
+        finished += f" | child_shared_wandb_run_id: {shared_wandb_run_id}"
+    finished += f" | parent_wandb_run_id: {parent_wandb_run_id}"
     print(finished, flush=True)
     print(
         "Cumulative stats: "
@@ -422,6 +527,9 @@ def main() -> None:
         f"retries={cumulative['llm_retry_requests']}, "
         f"rate_limit_retries={cumulative['llm_rate_limit_retries']}, "
         f"failed_batches={cumulative['llm_failed_batches']}, "
+        f"parse_failed_skipped={cumulative['llm_final_parse_failed']}, "
+        f"missing_skipped={cumulative['llm_final_missing']}, "
+        f"oracle_skipped={cumulative['oracle_skipped_snippets']}, "
         f"refinements={cumulative['refinements_stored']}, "
         f"queries={cumulative['oracle_queries_sent']}",
         flush=True,

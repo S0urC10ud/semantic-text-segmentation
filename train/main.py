@@ -132,6 +132,34 @@ def resolve_ckpt_paths(path: str):
     return ckpt_dir_abs, prefix, blob_abs
 
 
+def _save_training_checkpoint(
+    save_state,
+    ckpt_path: str,
+    step: int,
+    *,
+    async_manager=None,
+):
+    ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(ckpt_path)
+    checkpoints.save_checkpoint(
+        ckpt_dir,
+        save_state,
+        step=step,
+        prefix=ckpt_prefix,
+        keep=2,
+        overwrite=True,
+        async_manager=async_manager,
+    )
+
+    os.makedirs(ckpt_dir, exist_ok=True)
+    with open(ckpt_blob, "wb") as f:
+        f.write(serialization.to_bytes(save_state.params))
+    base = os.path.basename(ckpt_blob)
+    stem, ext = os.path.splitext(base)
+    hist_path = os.path.join(ckpt_dir, f"{stem}-{step}{ext}")
+    with open(hist_path, "wb") as f:
+        f.write(serialization.to_bytes(save_state.params))
+
+
 def _find_local_wandb_config(repo_root: Path, run_id: str) -> Path | None:
     wandb_root = repo_root / "wandb"
     if not wandb_root.exists():
@@ -255,6 +283,12 @@ def main():
 
     # Train args
     parser.add_argument("--steps", type=int, default=2_000_000)
+    parser.add_argument(
+        "--schedule_steps",
+        type=int,
+        default=None,
+        help="Optional learning-rate decay horizon. Defaults to --steps when omitted.",
+    )
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup", type=int, default=100)
@@ -320,6 +354,12 @@ def main():
         type=str,
         default="",
         help="Resume from an existing W&B run id (reuses its checkpoint and W&B run).",
+    )
+    parser.add_argument(
+        "--wandb-run-id",
+        type=str,
+        default="",
+        help="Use a specific W&B run id without restoring optimizer/checkpoint state.",
     )
     parser.add_argument(
         "--fine-tune",
@@ -621,6 +661,7 @@ def main():
 
     t_cfg = cfg.TrainConfig(
         steps=args.steps,
+        schedule_steps=args.schedule_steps,
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup=args.warmup,
@@ -749,6 +790,14 @@ def main():
             }
         )
         print(f"Resuming W&B run: {args.continue_run_id}", flush=True)
+    elif getattr(args, "wandb_run_id", ""):
+        wandb_init_kwargs.update(
+            {
+                "id": args.wandb_run_id,
+                "resume": "allow",
+            }
+        )
+        print(f"Using explicit W&B run id: {args.wandb_run_id}", flush=True)
     wandb.init(**wandb_init_kwargs)
     wandb.config.update({**d_cfg.__dict__, **t_cfg.__dict__}, allow_val_change=True)
     wandb.config.update(
@@ -1700,32 +1749,17 @@ def main():
                     )
 
                     # Save checkpoints — unreplicate if using pmap
-                    ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(
-                        t_cfg.ckpt_path
-                    )
                     save_state = unreplicate_state(state) if use_pmap else state
-                    checkpoints.save_checkpoint(
-                        ckpt_dir,
-                        save_state,
-                        step=step,
-                        prefix=ckpt_prefix,
-                        keep=2,
-                        overwrite=True,
-                        async_manager=ckpt_async_manager,
-                    )
-
                     try:
-                        os.makedirs(ckpt_dir, exist_ok=True)
-                        with open(ckpt_blob, "wb") as f:
-                            f.write(serialization.to_bytes(save_state.params))
-                        base = os.path.basename(ckpt_blob)
-                        stem, ext = os.path.splitext(base)
-                        hist_path = os.path.join(ckpt_dir, f"{stem}-{step}{ext}")
-                        with open(hist_path, "wb") as f:
-                            f.write(serialization.to_bytes(save_state.params))
+                        _save_training_checkpoint(
+                            save_state,
+                            t_cfg.ckpt_path,
+                            step,
+                            async_manager=ckpt_async_manager,
+                        )
                     except Exception as e:
                         print(
-                            f"WARNING: writing raw params msgpack failed: {e}",
+                            f"WARNING: writing checkpoint failed: {e}",
                             flush=True,
                         )
 
@@ -1790,6 +1824,12 @@ def main():
                 pass
 
         current_step = int(unreplicate_state(state).step) if use_pmap else int(getattr(state, "step", 0))
+        if current_step > 0:
+            save_state = unreplicate_state(state) if use_pmap else state
+            try:
+                _save_training_checkpoint(save_state, t_cfg.ckpt_path, current_step)
+            except Exception as e:
+                print(f"WARNING: final checkpoint save failed: {e}", flush=True)
         _wandb_safe_log(
             {
                 "meta/stopped_reason": final_reason,

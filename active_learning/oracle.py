@@ -619,6 +619,8 @@ class GeminiBoundaryOracle:
             "fallback_failed_segmentation",
             "fallback_oracle_error",
             "fallback_runtime_error",
+            "skipped_parse_failed",
+            "skipped_missing",
         }
         if self.show_progress and _tqdm is not None and len(snippets) > 0:
             total_batches = int((len(snippets) + self.batch_size - 1) // self.batch_size)
@@ -1230,23 +1232,15 @@ class GeminiBoundaryOracle:
             print(
                 "Failed segmentation for "
                 f"{len(final_parse_failed_ids) + len(final_missing_ids)}/{len(snippets)} snippets; "
-                "marking unresolved snippets as failed/skipped. "
+                "skipping unresolved snippets and continuing with partial oracle results. "
                 f"{summary}",
                 flush=True,
             )
 
         if status == "al_oracle_failed":
             raise RuntimeError(f"Oracle failed completely. Error: {error}")
-            
-        if final_parse_failed_ids or final_missing_ids:
-            summary = self._format_failed_segmentation_summary(
-                parse_failed_ids=final_parse_failed_ids,
-                missing_ids=final_missing_ids,
-                parse_failure_reasons=final_parse_failures,
-            )
-            raise RuntimeError(f"Oracle returned incomplete or unparseable segments. {summary}")
 
-        failed_states = set()
+        failed_states = {"skipped_parse_failed", "skipped_missing"}
         snippet_sources: Dict[str, str] = {}
         finalized: Dict[str, List[OracleSegment]] = {}
         for snippet in snippets:
@@ -1254,6 +1248,10 @@ class GeminiBoundaryOracle:
             if sid in normalized_map:
                 snippet_sources[sid] = "model"
                 finalized[sid] = list(normalized_map.get(sid, []))
+            elif sid in final_parse_failures:
+                snippet_sources[sid] = "skipped_parse_failed"
+            elif sid in final_missing_ids:
+                snippet_sources[sid] = "skipped_missing"
         model_output_count = int(sum(1 for state in snippet_sources.values() if state == "model"))
         failed_segmentation_count = int(
             sum(1 for state in snippet_sources.values() if str(state) in failed_states)
@@ -1311,9 +1309,13 @@ class GeminiBoundaryOracle:
         candidates_tokens = int(_usage_serialized.get("candidates_token_count") or 0) if isinstance(_usage_serialized, dict) else 0
         total_tokens = int(_usage_serialized.get("total_token_count") or 0) if isinstance(_usage_serialized, dict) else 0
 
+        batch_status = status
+        if status == "al_oracle_ok" and (final_parse_failed_ids or final_missing_ids):
+            batch_status = "al_oracle_partial"
+
         batch_info: Dict[str, object] = {
             "run_id": run_id,
-            "status": status,
+            "status": batch_status,
             "requested": int(len(snippets)),
             "parsed": int(len(normalized_map)),
             "model_output_count": int(model_output_count),

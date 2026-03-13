@@ -548,17 +548,35 @@ def run_one_round(
         oracle_sources = {}
     oracle_batches = getattr(oracle, "last_batches", None)
     failed_batches = []
+    skipped_parse_failed_total = 0
+    skipped_missing_total = 0
     if isinstance(oracle_batches, list) and oracle_batches:
         failed_batches = [b for b in oracle_batches if str(b.get("status", "")).endswith("failed")]
         requested_total = int(sum(int(b.get("requested", 0)) for b in oracle_batches))
         model_total = int(sum(int(b.get("model_output_count", 0)) for b in oracle_batches))
         missing_initial_total = int(sum(int(b.get("initial_missing_snippets", 0)) for b in oracle_batches))
+        parse_failed_initial_total = int(
+            sum(int(b.get("initial_parse_failed_snippets", 0)) for b in oracle_batches)
+        )
         missing_recovered_total = int(sum(int(b.get("recovered_missing_snippets", 0)) for b in oracle_batches))
+        parse_failed_recovered_total = int(
+            sum(int(b.get("recovered_parse_failed_snippets", 0)) for b in oracle_batches)
+        )
+        skipped_parse_failed_total = int(
+            sum(int(b.get("final_parse_failed_snippets", 0)) for b in oracle_batches)
+        )
+        skipped_missing_total = int(
+            sum(int(b.get("final_missing_snippets", 0)) for b in oracle_batches)
+        )
         print(
             "Oracle batch diagnostics: "
             f"batches={len(oracle_batches)}, requested={requested_total}, "
             f"model_outputs={model_total}, failed_batches={len(failed_batches)}, "
-            f"missing_initial={missing_initial_total}, missing_recovered={missing_recovered_total}",
+            f"missing_initial={missing_initial_total}, missing_recovered={missing_recovered_total}, "
+            f"parse_failed_initial={parse_failed_initial_total}, "
+            f"parse_failed_recovered={parse_failed_recovered_total}, "
+            f"parse_failed_skipped={skipped_parse_failed_total}, "
+            f"missing_skipped={skipped_missing_total}",
             flush=True,
         )
         if failed_batches:
@@ -573,12 +591,28 @@ def run_one_round(
             print(msg, flush=True)
 
     if oracle_name != "stub":
+        allowed_non_model_states = {"skipped_parse_failed", "skipped_missing"}
         non_model = [
             (snippet.snippet_id, str(oracle_sources.get(snippet.snippet_id, "unknown")))
             for snippet in queried_snippets
             if str(oracle_sources.get(snippet.snippet_id, "unknown")) != "model"
         ]
-        if failed_batches or non_model:
+        unexpected_non_model = [
+            (snippet_id, state) for snippet_id, state in non_model if state not in allowed_non_model_states
+        ]
+        if non_model:
+            state_counts = {}
+            for _, state in non_model:
+                state_counts[state] = state_counts.get(state, 0) + 1
+            print(
+                "Oracle skipped unresolved snippets after retries: "
+                f"count={len(non_model)}, "
+                "states="
+                + ",".join(f"{key}:{state_counts[key]}" for key in sorted(state_counts))
+                + f", first_snippet={non_model[0][0]}",
+                flush=True,
+            )
+        if failed_batches or unexpected_non_model:
             details = []
             if failed_batches:
                 first_failed = failed_batches[0]
@@ -589,31 +623,49 @@ def run_one_round(
                 log_path = str(first_failed.get("log_path", "")).strip()
                 if log_path:
                     details.append(f"log={log_path}")
-            if non_model:
+            if unexpected_non_model:
                 state_counts = {}
-                for _, state in non_model:
+                for _, state in unexpected_non_model:
                     state_counts[state] = state_counts.get(state, 0) + 1
-                details.append(f"non_model_snippets={len(non_model)}")
+                details.append(f"non_model_snippets={len(unexpected_non_model)}")
                 details.append(
                     "states="
                     + ",".join(f"{key}:{state_counts[key]}" for key in sorted(state_counts))
                 )
-                details.append(f"first_snippet={non_model[0][0]}")
+                details.append(f"first_snippet={unexpected_non_model[0][0]}")
             raise RuntimeError(
                 "Oracle refinement failed or returned fallback outputs; aborting round. "
                 + " | ".join(details)
             )
 
     if oracle_sources:
-        model_output_snippets = sum(
-            1 for snippet in queried_snippets if oracle_sources.get(snippet.snippet_id) == "model"
+        model_output_snippets = int(
+            sum(1 for snippet in queried_snippets if oracle_sources.get(snippet.snippet_id) == "model")
+        )
+        oracle_fallback_snippets = int(
+            sum(
+                1
+                for snippet in queried_snippets
+                if str(oracle_sources.get(snippet.snippet_id, "")).startswith("fallback_")
+            )
+        )
+        oracle_skipped_snippets = int(
+            sum(
+                1
+                for snippet in queried_snippets
+                if str(oracle_sources.get(snippet.snippet_id, "")) in {"skipped_parse_failed", "skipped_missing"}
+            )
         )
     else:
         model_output_snippets = len(queried_snippets)
+        oracle_fallback_snippets = 0
+        oracle_skipped_snippets = 0
 
     rows: List[StoredRefinement] = []
     total_open_set_segments = 0
     for snippet in queried_snippets:
+        if oracle_sources and oracle_sources.get(snippet.snippet_id) != "model":
+            continue
         segs = refined.get(snippet.snippet_id, [])
         refined_segments = []
         open_set_labels = []
@@ -709,6 +761,12 @@ def run_one_round(
             "llm_recovered_parse_failed": int(
                 sum(int(b.get("recovered_parse_failed_snippets", 0)) for b in oracle_batches)
             ),
+            "llm_final_parse_failed": int(
+                sum(int(b.get("final_parse_failed_snippets", 0)) for b in oracle_batches)
+            ),
+            "llm_final_missing": int(
+                sum(int(b.get("final_missing_snippets", 0)) for b in oracle_batches)
+            ),
         }
     return {
         "round_id": round_id,
@@ -721,7 +779,8 @@ def run_one_round(
         "oracle": getattr(oracle, "name", "oracle"),
         "oracle_model": str(getattr(oracle, "model", "")),
         "oracle_model_outputs": int(model_output_snippets),
-        "oracle_fallback_snippets": int(len(queried_snippets) - model_output_snippets),
+        "oracle_fallback_snippets": int(oracle_fallback_snippets),
+        "oracle_skipped_snippets": int(oracle_skipped_snippets),
         "timestamp": _now_utc(),
         **_oracle_stats,
     }

@@ -325,10 +325,11 @@ def create_train_state(rng, cfg: "TrainConfig", num_classes: int):
     dummy_tokens = jnp.zeros((1, cfg.MODEL_WINDOW_BYTES), dtype=jnp.int32)
     variables = model.init({"params": rng, "dropout": rng}, dummy_tokens, train=True)
     params = variables["params"]
+    decay_steps = int(getattr(cfg, "schedule_steps", 0) or cfg.steps)
 
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=cfg.lr, warmup_steps=cfg.warmup,
-        decay_steps=cfg.steps, end_value=cfg.lr * 0.1
+        decay_steps=decay_steps, end_value=cfg.lr * 0.1
     )
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),

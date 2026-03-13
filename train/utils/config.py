@@ -147,6 +147,7 @@ class DataConfig:
 class TrainConfig:
     """Configuration for model training."""
     steps: int = 2000
+    schedule_steps: int | None = None
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup: int = 100
