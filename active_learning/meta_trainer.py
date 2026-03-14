@@ -188,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arch", type=str, default=None, choices=("unet1d", "mamba"),
                         help="Model architecture (auto-detected from checkpoint if omitted).")
     parser.add_argument("--data-root", type=str, default="downloader/arrow_out")
-    parser.add_argument("--train-max-minutes", type=int, default=10)
+    parser.add_argument("--train-max-minutes", type=int, default=1000)
     parser.add_argument("--train-steps", type=int, default=10_000)
     parser.add_argument("--train-extra-args", type=str, default="")
     parser.add_argument(
@@ -260,7 +260,8 @@ def main() -> None:
     init_ckpt_path = (args.init_ckpt_path or "").strip() or None
     _ensure_bootstrap_checkpoint(ckpt_path, init_ckpt_path)
     shared_wandb_run_id = ""
-    parent_wandb_run_id = (args.wandb_parent_run_id or "").strip() or _generate_wandb_run_id()
+    requested_parent_wandb_run_id = (args.wandb_parent_run_id or "").strip()
+    parent_wandb_run_id = requested_parent_wandb_run_id or _generate_wandb_run_id()
     initial_train_step = _latest_train_checkpoint_step(ckpt_path)
     shared_schedule_final_step = _compute_train_target_step(
         initial_train_step,
@@ -291,7 +292,7 @@ def main() -> None:
             "settings": Settings(init_timeout=300, start_method="thread"),
             "tags": ["active-learning", "meta-trainer"],
             "id": parent_wandb_run_id,
-            "resume": "allow",
+            "resume": "never",
         }
         wandb.init(**wandb_kwargs)
         wandb.config.update(
@@ -318,6 +319,10 @@ def main() -> None:
         wandb_available = True
         print(f"Wandb initialized for meta-trainer logging (project={wandb_project}).", flush=True)
     except Exception as e:
+        if requested_parent_wandb_run_id:
+            raise RuntimeError(
+                f"Failed to initialize parent W&B run {requested_parent_wandb_run_id}: {e}"
+            ) from e
         print(f"⚠️  Wandb init failed; metrics will only be printed: {e}", flush=True)
 
     # ── Cumulative counters across all rounds ──

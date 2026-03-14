@@ -50,7 +50,14 @@ ORACLE_RESPONSE_SCHEMA: Dict[str, object] = {
                             "type": "object",
                             "required": ["label", "text"],
                             "properties": {
-                                "label": {"type": "string"},
+                                "label": {
+                                    "type": "string",
+                                    "description": (
+                                        "Use a closed-set training label when possible. "
+                                        "For unsupported template/open-set wrappers, prefer "
+                                        "other_<best_guess> such as other_jsx or other_angular."
+                                    ),
+                                },
                                 "text": {"type": "string"},
                             },
                         },
@@ -81,12 +88,6 @@ ALLOWED_LABELS_BY_ID: List[str] = [
 if "other" not in ALLOWED_LABELS_BY_ID:
     ALLOWED_LABELS_BY_ID.append("other")
 ALLOWED_LABEL_SET = set(ALLOWED_LABELS_BY_ID)
-try:
-    ORACLE_RESPONSE_SCHEMA["properties"]["snippets"]["items"]["properties"]["segments"]["items"]["properties"][
-        "label"
-    ]["enum"] = list(ALLOWED_LABELS_BY_ID)
-except Exception:
-    pass
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _GENERIC_LABELS = {"text", "other"}
@@ -662,8 +663,11 @@ class GeminiBoundaryOracle:
         return (
             "You are a meticulous text-segmentation and boundary-refinement assistant. "
             "Follow rules literally, preserve snippet bytes, and output strict JSON only. "
-            "Use only the provided allowed labels; if uncertain or out-of-taxonomy, use 'other'. "
-            "Never add commentary."
+            "Be highly attentive to small but real boundary changes: even tiny embedded spans "
+            "should be split when there is compelling evidence of a different content type. "
+            "Use closed-set labels whenever they fit; otherwise use an open-set label like "
+            "'other_jsx', 'other_angular' or really 'other_<best_guess>' in general "
+            "so it can be normalized downstream. Never add commentary."
         )
 
     @staticmethod
@@ -1358,14 +1362,31 @@ class GeminiBoundaryOracle:
             "- Do not output `start`/`end`; output only `label` + exact `text` chunks.\n"
             "- Preserve bytes exactly: never rewrite snippet text content.\n"
             "- Prefer changing only uncertain boundary regions; keep stable regions intact.\n"
-            f"- Allowed labels (strict): {allowed_labels}.\n"
-            "- If content does not match an allowed label clearly, use 'other'.\n"
+            f"- Closed-set training labels: {allowed_labels}.\n"
+            "- If content does not match a closed-set label clearly, emit an open-set label "
+            "formatted as `other_<best_guess>` instead of plain `other` when you can name it "
+            "(for example `other_jsx`, `other_angular`, `other_django_template`).\n"
+            "- Open-set `other_<best_guess>` labels will be normalized to `other` downstream for "
+            "training, so prefer the more specific raw label when it is clear.\n"
             "- Avoid collapsing a whole snippet to a single generic label ('text'/'other') unless truly homogeneous.\n"
             "- For markdown with frontmatter, the frontmatter block should be labeled as yaml. Other yaml-formatted blocks within the document may also be labeled as yaml if they clearly match that format.\n"
-            "- Be precise for embedded code: keep wrappers in host language, but label bodies by true language.\n"
+            "- Prose is `text` only when there is no compelling evidence of a more specific content type (it has a special role). "
+            "Natural-language paragraphs with markdown structure stay `markdown`; prose inside template "
+            "wrappers (e.g. html, markdown, ...) stays with that host language unless there is a clearer embedded type.\n"
+            "- Be precise for embedded code: the examples should give you a feeling for keeping each character in its most precise type (e.g. if there is base64 in javascript in html, each of the parts should be labeled respectively).\n"
             "- For embedded strings or encodings (e.g., 'key=value'), the 'key=' part and quotes are the host language; only the raw 'value' is the embedded language.\n"
             "- For HTML-like regions, inline event-handler values and javascript: URLs are javascript_typescript.\n"
             "- For HTML-like regions, style attribute values are css; style wrappers remain host/wrapper text.\n"
+            "- Use open-set labels especially for template-specific syntax when the surrounding bytes fit a standard type. "
+            "reserve `other_<best_guess>` for the actual template-only bytes. IMPORTANT: Precisely look at the examples to get a feeling of the segmentation task\n"
+            "- For React/JSX/TSX, ordinary markup may stay `html`, but JSX-only syntax such as `className`, "
+            "`onClick={...}`, `{...}` delimiters, fragments, or custom-language syntax that is not common in any other relevant type, like <NewTag> should be `other_jsx`; "
+            "expressions inside `{...}` are `javascript_typescript` - the examples should make this clear.\n"
+            "- For Angular templates, ordinary markup/text may stay `html`, but Angular-only syntax such as "
+            "`*ngIf`, `(click)`, `[(ngModel)]`, or `{{ ... }}` may be `other_angular`; expressions/handlers "
+            "inside those constructs remain `javascript_typescript`.\n"
+            "- For Django/Jinja templates, ordinary markup/text may stay `html`, while template block/expression "
+            "syntax such as `{% ... %}` and `{{ ... }}` may be `other_django_template`.\n"
             "- Example (correct SVG inline-style split):\n"
             "  snippet: style=\"font-size:3.88584304px;fill:#00cedb;fill-opacity:1;stroke:none;"
             "stroke-width:0.29143822;stroke-opacity:1\"></tspan>\n"
@@ -1377,6 +1398,80 @@ class GeminiBoundaryOracle:
             "  ]\n"
             "- In SVG/XML, tag syntax + attribute names/quotes/ids/coords stay svg/xml; "
             "only the CSS declaration body inside style=\"...\" is css.\n"
+            "- Example (markdown prose stays markdown, not text):\n"
+            "  snippet: ## Release Notes\\nThis paragraph explains the change in prose.\\n- keep bytes exact\\n\n"
+            "  expected segments: [\n"
+            "    {'label':'markdown','text':'## Release Notes\\nThis paragraph explains the change in prose.\\n- keep bytes exact\\n'}\n"
+            "  ]\n"
+            "- Example (true HTML inline handler/style splits still matter):\n"
+            "  snippet: <button style=\"color:red;\" onclick=\"save()\">Go</button>\n"
+            "  expected segments: [\n"
+            "    {'label':'html','text':'<button style=\"'},\n"
+            "    {'label':'css','text':'color:red;'},\n"
+            "    {'label':'html','text':'\" onclick=\"'},\n"
+            "    {'label':'javascript_typescript','text':'save()'},\n"
+            "    {'label':'html','text':'\">Go</button>'}\n"
+            "  ]\n"
+            "- Example (true HTML wrapper with javascript body):\n"
+            "  snippet: <script type=\"text/javascript\">\\ninitMenu();\\n</script>\\n<div onclick=\"save()\">Go</div>\\n\n"
+            "  expected segments: [\n"
+            "    {'label':'html','text':'<script type=\"text/javascript\">\\n'},\n"
+            "    {'label':'javascript_typescript','text':'initMenu();\\n'},\n"
+            "    {'label':'html','text':'</script>\\n<div onclick=\"'},\n"
+            "    {'label':'javascript_typescript','text':'save()'},\n"
+            "    {'label':'html','text':'\">Go</div>\\n'}\n"
+            "  ]\n"
+            "- Example (html/css nested inside a javascript string literal):\n"
+            "  snippet: const snippet = \"<div><style>p{color:red;}</style></div>\";\n"
+            "  expected segments: [\n"
+            "    {'label':'javascript_typescript','text':'const snippet = \"'},\n"
+            "    {'label':'html','text':'<div><style>'},\n"
+            "    {'label':'css','text':'p{color:red;}'},\n"
+            "    {'label':'html','text':'</style></div>'},\n"
+            "    {'label':'javascript_typescript','text':'\";'}\n"
+            "  ]\n"
+            "- Example (Django template syntax is open-set, surrounding markup stays html/css; Note that in this example also user.name is not python but django template language so we keep it as django as well):\n"
+            "  snippet: {% block content %}<div class=\"card\" style=\"color:red;\">Hello {{ user.name }}</div>{% endblock %}\n"
+            "  expected segments: [\n"
+            "    {'label':'other_django_template','text':'{% block content %}'},\n"
+            "    {'label':'html','text':'<div class=\"card\" style=\"'},\n"
+            "    {'label':'css','text':'color:red;'},\n"
+            "    {'label':'html','text':'\">Hello '},\n"
+            "    {'label':'other_django_template','text':'{{ user.name }}'},\n"
+            "    {'label':'html','text':'</div>'},\n"
+            "    {'label':'other_django_template','text':'{% endblock %}'}\n"
+            "  ]\n"
+            "- Example (React JSX uses open-set labels only for JSX-specific syntax - which, in general, contains JS content):\n"
+            "  snippet: return (\\n  <div className={style.content} onClick={handleSave}><span>Save</span></div>\\n);\n"
+            "  expected segments: [\n"
+            "    {'label':'javascript_typescript','text':'return (\\n  '},\n"
+            "    {'label':'html','text':'<div '},\n"
+            "    {'label':'other_jsx','text':'className={'},\n"
+            "    {'label':'javascript_typescript','text':'style.content'},\n"
+            "    {'label':'other_jsx','text':'} '},\n"
+            "    {'label':'other_jsx','text':'onClick={'},\n"
+            "    {'label':'javascript_typescript','text':'handleSave'},\n"
+            "    {'label':'other_jsx','text':'}'},\n"
+            "    {'label':'html','text':'><span>Save</span></div>'},\n"
+            "    {'label':'javascript_typescript','text':'\\n);'}\n"
+            "  ]\n"
+            "- Example (Angular uses open-set labels only for Angular-specific syntax):\n"
+            "  snippet: <div class=\"card\" *ngIf=\"hasCard\">{{ title }}<button (click)=\"save()\">Save</button></div>\n"
+            "  expected segments: [\n"
+            "    {'label':'html','text':'<div class=\"card\" '},\n"
+            "    {'label':'other_angular','text':'*ngIf=\"'},\n"
+            "    {'label':'javascript_typescript','text':'hasCard'},\n"
+            "    {'label':'other_angular','text':'\"'},\n"
+            "    {'label':'html','text':'>'},\n"
+            "    {'label':'other_angular','text':'{{ '},\n"
+            "    {'label':'javascript_typescript','text':'title'},\n"
+            "    {'label':'other_angular','text':' }}'},\n"
+            "    {'label':'html','text':'<button '},\n"
+            "    {'label':'other_angular','text':'(click)=\"'},\n"
+            "    {'label':'javascript_typescript','text':'save()'},\n"
+            "    {'label':'other_angular','text':'\"'},\n"
+            "    {'label':'html','text':'>Save</button></div>'}\n"
+            "  ]\n"
             "- Keep tiny foreign-code injections typed correctly when boundaries clearly indicate a switch.\n"
             "- Use predicted_segments as a strong prior unless clearly contradicted by snippet text.\n"
             "- Return exactly one entry for every input snippet_id; never omit any snippet_id.\n"

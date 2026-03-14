@@ -98,8 +98,9 @@ def _signal_handler(sig, frame):
 
 
 # register early, before long inits
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
+if mp.current_process().name == "MainProcess":
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
 
 def _compute_running_stats(history, new_value, window=100):
@@ -122,6 +123,22 @@ def _wandb_safe_log(data: dict, step: int, commit: bool = True):
         wandb.log(data, step=step, commit=commit)
     except Exception as e:
         print(f"Wandb logging failed: {e}", flush=True)
+
+
+def _wandb_current_step(default: int = 0) -> int:
+    try:
+        run = getattr(wandb, "run", None)
+        if run is None:
+            return int(default)
+        return max(int(default), int(getattr(run, "step", default) or 0))
+    except Exception:
+        return int(default)
+
+
+def _state_step(state, *, use_pmap: bool) -> int:
+    if use_pmap:
+        return int(unreplicate_state(state).step)
+    return int(getattr(state, "step", 0))
 
 
 def resolve_ckpt_paths(path: str):
@@ -317,6 +334,11 @@ def main():
     )
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=2000)
+    parser.add_argument(
+        "--eval_on_start",
+        action="store_true",
+        help="Run validation and monitor evaluation immediately after restore, before training steps.",
+    )
     parser.add_argument(
         "--eval_batches",
         type=int,
@@ -786,7 +808,7 @@ def main():
         wandb_init_kwargs.update(
             {
                 "id": args.continue_run_id,
-                "resume": "allow",
+                "resume": "must",
             }
         )
         print(f"Resuming W&B run: {args.continue_run_id}", flush=True)
@@ -794,7 +816,7 @@ def main():
         wandb_init_kwargs.update(
             {
                 "id": args.wandb_run_id,
-                "resume": "allow",
+                "resume": "never",
             }
         )
         print(f"Using explicit W&B run id: {args.wandb_run_id}", flush=True)
@@ -811,14 +833,6 @@ def main():
             "data_parallel": use_pmap,
         },
         allow_val_change=True,
-    )
-    _wandb_safe_log(
-        {
-            "meta/monitor_train_files": int(fine_tune_train_files_count),
-            "meta/monitor_eval_files": int(monitor_eval_files_count),
-        },
-        step=0,
-        commit=False,
     )
 
     # Derive unique checkpoint path from run id if requested/placeholder-ish
@@ -1122,6 +1136,7 @@ def main():
         title: str = "Evaluating",
         train_loss: float | None = None,
         train_acc: float | None = None,
+        commit: bool = True,
     ) -> tuple[float, float]:
         """Run val eval and, if enabled, monitor eval; log everything to W&B."""
         nonlocal rng
@@ -1263,13 +1278,32 @@ def main():
             cfg.NUM_CLASSES,
             cfg.PAD_ID,
             conf_mat,
-            commit=True,
+            commit=commit,
         )
         return val_loss, val_acc
 
-    current_step = int(unreplicate_state(state).step) if use_pmap else int(state.step)
-    if current_step == 0:
-        run_val_and_monitor_eval(step=0, title="Baseline validation (step 0)")
+    current_step = _state_step(state, use_pmap=use_pmap)
+    startup_log_step = _wandb_current_step(default=current_step)
+    run_start_eval = bool(args.eval_on_start or current_step == 0)
+    _wandb_safe_log(
+        {
+            "meta/monitor_train_files": int(fine_tune_train_files_count),
+            "meta/monitor_eval_files": int(monitor_eval_files_count),
+        },
+        step=startup_log_step,
+        commit=bool(current_step > 0 and not run_start_eval),
+    )
+    if run_start_eval:
+        startup_title = (
+            "Baseline validation (step 0)"
+            if current_step == 0
+            else f"Startup validation (pre-train, checkpoint step {current_step})"
+        )
+        run_val_and_monitor_eval(
+            step=startup_log_step,
+            title=startup_title,
+            commit=bool(current_step == 0),
+        )
 
     print("Starting training...", flush=True)
     start_time = time.time()
@@ -1286,6 +1320,7 @@ def main():
     # Track min/max epochs across languages
     min_epochs = 0
     max_epochs = 0
+    target_logged_step = int(t_cfg.steps) + 1
 
     try:
         try:
@@ -1491,6 +1526,7 @@ def main():
 
                 oe_loss_value = float(sum(oe_losses) / len(oe_losses)) if oe_losses else 0.0
                 step_time = time.time() - step_start
+                logged_step = int(step) + 1
 
                 # LR best-effort
                 try:
@@ -1571,17 +1607,18 @@ def main():
 
                 # Determine if we should commit the logs now or wait
                 should_commit = (
-                    step % t_cfg.log_every == 0 and step % t_cfg.eval_every != 0
+                    logged_step % t_cfg.log_every == 0
+                    and logged_step % t_cfg.eval_every != 0
                 )
 
-                _wandb_safe_log(metrics, step=step, commit=should_commit)
+                _wandb_safe_log(metrics, step=logged_step, commit=should_commit)
                 last_heartbeat = time.time()
 
-                if step % t_cfg.log_every == 0:
+                if logged_step % t_cfg.log_every == 0:
                     elapsed = time.time() - last_log_time
                     sps = t_cfg.log_every / elapsed if elapsed > 0 else 0
                     print(
-                        f"Step {step}/{t_cfg.steps} [Epochs {min_epochs:.3f}-{max_epochs:.3f}] | "
+                        f"Step {logged_step}/{target_logged_step} [Epochs {min_epochs:.3f}-{max_epochs:.3f}] | "
                         f"Loss: {loss:.4f} (±{metrics['train/loss_std']:.4f}), "
                         f"Acc: {acc:.4f} (±{metrics['train/acc_std']:.4f}), SPS: {sps:.2f}",
                         flush=True,
@@ -1597,7 +1634,7 @@ def main():
                     )
                     break
 
-                if step > 0 and step % t_cfg.eval_every == 0:
+                if logged_step > 0 and logged_step % t_cfg.eval_every == 0:
                     print("Evaluating...", flush=True)
                     rng, eval_rng = jax.random.split(rng)
 
@@ -1632,7 +1669,7 @@ def main():
                         "val/acc_gap": float(acc) - val_acc,
                     }
                     # Do not commit yet; eval may also log monitor metrics.
-                    _wandb_safe_log(val_metrics, step=step, commit=False)
+                    _wandb_safe_log(val_metrics, step=logged_step, commit=False)
 
                     # Print table (console) and defer W&B commit until after optional monitor eval
                     print_metrics_table(
@@ -1683,7 +1720,7 @@ def main():
                         }
                         monitor_combined_logs = {**monitor_scalar_logs, **monitor_gap_logs}
                         wandb_log_metrics(
-                            step,
+                            logged_step,
                             per_class_m,
                             aggregates_m,
                             cfg.ID2LANG,
@@ -1724,7 +1761,7 @@ def main():
                                 "monitor_gap_thresh/weighted_f1": float(aggregates_mt["weighted"]["f1"] - aggregates["weighted"]["f1"]),
                             }
                             wandb_log_metrics(
-                                step,
+                                logged_step,
                                 per_class_mt,
                                 aggregates_mt,
                                 cfg.ID2LANG,
@@ -1738,7 +1775,7 @@ def main():
 
                     # Finally, log val confusion + metrics and commit the step atomically
                     wandb_log_metrics(
-                        step,
+                        logged_step,
                         per_class,
                         aggregates,
                         cfg.ID2LANG,
@@ -1754,7 +1791,7 @@ def main():
                         _save_training_checkpoint(
                             save_state,
                             t_cfg.ckpt_path,
-                            step,
+                            logged_step,
                             async_manager=ckpt_async_manager,
                         )
                     except Exception as e:
@@ -1808,7 +1845,7 @@ def main():
         final_reason = "completed"
         if error_reason:
             final_reason = f"error_{error_reason.__class__.__name__}"
-            current_step = int(unreplicate_state(state).step) if use_pmap else int(getattr(state, "step", 0))
+            current_step = _state_step(state, use_pmap=use_pmap)
             _wandb_safe_log(
                 {"meta/error_message": error_reason},
                 step=current_step,
@@ -1823,7 +1860,7 @@ def main():
             except Exception:
                 pass
 
-        current_step = int(unreplicate_state(state).step) if use_pmap else int(getattr(state, "step", 0))
+        current_step = _state_step(state, use_pmap=use_pmap)
         if current_step > 0:
             save_state = unreplicate_state(state) if use_pmap else state
             try:

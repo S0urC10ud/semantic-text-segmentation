@@ -155,6 +155,18 @@ class EpochPrefetchBatcher:
             t.join(timeout=2.0)
             if t.is_alive():
                 t.terminate()
+                t.join(timeout=2.0)
+            if t.is_alive() and hasattr(t, "kill"):
+                t.kill()
+                t.join(timeout=2.0)
+        try:
+            self.q.close()
+        except Exception:
+            pass
+        try:
+            self.q.cancel_join_thread()
+        except Exception:
+            pass
 
 
 class MonitorFineTuneBatcher:
@@ -346,4 +358,15 @@ class MonitorFineTuneBatcher:
             t.join(timeout=2.0)
             if t.is_alive():
                 t.terminate()
-
+                t.join(timeout=2.0)
+            if t.is_alive() and hasattr(t, "kill"):
+                t.kill()
+                t.join(timeout=2.0)
+        try:
+            self.q.close()
+        except Exception:
+            pass
+        try:
+            self.q.cancel_join_thread()
+        except Exception:
+            pass

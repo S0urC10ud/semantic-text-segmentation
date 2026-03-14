@@ -25,6 +25,7 @@ from active_learning.oracle import (
     _is_rate_limited_error,
     _is_non_retriable_quota_error,
     _normalize_segments,
+    normalize_label_to_allowed,
     _resolve_oracle_backend,
     merge_adjacent_segments,
 )
@@ -150,6 +151,15 @@ class TestOracleUtils(unittest.TestCase):
             "google/gemini-3-flash-preview",
         )
 
+    def test_normalize_label_to_allowed_preserves_open_set_other_label(self) -> None:
+        self.assertEqual(
+            normalize_label_to_allowed("other_jsx"),
+            ("other", "other_jsx"),
+        )
+        self.assertEqual(
+            normalize_label_to_allowed("other-angular"),
+            ("other", "other_angular"),
+        )
 
     def test_oracle_init_picks_openrouter_if_only_openrouter_key_exists(self) -> None:
         with patch.dict("os.environ", {"OPEN_ROUTER_API_KEY": "or-key"}, clear=True):
@@ -199,6 +209,34 @@ class TestOracleUtils(unittest.TestCase):
             ],
         )
 
+    def test_normalize_segments_maps_open_set_label_to_other_with_raw_label_preserved(self) -> None:
+        text = "return (<div className={style.content}>Save</div>);"
+        snippet = BoundarySnippet(
+            snippet_id="jsx-1",
+            text=text,
+            global_start=0,
+            global_end=len(text),
+            boundary=text.index("<"),
+            predicted_labels=["javascript_typescript"] * len(text),
+            metadata={"source_lang": "javascript_typescript"},
+        )
+        normalized = _normalize_segments(
+            snippet,
+            [
+                OracleSegment(0, 8, "javascript_typescript", "javascript_typescript"),
+                OracleSegment(8, len(text) - 2, "other_jsx", "other_jsx"),
+                OracleSegment(len(text) - 2, len(text), "javascript_typescript", "javascript_typescript"),
+            ],
+        )
+        self.assertEqual(
+            normalized,
+            [
+                OracleSegment(0, 8, "javascript_typescript", None),
+                OracleSegment(8, len(text) - 2, "other", "other_jsx"),
+                OracleSegment(len(text) - 2, len(text), "javascript_typescript", None),
+            ],
+        )
+
     def test_build_prompt_contains_svg_inline_style_example(self) -> None:
         text = '<text id="text823" style="font-size:3.88584304px;fill:#00cedb"></text>'
         n = len(text)
@@ -216,6 +254,26 @@ class TestOracleUtils(unittest.TestCase):
         self.assertIn("font-size:3.88584304px;fill:#00cedb", prompt)
         self.assertIn("{'label':'svg','text':'style=\"'}", prompt)
         self.assertIn("{'label':'css','text':'font-size:3.88584304px", prompt)
+        self.assertIn("other_jsx", prompt)
+        self.assertIn("other_angular", prompt)
+        self.assertIn("Open-set `other_<best_guess>` labels will be normalized to `other` downstream", prompt)
+        self.assertIn("Prose is `text` only when there is no compelling evidence of a more specific content type", prompt)
+        self.assertIn("Example (markdown prose stays markdown, not text)", prompt)
+        self.assertIn("Use open-set labels precisely for template-specific syntax when the surrounding bytes fit a standard type", prompt)
+        self.assertIn("Example (true HTML inline handler/style splits still matter)", prompt)
+        self.assertIn("{'label':'html','text':'<button style=\"'}", prompt)
+        self.assertIn("Example (true HTML wrapper with javascript body)", prompt)
+        self.assertIn("{'label':'html','text':'<script type=\"text/javascript\">\\n'}", prompt)
+        self.assertIn("Example (html/css nested inside a javascript string literal)", prompt)
+        self.assertIn("{'label':'javascript_typescript','text':'const snippet = \"'}", prompt)
+        self.assertIn("Example (Django template syntax is open-set, surrounding markup stays html/css)", prompt)
+        self.assertIn("other_django_template", prompt)
+        self.assertIn("Example (React JSX uses open-set labels only for JSX-specific syntax)", prompt)
+        self.assertIn("{'label':'html','text':'<div '}", prompt)
+        self.assertIn("{'label':'other_jsx','text':'onClick={'}", prompt)
+        self.assertIn("Example (Angular uses open-set labels only for Angular-specific syntax)", prompt)
+        self.assertIn("{'label':'html','text':'<button '}", prompt)
+        self.assertIn("{'label':'other_angular','text':'(click)=\"'}", prompt)
 
     def test_annotate_batch_recovers_missing_snippet_ids(self) -> None:
         snippet_a = BoundarySnippet(

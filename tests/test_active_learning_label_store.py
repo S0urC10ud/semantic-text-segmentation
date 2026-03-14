@@ -160,6 +160,58 @@ class TestLabelStore(unittest.TestCase):
             ]
             self.assertEqual(as_tuples, [("hash_a", 0, 0), ("hash_b", 1, 1)])
 
+    def test_open_set_labels_persist_in_sqlite_but_train_as_other(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "al.sqlite"
+            store = LabelStore(db_path)
+
+            store.add(
+                StoredRefinement(
+                    round_id="r1",
+                    source_split="train",
+                    source_lang="javascript_typescript",
+                    sample_index=0,
+                    sample_hash="hash_jsx",
+                    boundary_index=8,
+                    snippet_start=0,
+                    snippet_end=17,
+                    snippet_text="<div>Save</div>\n",
+                    oracle_name="gemini",
+                    oracle_model="gemini-test",
+                    oracle_run_id="run-1",
+                    status="ok",
+                    acquisition_score=0.5,
+                    predicted_segments=[],
+                    refined_segments=[
+                        {"start": 0, "end": 15, "label": "other", "open_set_label": "other_jsx"},
+                        {"start": 15, "end": 16, "label": "javascript_typescript"},
+                    ],
+                    metadata={"oracle_open_set_labels": ["other_jsx"]},
+                )
+            )
+
+            with sqlite3.connect(str(db_path)) as con:
+                row = con.execute(
+                    "SELECT refined_segments_json, metadata_json FROM refinements WHERE sample_hash = ?",
+                    ("hash_jsx",),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertIn('"open_set_label": "other_jsx"', str(row[0]))
+            self.assertIn('"other_jsx"', str(row[1]))
+
+            windows = store.build_training_windows(
+                window_bytes=32,
+                pad_byte_id=0,
+                pad_label_id=255,
+                label_to_id={"javascript_typescript": 0, "other": 1},
+                max_windows=1,
+                fallback_label="other",
+            )
+            self.assertEqual(len(windows), 1)
+            _, labels = windows[0]
+            self.assertTrue(all(int(v) == 1 for v in labels[:15]))
+            self.assertEqual(int(labels[15]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
