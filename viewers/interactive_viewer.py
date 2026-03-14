@@ -440,6 +440,14 @@ def api_segment(req: SegmentRequest):
                 payload["others"] = remaining
             probs_attr = esc(json.dumps(payload))
             display_label = esc(ID2NAME.get(lbl, str(lbl)))
+
+            if ch == "\n":
+                chars_html.append(
+                    f'<span class="char newline" style="background-color:{char_bg};" '
+                    f'data-probs="{probs_attr}" data-label="{display_label}"><br></span>'
+                )
+                continue
+
             chars_html.append(
                 f'<span class="char" style="background-color:{char_bg};" '
                 f'data-probs="{probs_attr}" data-label="{display_label}">{esc(ch)}</span>'

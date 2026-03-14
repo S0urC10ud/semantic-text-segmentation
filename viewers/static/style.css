@@ -218,6 +218,15 @@ textarea.code{
 
 /* Tooltip + per-char confidence heatmap */
 .char { position: relative; cursor: pointer; display: inline-block; border-radius: 3px; }
+.char.newline {
+  display: block;
+  width: 100%;
+  height: 0;
+  line-height: 0;
+  margin: 0;
+  padding: 0;
+  visibility: hidden;
+}
 .tooltip {
   display: none;
   position: fixed;
