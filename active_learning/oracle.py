@@ -546,6 +546,7 @@ class GeminiBoundaryOracle:
         self,
         *,
         model: str = "gemini-3-flash-preview",
+        thinking_level: str = "medium",
         api_key: Optional[str] = None,
         batch_size: int = 8,
         proxy: Optional[str] = None,
@@ -557,6 +558,7 @@ class GeminiBoundaryOracle:
         progress_leave: bool = False,
     ) -> None:
         self.model = str(model)
+        self.thinking_level = self._normalize_thinking_level(thinking_level)
         self.batch_size = max(1, int(batch_size))
         self.rate_limit_sleep_seconds = max(1.0, float(rate_limit_sleep_seconds))
         self.rate_limit_max_retries = max(0, int(rate_limit_max_retries))
@@ -605,6 +607,39 @@ class GeminiBoundaryOracle:
     @property
     def name(self) -> str:
         return "gemini_boundary_refine"
+
+    @staticmethod
+    def _normalize_thinking_level(value: object) -> str:
+        raw = str(value or "medium").strip().lower()
+        if raw not in {"minimal", "low", "medium", "high"}:
+            raise ValueError(
+                "thinking_level must be one of: minimal, low, medium, high"
+            )
+        return raw
+
+    def _thinking_level_for_sdk(self) -> object:
+        level = str(getattr(self, "thinking_level", "medium")).strip().lower() or "medium"
+        if types is None:
+            return level.upper()
+        enum_cls = getattr(types, "ThinkingLevel", None)
+        if enum_cls is None:
+            return level.upper()
+        enum_value = getattr(enum_cls, level.upper(), None)
+        if enum_value is not None:
+            return enum_value
+        return level.upper()
+
+    def _build_generate_content_config(self):
+        if types is None:
+            raise RuntimeError("google-genai types are unavailable for Gemini direct backend.")
+        return types.GenerateContentConfig(
+            system_instruction=self._system_instruction(),
+            thinking_config=types.ThinkingConfig(
+                thinking_level=self._thinking_level_for_sdk(),
+            ),
+            response_mime_type="application/json",
+            response_schema=ORACLE_RESPONSE_SCHEMA,
+        )
 
     def annotate(self, snippets: Sequence[BoundarySnippet]) -> Dict[str, List[OracleSegment]]:
         out: Dict[str, List[OracleSegment]] = {}
@@ -997,12 +1032,7 @@ class GeminiBoundaryOracle:
                     parts=[types.Part.from_text(text=prompt)],
                 )
             ]
-            config = types.GenerateContentConfig(
-                system_instruction=self._system_instruction(),
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                response_mime_type="application/json",
-                response_schema=ORACLE_RESPONSE_SCHEMA,
-            )
+            config = self._build_generate_content_config()
 
         for attempt in range(self.rate_limit_max_retries + 1):
             usage_metadata = None

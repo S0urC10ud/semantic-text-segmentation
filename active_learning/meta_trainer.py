@@ -218,7 +218,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--al-max-candidates-per-sample", type=int, default=3)
     parser.add_argument("--al-min-score", type=float, default=0.5)
     parser.add_argument("--al-context-chars", type=int, default=250)
+    parser.add_argument("--al-predict-batch-size", type=int, default=12)
     parser.add_argument("--al-gemini-model", type=str, default="gemini-3-flash-preview")
+    parser.add_argument(
+        "--al-gemini-thinking-level",
+        type=str,
+        choices=("minimal", "low", "medium", "high"),
+        default="medium",
+    )
     parser.add_argument("--al-gemini-batch-size", type=int, default=32)
     parser.add_argument("--al-gemini-rate-limit-sleep-seconds", type=float, default=65.0)
     parser.add_argument("--al-gemini-rate-limit-max-retries", type=int, default=8)
@@ -304,9 +311,11 @@ def main() -> None:
                 "al_split": str(args.al_split),
                 "al_oracle": str(args.al_oracle),
                 "al_gemini_model": str(args.al_gemini_model),
+                "al_gemini_thinking_level": str(args.al_gemini_thinking_level),
                 "al_gemini_batch_size": int(args.al_gemini_batch_size),
                 "al_max_samples_per_lang": int(args.al_max_samples_per_lang),
                 "al_max_candidates_per_sample": int(args.al_max_candidates_per_sample),
+                "al_predict_batch_size": int(args.al_predict_batch_size),
                 "al_mix_prob_max": float(args.al_mix_prob),
                 "al_mix_full_at_rows": int(args.al_mix_full_at_rows),
                 "al_max_oracle_requests": None if args.al_unlimited_oracle else int(args.al_max_oracle_requests),
@@ -364,10 +373,14 @@ def main() -> None:
             str(args.al_min_score),
             "--context-chars",
             str(min(250, max(8, int(args.al_context_chars)))),
+            "--predict-batch-size",
+            str(max(1, int(args.al_predict_batch_size))),
             "--oracle",
             args.al_oracle,
             "--gemini-model",
             args.al_gemini_model,
+            "--gemini-thinking-level",
+            args.al_gemini_thinking_level,
             "--gemini-batch-size",
             str(args.al_gemini_batch_size),
             "--gemini-rate-limit-sleep-seconds",

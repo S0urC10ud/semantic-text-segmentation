@@ -1208,6 +1208,7 @@ class Predictor:
         dtype_str: str = "bfloat16",
         chunk: int = DEFAULT_CHUNK_SIZE,
         other_threshold: Optional[float] = 0.2,
+        inference_batch_size: int = 12,
     ):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -1251,6 +1252,7 @@ class Predictor:
         self.other_threshold: Optional[float] = (
             float(other_threshold) if other_threshold is not None and other_threshold > 0.0 else None
         )
+        self.inference_batch_size = max(1, int(inference_batch_size))
 
     @staticmethod
     def threshold_predictions(
@@ -1293,7 +1295,7 @@ class Predictor:
         weights = np.exp(-0.5 * (positions / sigma) ** 2)
         return weights.astype(np.float32)
 
-    def _segment_bytes(self, byte_arr: np.ndarray, chunk: int = None) -> tuple[np.ndarray, np.ndarray]:
+    def _resolve_chunk_size(self, chunk: int = None) -> int:
         chunk_size = self.chunk
         if chunk is not None:
             requested = int(chunk)
@@ -1301,65 +1303,155 @@ class Predictor:
                 raise ValueError(
                     f"Predictor initialized with chunk={self.chunk} but received chunk={requested}."
                 )
-        N = int(len(byte_arr))
-        out = np.zeros((N,), dtype=np.uint8)
-        probs_accum = np.zeros((N, self.num_classes), dtype=np.float32)
-        weight_accum = np.zeros((N,), dtype=np.float32)
-        if N == 0:
-            return out, probs_accum
-        win = max(64, chunk_size)
+        return chunk_size
+
+    @staticmethod
+    def _build_window_spans(length: int, chunk_size: int) -> List[Tuple[int, int]]:
+        n = int(length)
+        if n <= 0:
+            return []
+        win = max(64, int(chunk_size))
         stride = max(1, win // 2)
-        start_positions = list(range(0, max(1, N - win + 1), stride))
+        start_positions = list(range(0, max(1, n - win + 1), stride))
         if not start_positions:
             start_positions = [0]
         last_start = start_positions[-1]
-        tail_start = max(0, N - win)
-        if last_start + win < N and tail_start not in start_positions:
+        tail_start = max(0, n - win)
+        if last_start + win < n and tail_start not in start_positions:
             start_positions.append(tail_start)
         spans: List[Tuple[int, int]] = []
-        xs: List[np.ndarray] = []
         seen = set()
         for start in start_positions:
             if start in seen:
                 continue
             seen.add(start)
-            end = min(start + win, N)
-            xs.append(byte_arr[start:end])
-            spans.append((start, end))
-        if not xs:
-            xs = [byte_arr]
-            spans = [(0, N)]
-        bs = 16
-        for i in range(0, len(xs), bs):
-            batch = xs[i:i+bs]
+            end = min(start + win, n)
+            spans.append((int(start), int(end)))
+        if not spans:
+            spans = [(0, n)]
+        return spans
+
+    def _segment_bytes_batch(
+        self,
+        byte_arrays: Sequence[np.ndarray],
+        chunk: int = None,
+    ) -> tuple[List[np.ndarray], List[np.ndarray], List[List[Tuple[int, int]]]]:
+        chunk_size = self._resolve_chunk_size(chunk)
+        arrays = [_sanitize_model_bytes(np.asarray(arr, dtype=np.uint8)) for arr in byte_arrays]
+        probs_accum_list: List[np.ndarray] = [
+            np.zeros((int(arr.shape[0]), self.num_classes), dtype=np.float32)
+            for arr in arrays
+        ]
+        weight_accum_list: List[np.ndarray] = [
+            np.zeros((int(arr.shape[0]),), dtype=np.float32)
+            for arr in arrays
+        ]
+        spans_by_text: List[List[Tuple[int, int]]] = []
+        window_refs: List[Tuple[int, int, int, np.ndarray]] = []
+
+        for text_idx, arr in enumerate(arrays):
+            spans = self._build_window_spans(int(arr.shape[0]), chunk_size)
+            spans_by_text.append(spans)
+            for start, end in spans:
+                window_refs.append((text_idx, int(start), int(end), arr[start:end]))
+
+        if not window_refs:
+            byte_labels = [np.zeros((int(arr.shape[0]),), dtype=np.uint8) for arr in arrays]
+            return byte_labels, probs_accum_list, spans_by_text
+
+        batch_size = int(self.inference_batch_size)
+        for i in range(0, len(window_refs), batch_size):
+            batch = window_refs[i:i + batch_size]
             actual = len(batch)
-            tokens = np.full((bs, chunk_size), PAD_BYTE_ID, dtype=np.int32)
-            for j, b in enumerate(batch):
-                length = min(len(b), chunk_size)
-                tokens[j, :length] = b[:length].astype(np.int32)
+            tokens = np.full((batch_size, chunk_size), PAD_BYTE_ID, dtype=np.int32)
+            for j, (_, _, _, window_bytes) in enumerate(batch):
+                length = min(int(window_bytes.shape[0]), chunk_size)
+                if length > 0:
+                    tokens[j, :length] = window_bytes[:length].astype(np.int32)
             tokens = _sanitize_model_tokens(tokens)
             logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
-            # Convert logits to probabilities using softmax
-            probs_batch = np.array(jax.nn.softmax(logits, axis=-1))[:actual, :chunk_size]
-            for j, (s, e) in enumerate(spans[i:i+bs]):
-                plen = e - s
+            probs_batch = np.asarray(jax.nn.softmax(logits, axis=-1), dtype=np.float32)
+            probs_batch = probs_batch[:actual, :chunk_size]
+
+            for j, (text_idx, start, end, _) in enumerate(batch):
+                plen = int(end) - int(start)
                 if plen <= 0:
                     continue
                 weights = self._window_weights(plen)
                 window_probs = probs_batch[j, :plen]
-                probs_accum[s:e] += window_probs * weights[:, None]
-                weight_accum[s:e] += weights
-        if np.any(weight_accum > 0):
-            nonzero = weight_accum > 0
-            probs_accum[nonzero] /= weight_accum[nonzero, None]
-            zero_mask = ~nonzero
-            if np.any(zero_mask):
-                probs_accum[zero_mask] = 1.0 / self.num_classes
-        else:
-            probs_accum[:] = 1.0 / self.num_classes
-        out = np.argmax(probs_accum, axis=-1).astype(np.uint8)
-        self._last_window_spans = [(int(s), int(e)) for (s, e) in spans]
-        return out, probs_accum
+                probs_accum_list[text_idx][start:end] += window_probs * weights[:, None]
+                weight_accum_list[text_idx][start:end] += weights
+
+        byte_labels: List[np.ndarray] = []
+        for probs_accum, weight_accum in zip(probs_accum_list, weight_accum_list):
+            if probs_accum.size <= 0:
+                byte_labels.append(np.zeros((0,), dtype=np.uint8))
+                continue
+            if np.any(weight_accum > 0):
+                nonzero = weight_accum > 0
+                probs_accum[nonzero] /= weight_accum[nonzero, None]
+                zero_mask = ~nonzero
+                if np.any(zero_mask):
+                    probs_accum[zero_mask] = 1.0 / self.num_classes
+            else:
+                probs_accum[:] = 1.0 / self.num_classes
+            byte_labels.append(np.argmax(probs_accum, axis=-1).astype(np.uint8))
+        return byte_labels, probs_accum_list, spans_by_text
+
+    def _segment_bytes(self, byte_arr: np.ndarray, chunk: int = None) -> tuple[np.ndarray, np.ndarray]:
+        byte_labels, byte_probs, spans_by_text = self._segment_bytes_batch([byte_arr], chunk=chunk)
+        self._last_window_spans = list(spans_by_text[0]) if spans_by_text else []
+        return byte_labels[0], byte_probs[0]
+
+    @staticmethod
+    def _build_windows_info(text: str, spans: Sequence[Tuple[int, int]]) -> List[Dict[str, int]]:
+        if not spans:
+            return []
+        byte_offsets = [0]
+        for ch in text:
+            byte_offsets.append(byte_offsets[-1] + len(ch.encode("utf-8", "ignore")))
+        windows_info: List[Dict[str, int]] = []
+        for idx, (start_byte, end_byte) in enumerate(spans):
+            start_char = bisect.bisect_left(byte_offsets, int(start_byte))
+            end_char = bisect.bisect_left(byte_offsets, int(end_byte))
+            windows_info.append(
+                {
+                    "index": idx,
+                    "start_byte": int(start_byte),
+                    "end_byte": int(end_byte),
+                    "start_char": int(start_char),
+                    "end_char": int(end_char),
+                }
+            )
+        return windows_info
+
+    def _finalize_segmented_text(
+        self,
+        *,
+        text: str,
+        byte_labels: np.ndarray,
+        byte_probs: np.ndarray,
+        spans: Sequence[Tuple[int, int]],
+        min_run_chars: int,
+    ) -> tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]]:
+        char_labels, char_probs = self._byte_labels_to_char_labels(text, byte_labels, byte_probs)
+        # Apply open-set thresholding first; when enabled we skip run-length
+        # smoothing to avoid mutating thresholded OTHER predictions.
+        char_labels, char_probs = self._apply_other_threshold(char_labels, char_probs)
+        if self.other_threshold is None or self.other_threshold <= 0.0:
+            char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
+        segs: List[Tuple[int, int, int]] = []
+        if len(char_labels) > 0:
+            cur = char_labels[0]
+            start = 0
+            for i in range(1, len(char_labels)):
+                if char_labels[i] != cur:
+                    segs.append((start, i, cur))
+                    start = i
+                    cur = char_labels[i]
+            segs.append((start, len(char_labels), cur))
+        windows_info = self._build_windows_info(text, spans)
+        return segs, char_labels, char_probs, windows_info
 
     def predict_logits(self, token_batch: np.ndarray) -> np.ndarray:
         """
@@ -1475,40 +1567,42 @@ class Predictor:
                 arr[i] = new_lbl
         return arr
 
-    def segment_text(self, text: str, min_run_chars: int = 6, chunk: int = None):
-        b = _sanitize_model_bytes(np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8))
-        byte_labels, byte_probs = self._segment_bytes(b)
-        char_labels, char_probs = self._byte_labels_to_char_labels(text, byte_labels, byte_probs)
-        # Apply open-set thresholding first; when enabled we skip run-length
-        # smoothing to avoid mutating thresholded OTHER predictions.
-        char_labels, char_probs = self._apply_other_threshold(char_labels, char_probs)
-        if self.other_threshold is None or self.other_threshold <= 0.0:
-            char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
-        segs = []
-        if len(char_labels) > 0:
-            cur = char_labels[0]; start = 0
-            for i in range(1, len(char_labels)):
-                if char_labels[i] != cur:
-                    segs.append((start, i, cur))
-                    start = i; cur = char_labels[i]
-            segs.append((start, len(char_labels), cur))
-        spans = getattr(self, "_last_window_spans", None)
-        if not spans:
-            spans = [(0, int(len(b)))]
-        byte_offsets = [0]
-        for ch in text:
-            byte_offsets.append(byte_offsets[-1] + len(ch.encode("utf-8", "ignore")))
-        windows_info: List[Dict[str, int]] = []
-        for idx, (start_byte, end_byte) in enumerate(spans):
-            start_char = bisect.bisect_left(byte_offsets, start_byte)
-            end_char = bisect.bisect_left(byte_offsets, end_byte)
-            windows_info.append(
-                {
-                    "index": idx,
-                    "start_byte": int(start_byte),
-                    "end_byte": int(end_byte),
-                    "start_char": int(start_char),
-                    "end_char": int(end_char),
-                }
+    def segment_texts(
+        self,
+        texts: Sequence[str],
+        min_run_chars: int = 6,
+        chunk: int = None,
+    ) -> List[tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]]]:
+        byte_arrays = [
+            _sanitize_model_bytes(np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8))
+            for text in texts
+        ]
+        byte_labels_by_text, byte_probs_by_text, spans_by_text = self._segment_bytes_batch(
+            byte_arrays,
+            chunk=chunk,
+        )
+        results: List[tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]]] = []
+        for text, byte_labels, byte_probs, spans in zip(
+            texts,
+            byte_labels_by_text,
+            byte_probs_by_text,
+            spans_by_text,
+        ):
+            results.append(
+                self._finalize_segmented_text(
+                    text=text,
+                    byte_labels=byte_labels,
+                    byte_probs=byte_probs,
+                    spans=spans,
+                    min_run_chars=min_run_chars,
+                )
             )
-        return segs, char_labels, char_probs, windows_info
+        return results
+
+    def segment_text(self, text: str, min_run_chars: int = 6, chunk: int = None):
+        result = self.segment_texts([text], min_run_chars=min_run_chars, chunk=chunk)[0]
+        self._last_window_spans = [
+            (int(window["start_byte"]), int(window["end_byte"]))
+            for window in result[3]
+        ]
+        return result

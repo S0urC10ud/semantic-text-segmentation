@@ -183,6 +183,7 @@ def _build_predictor(args: argparse.Namespace) -> Predictor:
         dtype_str=str(args.dtype),
         chunk=int(args.chunk),
         other_threshold=float(args.other_threshold) if args.other_threshold > 0 else None,
+        inference_batch_size=max(1, int(getattr(args, "predict_batch_size", 12))),
     )
 
 
@@ -235,18 +236,19 @@ def _iter_split_examples(
         )
 
 
-def _build_snippets_for_sample(
+def _build_snippets_from_prediction(
     *,
     normalized_text: str,
     lang: str,
     sample_index: int,
-    predictor: Predictor,
+    sample_hash: str,
+    char_labels: Sequence[int],
+    char_probs: Sequence[Dict[str, float]],
     max_candidates_per_sample: int,
     context_chars: int,
     min_score: float,
 ) -> tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]:
     normalized = normalized_text
-    _, char_labels, char_probs, _ = predictor.segment_text(normalized, min_run_chars=1)
     if not char_labels or not char_probs:
         return [], []
     probs = _probs_dicts_to_matrix(char_probs, cfg.NUM_CLASSES)
@@ -262,7 +264,6 @@ def _build_snippets_for_sample(
         min_score=float(min_score),
         other_id=getattr(cfg, "OTHER_CLASS_INDEX", None),
     )
-    sample_hash = _hash_text(normalized)
     out: List[tuple[BoundarySnippet, CandidateSpan]] = []
     for cand in candidates:
         snippet_labels = [
@@ -300,6 +301,69 @@ def _build_snippets_for_sample(
         )
         out.append((snippet, cand))
     return out, sample_pred_segments
+
+
+def _build_snippets_for_sample(
+    *,
+    normalized_text: str,
+    lang: str,
+    sample_index: int,
+    predictor: Predictor,
+    max_candidates_per_sample: int,
+    context_chars: int,
+    min_score: float,
+    sample_hash: Optional[str] = None,
+) -> tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]:
+    normalized = normalized_text
+    _, char_labels, char_probs, _ = predictor.segment_text(normalized, min_run_chars=1)
+    resolved_hash = str(sample_hash) if sample_hash else _hash_text(normalized)
+    return _build_snippets_from_prediction(
+        normalized_text=normalized,
+        lang=lang,
+        sample_index=sample_index,
+        sample_hash=resolved_hash,
+        char_labels=char_labels,
+        char_probs=char_probs,
+        max_candidates_per_sample=max_candidates_per_sample,
+        context_chars=context_chars,
+        min_score=min_score,
+    )
+
+
+def _build_snippets_for_samples_batch(
+    *,
+    samples: Sequence[tuple[str, int, str, str]],
+    predictor: Predictor,
+    max_candidates_per_sample: int,
+    context_chars: int,
+    min_score: float,
+) -> List[tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]]:
+    if not samples:
+        return []
+    texts = [normalized for _, _, normalized, _ in samples]
+    segmented = predictor.segment_texts(texts, min_run_chars=1)
+    if len(segmented) != len(samples):
+        raise RuntimeError(
+            "Predictor returned a mismatched number of batched segmentation results: "
+            f"expected {len(samples)}, got {len(segmented)}."
+        )
+    out: List[tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]] = []
+    for (lang, sample_index, normalized, sample_hash), result in zip(samples, segmented):
+        _, char_labels, char_probs, _ = result
+        out.append(
+            _build_snippets_from_prediction(
+                normalized_text=normalized,
+                lang=lang,
+                sample_index=int(sample_index),
+                sample_hash=str(sample_hash),
+                char_labels=char_labels,
+                char_probs=char_probs,
+                max_candidates_per_sample=max_candidates_per_sample,
+                context_chars=context_chars,
+                min_score=min_score,
+            )
+        )
+    return out
 
 
 def _limit_snippets_for_oracle_requests(
@@ -359,6 +423,7 @@ def run_one_round(
         dtype="bfloat16",
         chunk=DEFAULT_CHUNK_SIZE,
         other_threshold=0.2,
+        predict_batch_size=12,
     )
     if predictor_kwargs:
         for key, value in predictor_kwargs.items():
@@ -366,6 +431,7 @@ def run_one_round(
     predictor = _build_predictor(predictor_args)
     store = LabelStore(store_path)
     rng = np.random.default_rng(sample_seed)
+    scoring_text_batch_size = max(1, int(getattr(predictor, "inference_batch_size", 12)))
     seen_hashes: set[str] = set()
     if skip_seen_hashes:
         seen_hashes = store.existing_sample_hashes()
@@ -381,6 +447,70 @@ def run_one_round(
     inference_rows: List[StoredInferenceSample] = []
     total_samples_seen = 0
     total_samples_with_candidates = 0
+
+    def _process_scored_batch(samples_batch: Sequence[tuple[str, int, str, str]]) -> None:
+        nonlocal total_samples_with_candidates
+        if not samples_batch:
+            return
+        batch_results = _build_snippets_for_samples_batch(
+            samples=samples_batch,
+            predictor=predictor,
+            max_candidates_per_sample=max_candidates_per_sample,
+            context_chars=context_chars,
+            min_score=min_score,
+        )
+        for (lang, sample_idx, normalized, sample_hash), (
+            sample_snippets,
+            sample_pred_segments,
+        ) in zip(samples_batch, batch_results):
+            if sample_snippets:
+                total_samples_with_candidates += 1
+            trigger_ranges: List[Dict[str, object]] = []
+            for snippet, cand in sample_snippets:
+                snippets.append(snippet)
+                score_by_id[snippet.snippet_id] = float(cand.score)
+                pred_segments_by_id[snippet.snippet_id] = _segments_from_label_names(
+                    snippet.predicted_labels
+                )
+                source_by_id[snippet.snippet_id] = dict(snippet.metadata)
+                trigger_ranges.append(
+                    {
+                        "start": int(cand.start),
+                        "end": int(cand.end),
+                        "boundary": int(cand.boundary),
+                        "score": float(cand.score),
+                        "entropy_mean": float(cand.entropy_mean),
+                        "flip_rate": float(cand.flip_rate),
+                        "is_other_boundary": bool(cand.is_other_boundary),
+                        "left_label_id": int(cand.left_label),
+                        "right_label_id": int(cand.right_label),
+                        "left_label": cfg.ID2LANG.get(int(cand.left_label), "other"),
+                        "right_label": cfg.ID2LANG.get(int(cand.right_label), "other"),
+                    }
+                )
+
+            inference_rows.append(
+                StoredInferenceSample(
+                    round_id=round_id,
+                    source_split=str(split),
+                    source_lang=str(lang),
+                    sample_index=int(sample_idx),
+                    sample_hash=str(sample_hash),
+                    sample_text=normalized,
+                    char_count=int(len(normalized)),
+                    queried_for_oracle=False,
+                    candidate_count=int(len(sample_snippets)),
+                    trigger_ranges=trigger_ranges,
+                    predicted_segments=sample_pred_segments,
+                    metadata={
+                        "max_candidates_per_sample": int(max_candidates_per_sample),
+                        "min_score": float(min_score),
+                        "context_chars": int(context_chars),
+                    },
+                )
+            )
+
+    pending_samples: List[tuple[str, int, str, str]] = []
     for lang, sample_idx, normalized, sample_hash in _iter_split_examples(
         Path(data_root),
         split,
@@ -390,59 +520,13 @@ def run_one_round(
         seen_hashes=seen_hashes if skip_seen_hashes else None,
     ):
         total_samples_seen += 1
-        sample_snippets, sample_pred_segments = _build_snippets_for_sample(
-            normalized_text=normalized,
-            lang=lang,
-            sample_index=sample_idx,
-            predictor=predictor,
-            max_candidates_per_sample=max_candidates_per_sample,
-            context_chars=context_chars,
-            min_score=min_score,
-        )
-        if sample_snippets:
-            total_samples_with_candidates += 1
-        trigger_ranges: List[Dict[str, object]] = []
-        for snippet, cand in sample_snippets:
-            snippets.append(snippet)
-            score_by_id[snippet.snippet_id] = float(cand.score)
-            pred_segments_by_id[snippet.snippet_id] = _segments_from_label_names(snippet.predicted_labels)
-            source_by_id[snippet.snippet_id] = dict(snippet.metadata)
-            trigger_ranges.append(
-                {
-                    "start": int(cand.start),
-                    "end": int(cand.end),
-                    "boundary": int(cand.boundary),
-                    "score": float(cand.score),
-                    "entropy_mean": float(cand.entropy_mean),
-                    "flip_rate": float(cand.flip_rate),
-                    "is_other_boundary": bool(cand.is_other_boundary),
-                    "left_label_id": int(cand.left_label),
-                    "right_label_id": int(cand.right_label),
-                    "left_label": cfg.ID2LANG.get(int(cand.left_label), "other"),
-                    "right_label": cfg.ID2LANG.get(int(cand.right_label), "other"),
-                }
-            )
+        pending_samples.append((str(lang), int(sample_idx), normalized, str(sample_hash)))
+        if len(pending_samples) >= scoring_text_batch_size:
+            _process_scored_batch(pending_samples)
+            pending_samples = []
 
-        inference_rows.append(
-            StoredInferenceSample(
-                round_id=round_id,
-                source_split=str(split),
-                source_lang=str(lang),
-                sample_index=int(sample_idx),
-                sample_hash=sample_hash,
-                sample_text=normalized,
-                char_count=int(len(normalized)),
-                queried_for_oracle=False,
-                candidate_count=int(len(sample_snippets)),
-                trigger_ranges=trigger_ranges,
-                predicted_segments=sample_pred_segments,
-                metadata={
-                    "max_candidates_per_sample": int(max_candidates_per_sample),
-                    "min_score": float(min_score),
-                    "context_chars": int(context_chars),
-                },
-            )
-        )
+    if pending_samples:
+        _process_scored_batch(pending_samples)
 
     inference_inserted = store.add_inference_samples_many(inference_rows)
     print(
@@ -799,6 +883,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-score", type=float, default=0.5)
     parser.add_argument("--oracle", choices=("stub", "gemini"), default="gemini")
     parser.add_argument("--gemini-model", type=str, default="gemini-3-flash-preview")
+    parser.add_argument(
+        "--gemini-thinking-level",
+        type=str,
+        choices=("minimal", "low", "medium", "high"),
+        default="medium",
+    )
     parser.add_argument("--gemini-batch-size", type=int, default=32)
     parser.add_argument("--gemini-rate-limit-sleep-seconds", type=float, default=65.0)
     parser.add_argument("--gemini-rate-limit-max-retries", type=int, default=8)
@@ -835,6 +925,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--chunk", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--other-threshold", type=float, default=0.2)
+    parser.add_argument(
+        "--predict-batch-size",
+        type=int,
+        default=12,
+        help="Window batch size for local model scoring during AL acquisition.",
+    )
     return parser
 
 
@@ -848,6 +944,7 @@ def main() -> None:
     if args.oracle == "gemini":
         oracle = GeminiBoundaryOracle(
             model=args.gemini_model,
+            thinking_level=args.gemini_thinking_level,
             api_key=args.api_key,
             batch_size=args.gemini_batch_size,
             proxy=args.proxy,
@@ -872,6 +969,7 @@ def main() -> None:
         "dtype": args.dtype,
         "chunk": args.chunk,
         "other_threshold": args.other_threshold,
+        "predict_batch_size": args.predict_batch_size,
     }
     summary = run_one_round(
         ckpt_path=args.ckpt,

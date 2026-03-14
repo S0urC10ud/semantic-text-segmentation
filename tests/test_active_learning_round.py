@@ -11,8 +11,14 @@ if str(ROOT) not in sys.path:
 if str(TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAIN_ROOT))
 
+import utils.config as cfg
 from active_learning.oracle import BoundarySnippet
-from active_learning.round import _limit_snippets_for_oracle_requests, _make_snippet_id
+from active_learning.round import (
+    _build_parser,
+    _build_snippets_for_samples_batch,
+    _limit_snippets_for_oracle_requests,
+    _make_snippet_id,
+)
 
 
 def _snippet(sid: str) -> BoundarySnippet:
@@ -83,6 +89,97 @@ class TestRoundOracleRequestCap(unittest.TestCase):
             max_oracle_requests=0,
         )
         self.assertEqual(kept, [])
+
+    def test_build_snippets_for_samples_batch_uses_batched_predictor(self) -> None:
+        html_id = int(cfg.LANG2ID["html"])
+        css_id = int(cfg.LANG2ID["css"])
+
+        class FakePredictor:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def segment_texts(self, texts, min_run_chars=6, chunk=None):
+                self.calls.append(
+                    {
+                        "texts": list(texts),
+                        "min_run_chars": int(min_run_chars),
+                        "chunk": chunk,
+                    }
+                )
+                out = []
+                for text in texts:
+                    split = max(1, len(text) // 2)
+                    labels = [html_id] * split + [css_id] * (len(text) - split)
+                    probs = []
+                    for idx in range(len(text)):
+                        if idx < split:
+                            probs.append({str(html_id): 0.99, str(css_id): 0.01})
+                        else:
+                            probs.append({str(html_id): 0.01, str(css_id): 0.99})
+                    out.append(([], labels, probs, []))
+                return out
+
+        predictor = FakePredictor()
+        samples = [
+            ("html", 11, "abcd", "hash-a"),
+            ("html", 12, "wxyzuv", "hash-b"),
+        ]
+
+        results = _build_snippets_for_samples_batch(
+            samples=samples,
+            predictor=predictor,
+            max_candidates_per_sample=1,
+            context_chars=16,
+            min_score=0.0,
+        )
+
+        self.assertEqual(
+            predictor.calls,
+            [{"texts": ["abcd", "wxyzuv"], "min_run_chars": 1, "chunk": None}],
+        )
+        self.assertEqual(len(results), 2)
+
+        sample_snippets_a, pred_segments_a = results[0]
+        self.assertEqual(
+            pred_segments_a,
+            [
+                {"start": 0, "end": 2, "label": "html"},
+                {"start": 2, "end": 4, "label": "css"},
+            ],
+        )
+        self.assertEqual(len(sample_snippets_a), 1)
+        snippet_a, cand_a = sample_snippets_a[0]
+        self.assertEqual(snippet_a.text, "abcd")
+        self.assertEqual(snippet_a.metadata["sample_hash"], "hash-a")
+        self.assertEqual(snippet_a.predicted_labels, ["html", "html", "css", "css"])
+        self.assertEqual((cand_a.start, cand_a.end, cand_a.boundary), (0, 4, 2))
+
+        sample_snippets_b, pred_segments_b = results[1]
+        self.assertEqual(
+            pred_segments_b,
+            [
+                {"start": 0, "end": 3, "label": "html"},
+                {"start": 3, "end": 6, "label": "css"},
+            ],
+        )
+        self.assertEqual(len(sample_snippets_b), 1)
+        snippet_b, cand_b = sample_snippets_b[0]
+        self.assertEqual(snippet_b.text, "wxyzuv")
+        self.assertEqual(snippet_b.metadata["sample_hash"], "hash-b")
+        self.assertEqual(snippet_b.predicted_labels, ["html", "html", "html", "css", "css", "css"])
+        self.assertEqual((cand_b.start, cand_b.end, cand_b.boundary), (0, 6, 3))
+
+    def test_round_parser_defaults_predict_batch_size_to_twelve(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--ckpt",
+                "checkpoint.msgpack",
+                "--store",
+                "active_learning/label_store.sqlite",
+            ]
+        )
+        self.assertEqual(args.predict_batch_size, 12)
+        self.assertEqual(args.gemini_thinking_level, "medium")
 
 
 if __name__ == "__main__":

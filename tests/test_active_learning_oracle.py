@@ -169,6 +169,36 @@ class TestOracleUtils(unittest.TestCase):
         if getattr(oracle, "_openrouter_client", None) is not None:
             oracle._openrouter_client.close()  # type: ignore[attr-defined]
 
+    def test_build_generate_content_config_uses_medium_thinking_level(self) -> None:
+        class _FakeThinkingConfig:
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = kwargs
+
+        class _FakeGenerateContentConfig:
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = kwargs
+
+        fake_types = pytypes.SimpleNamespace(
+            ThinkingConfig=_FakeThinkingConfig,
+            GenerateContentConfig=_FakeGenerateContentConfig,
+            ThinkingLevel=pytypes.SimpleNamespace(
+                MINIMAL="MINIMAL",
+                LOW="LOW",
+                MEDIUM="MEDIUM",
+                HIGH="HIGH",
+            ),
+        )
+        oracle = GeminiBoundaryOracle.__new__(GeminiBoundaryOracle)
+        oracle.thinking_level = "medium"
+
+        with patch("active_learning.oracle.types", fake_types):
+            config = oracle._build_generate_content_config()
+
+        self.assertEqual(
+            config.kwargs["thinking_config"].kwargs["thinking_level"],
+            "MEDIUM",
+        )
+
     def test_parse_segments_payload_accepts_text_chunks(self) -> None:
         raw = (
             '{"snippets":[{"snippet_id":"s1","segments":['
@@ -259,16 +289,16 @@ class TestOracleUtils(unittest.TestCase):
         self.assertIn("Open-set `other_<best_guess>` labels will be normalized to `other` downstream", prompt)
         self.assertIn("Prose is `text` only when there is no compelling evidence of a more specific content type", prompt)
         self.assertIn("Example (markdown prose stays markdown, not text)", prompt)
-        self.assertIn("Use open-set labels precisely for template-specific syntax when the surrounding bytes fit a standard type", prompt)
+        self.assertIn("Use open-set labels especially for template-specific syntax when the surrounding bytes fit a standard type", prompt)
         self.assertIn("Example (true HTML inline handler/style splits still matter)", prompt)
         self.assertIn("{'label':'html','text':'<button style=\"'}", prompt)
         self.assertIn("Example (true HTML wrapper with javascript body)", prompt)
         self.assertIn("{'label':'html','text':'<script type=\"text/javascript\">\\n'}", prompt)
         self.assertIn("Example (html/css nested inside a javascript string literal)", prompt)
         self.assertIn("{'label':'javascript_typescript','text':'const snippet = \"'}", prompt)
-        self.assertIn("Example (Django template syntax is open-set, surrounding markup stays html/css)", prompt)
+        self.assertIn("Example (Django template syntax is open-set, surrounding markup stays html/css", prompt)
         self.assertIn("other_django_template", prompt)
-        self.assertIn("Example (React JSX uses open-set labels only for JSX-specific syntax)", prompt)
+        self.assertIn("Example (React JSX uses open-set labels only for JSX-specific syntax", prompt)
         self.assertIn("{'label':'html','text':'<div '}", prompt)
         self.assertIn("{'label':'other_jsx','text':'onClick={'}", prompt)
         self.assertIn("Example (Angular uses open-set labels only for Angular-specific syntax)", prompt)
