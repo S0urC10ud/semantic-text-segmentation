@@ -87,6 +87,10 @@ IGNORED_TRAINING_TOKEN_IDS: Tuple[int, ...] = tuple(
     sorted({ord(" "), ord("\t"), ord("\n"), ord("\r")})
 )
 
+# Auxiliary training targets: predict neighboring labels from the current token.
+AUX_NEIGHBOR_OFFSETS: Tuple[int, ...] = (-2, -1, 1, 2)
+AUX_NEIGHBOR_LOSS_WEIGHT: float = 1.0
+
 @dataclass
 class DataConfig:
     """Configuration for data loading, augmentation, and batching."""

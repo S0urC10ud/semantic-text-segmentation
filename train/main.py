@@ -61,6 +61,9 @@ from utils.model import (
     microbatch_grad_step_no_jit,
     microbatch_grad_step_with_oe_no_jit,
     grad_global_norm,
+    checkpoint_params_subtree,
+    merge_compatible_state,
+    seed_missing_auxiliary_heads_from_main,
     # Multi-GPU (pmap) variants
     replicate_state,
     unreplicate_state,
@@ -860,20 +863,92 @@ def main():
     num_params = count_params(state.params)
     print(f"Model created with {num_params/1e6:.2f}M parameters.", flush=True)
 
-    def _strict_load_params(target_params, raw_bytes, path_desc=""):
-        from flax.traverse_util import flatten_dict
-        msgpack_dict = serialization.msgpack_restore(raw_bytes)
-        flat_msgpack = flatten_dict(msgpack_dict)
-        flat_target = flatten_dict(serialization.to_state_dict(target_params))
-        missing_keys = set(flat_target.keys()) - set(flat_msgpack.keys())
-        extra_keys = set(flat_msgpack.keys()) - set(flat_target.keys())
-        if missing_keys or extra_keys:
-            raise ValueError(
-                f"Checkpoint structure mismatch for {path_desc}!\n"
-                f"Missing from checkpoint: {missing_keys}\n"
-                f"Extra in checkpoint: {extra_keys}"
+    def _format_restore_keys(keys, limit=4):
+        shown = ["/".join(map(str, key)) for key in keys[:limit]]
+        if len(keys) > limit:
+            shown.append("...")
+        return ", ".join(shown)
+
+    def _log_restore_stats(label: str, path_desc: str, stats: dict):
+        loaded = len(stats.get("loaded", ()))
+        missing = tuple(stats.get("missing", ()))
+        mismatched = tuple(stats.get("mismatched", ()))
+        extra = tuple(stats.get("extra", ()))
+        print(
+            f"{label} restore from {path_desc}: loaded={loaded}, "
+            f"missing={len(missing)}, mismatched={len(mismatched)}, extra={len(extra)}",
+            flush=True,
+        )
+        if missing:
+            print(
+                f"  Missing leaves kept from current init: {_format_restore_keys(missing)}",
+                flush=True,
             )
-        return serialization.from_state_dict(target_params, msgpack_dict)
+        if mismatched:
+            print(
+                f"  Shape-mismatched leaves kept from current init: {_format_restore_keys(mismatched)}",
+                flush=True,
+            )
+        if extra:
+            print(
+                f"  Extra checkpoint leaves ignored: {_format_restore_keys(extra)}",
+                flush=True,
+            )
+
+    def _restore_params_from_raw(target_params, raw_bytes, path_desc=""):
+        restored_obj = serialization.msgpack_restore(raw_bytes)
+        source_params = checkpoint_params_subtree(restored_obj)
+        params, stats = merge_compatible_state(target_params, source_params)
+        params, aux_note = seed_missing_auxiliary_heads_from_main(params, source_params)
+        _log_restore_stats("Param", path_desc, stats)
+        if aux_note:
+            print(f"  NOTE: {aux_note}", flush=True)
+        return params
+
+    def _restore_params_from_flax(target_params, ckpt_dir, ckpt_prefix, *, step=None, path_desc=""):
+        try:
+            restored_obj = checkpoints.restore_checkpoint(
+                ckpt_dir,
+                target=None,
+                step=step,
+                prefix=ckpt_prefix,
+            )
+        except Exception:
+            return None
+        if restored_obj is None:
+            return None
+        source_params = checkpoint_params_subtree(restored_obj)
+        params, stats = merge_compatible_state(target_params, source_params)
+        params, aux_note = seed_missing_auxiliary_heads_from_main(params, source_params)
+        _log_restore_stats("Param", path_desc or ckpt_dir, stats)
+        if aux_note:
+            print(f"  NOTE: {aux_note}", flush=True)
+        return params
+
+    def _restore_train_state_from_flax(target_state, ckpt_dir, ckpt_prefix, *, step=None, path_desc=""):
+        try:
+            restored_obj = checkpoints.restore_checkpoint(
+                ckpt_dir,
+                target=None,
+                step=step,
+                prefix=ckpt_prefix,
+            )
+        except Exception:
+            return None
+        if restored_obj is None:
+            return None
+        restored_state, stats = merge_compatible_state(target_state, restored_obj)
+        source_params = checkpoint_params_subtree(restored_obj)
+        restored_params, aux_note = seed_missing_auxiliary_heads_from_main(
+            restored_state.params,
+            source_params,
+        )
+        if aux_note:
+            restored_state = restored_state.replace(params=restored_params)
+        _log_restore_stats("TrainState", path_desc or ckpt_dir, stats)
+        if aux_note:
+            print(f"  NOTE: {aux_note}", flush=True)
+        return restored_state
 
     # If we're starting a new fine-tune run (not resuming), load weights
     # from the source W&B run's checkpoint before configuring this run's
@@ -938,7 +1013,7 @@ def main():
                 )
                 with open(hist_path, "rb") as f:
                     raw = f.read()
-                params = _strict_load_params(state.params, raw, path_desc=hist_path)
+                params = _restore_params_from_raw(state.params, raw, path_desc=hist_path)
                 state = state.replace(params=params)
             else:
                 # Fallback: try the Flax checkpoint layout
@@ -948,10 +1023,18 @@ def main():
                         f"Restoring fine-tune checkpoint at step {step_arg}",
                         flush=True,
                     )
-                    restored = checkpoints.restore_checkpoint(
-                        src_ckpt_dir, state, step=step_arg, prefix=src_ckpt_prefix
+                    params = _restore_params_from_flax(
+                        state.params,
+                        src_ckpt_dir,
+                        src_ckpt_prefix,
+                        step=step_arg,
+                        path_desc=flax_ckpt_path,
                     )
-                    state = state.replace(params=restored.params)
+                    if params is None:
+                        raise ValueError(
+                            f"Fine-tune checkpoint step {step_arg} could not be restored from {flax_ckpt_path}."
+                        )
+                    state = state.replace(params=params)
                 else:
                     raise ValueError(
                         f"Requested fine-tune checkpoint step {step_arg} for run "
@@ -969,26 +1052,34 @@ def main():
                 )
                 with open(src_ckpt_blob, "rb") as f:
                     raw = f.read()
-                params = _strict_load_params(state.params, raw, path_desc=src_ckpt_blob)
+                params = _restore_params_from_raw(state.params, raw, path_desc=src_ckpt_blob)
                 state = state.replace(params=params)
             else:
-                restored = checkpoints.restore_checkpoint(
-                    src_ckpt_dir, state, prefix=src_ckpt_prefix
+                params = _restore_params_from_flax(
+                    state.params,
+                    src_ckpt_dir,
+                    src_ckpt_prefix,
+                    path_desc=f"{src_ckpt_dir} (prefix={src_ckpt_prefix})",
                 )
-                if restored is state:
+                if params is None:
                     raise ValueError(
                         f"Fine-tune source checkpoint not found at {source_ckpt_path}. "
                         "Provide --fine_tune_ckpt_path or a RUNID-STEP that exists."
                     )
-                state = state.replace(params=restored.params)
+                state = state.replace(params=params)
 
     ckpt_dir, ckpt_prefix, ckpt_blob = resolve_ckpt_paths(t_cfg.ckpt_path)
     ckpt_async_manager = checkpoints.AsyncManager() if hasattr(checkpoints, "AsyncManager") else None
     
     if getattr(args, "continue_run_id", ""):
         print(f"Restoring checkpoint for continued run {args.continue_run_id}...", flush=True)
-        restored = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
-        if restored is state:
+        restored = _restore_train_state_from_flax(
+            state,
+            ckpt_dir,
+            ckpt_prefix,
+            path_desc=f"{ckpt_dir} (prefix={ckpt_prefix})",
+        )
+        if restored is None:
             raise RuntimeError(
                 f"FATAL: --continue was requested for run {args.continue_run_id}, "
                 f"but no Flax checkpoint could be loaded from {ckpt_dir} (prefix: {ckpt_prefix}). "
@@ -999,7 +1090,19 @@ def main():
         os.path.join(ckpt_dir, f"{ckpt_prefix}0")
     ):
         print("Restoring checkpoint...", flush=True)
-        state = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
+        restored = _restore_train_state_from_flax(
+            state,
+            ckpt_dir,
+            ckpt_prefix,
+            path_desc=f"{ckpt_dir} (prefix={ckpt_prefix})",
+        )
+        if restored is not None:
+            state = restored
+        elif os.path.exists(ckpt_blob):
+            with open(ckpt_blob, "rb") as f:
+                raw = f.read()
+            params = _restore_params_from_raw(state.params, raw, path_desc=ckpt_blob)
+            state = state.replace(params=params)
 
     # Replicate state across devices for data-parallel training
     if use_pmap:

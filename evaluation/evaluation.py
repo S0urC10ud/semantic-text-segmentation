@@ -63,7 +63,12 @@ from flax.errors import ScopeParamShapeError  # noqa: E402
 import orbax.checkpoint as ocp  # noqa: E402
 
 import utils.config as cfg  # noqa: E402
-from utils.model import UNet1D, Mamba1D  # noqa: E402
+from utils.model import (  # noqa: E402
+    Mamba1D,
+    UNet1D,
+    checkpoint_params_subtree,
+    merge_compatible_state,
+)
 from utils.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
 try:
     from utils.metrics_helper import compute_metrics_from_confusion  # noqa: E402
@@ -187,8 +192,16 @@ def _load_params_from_any(ckpt_path: str, params_template):
         try:
             return serialization.from_bytes(params_template, raw)
         except Exception:
-            data = serialization.from_bytes({"params": params_template}, raw)
-            return data["params"]
+            try:
+                data = serialization.from_bytes({"params": params_template}, raw)
+                return data["params"]
+            except Exception:
+                restored = serialization.msgpack_restore(raw)
+                params, _ = merge_compatible_state(
+                    params_template,
+                    checkpoint_params_subtree(restored),
+                )
+                return params
 
     step_dir = _find_latest_orbax_step_dir(p)
     if step_dir is None:
@@ -198,14 +211,22 @@ def _load_params_from_any(ckpt_path: str, params_template):
     checkpointer = ocp.StandardCheckpointer()
     try:
         restored = checkpointer.restore(step_dir_str)
-        return _extract_params_tree(restored)
+        params, _ = merge_compatible_state(
+            params_template,
+            checkpoint_params_subtree(_extract_params_tree(restored)),
+        )
+        return params
     except Exception:
         pass
 
     try:
         template = {"params": params_template}
         restored = checkpointer.restore(step_dir_str, target=template, strict=False)
-        return _extract_params_tree(restored)
+        params, _ = merge_compatible_state(
+            params_template,
+            checkpoint_params_subtree(_extract_params_tree(restored)),
+        )
+        return params
     except Exception:
         pass
 
@@ -216,7 +237,11 @@ def _load_params_from_any(ckpt_path: str, params_template):
         tx = optax.identity()
         dummy = ts.TrainState.create(apply_fn=lambda *a, **k: None, params=params_template, tx=tx)
         restored = checkpointer.restore(step_dir_str, target=dummy, strict=False)
-        return restored.params
+        params, _ = merge_compatible_state(
+            params_template,
+            checkpoint_params_subtree(restored),
+        )
+        return params
     except Exception as exc:
         raise RuntimeError(
             f"Failed to restore checkpoint at '{step_dir_str}': {exc}"

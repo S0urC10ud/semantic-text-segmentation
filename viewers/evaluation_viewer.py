@@ -36,7 +36,11 @@ if str(TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAIN_ROOT))
 
 import utils.config as cfg  # noqa: E402
-from utils.model import UNet1D  # noqa: E402
+from utils.model import (  # noqa: E402
+    UNet1D,
+    checkpoint_params_subtree,
+    merge_compatible_state,
+)
 from utils.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -539,8 +543,16 @@ class SegmenterRunner:
             try:
                 return serialization.from_bytes(template, data)
             except Exception:
-                tmp = serialization.from_bytes({"params": template}, data)
-                return tmp["params"]
+                try:
+                    tmp = serialization.from_bytes({"params": template}, data)
+                    return tmp["params"]
+                except Exception:
+                    restored = serialization.msgpack_restore(data)
+                    params, _ = merge_compatible_state(
+                        template,
+                        checkpoint_params_subtree(restored),
+                    )
+                    return params
 
         step_dir = cls._find_orbax_step(path)
         if step_dir is None:
@@ -549,19 +561,29 @@ class SegmenterRunner:
         step_str = step_dir.resolve().as_posix()
         try:
             restored = ckptr.restore(step_str)
-            if hasattr(restored, "params"):
-                return restored.params
+            params, _ = merge_compatible_state(
+                template,
+                checkpoint_params_subtree(restored),
+            )
+            return params
         except Exception:
             pass
         try:
             restored = ckptr.restore(step_str, target={"params": template}, strict=False)
-            if "params" in restored:
-                return restored["params"]
+            params, _ = merge_compatible_state(
+                template,
+                checkpoint_params_subtree(restored),
+            )
+            return params
         except Exception:
             pass
         dummy = ts.TrainState.create(apply_fn=lambda *a, **k: None, params=template, tx=optax.identity())
         restored = ckptr.restore(step_str, target=dummy, strict=False)
-        return restored.params
+        params, _ = merge_compatible_state(
+            template,
+            checkpoint_params_subtree(restored),
+        )
+        return params
 
     def _segment_bytes(self, byte_arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         byte_arr = sanitize_bytes(byte_arr)

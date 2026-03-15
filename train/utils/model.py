@@ -2,7 +2,7 @@
 The 1D U-Net model architecture and training-related utilities like the
 TrainState, loss functions, and train/eval steps.
 """
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Any, Mapping, TYPE_CHECKING, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +11,8 @@ import numpy as np
 import optax
 import utils.config as cfg
 from flax import linen as nn
+from flax import serialization
+from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.training import train_state
 
 if TYPE_CHECKING:
@@ -60,11 +62,17 @@ class UNet1D(nn.Module):
     num_classes: int = cfg.NUM_CLASSES
     emb_dim: int = 128
     channels: Tuple[int, ...] = (128, 256, 384, 512)
+    aux_offsets: Tuple[int, ...] = cfg.AUX_NEIGHBOR_OFFSETS
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, tokens: jnp.ndarray, train: bool = True):
+    def __call__(
+        self,
+        tokens: jnp.ndarray,
+        train: bool = True,
+        return_auxiliary: bool = False,
+    ):
         h = nn.Embed(num_embeddings=cfg.NUM_TOKEN_EMBEDDINGS, features=self.emb_dim,
                      embedding_init=nn.initializers.normal(stddev=0.02),
                      dtype=self.dtype, param_dtype=jnp.float32)(tokens)
@@ -90,7 +98,22 @@ class UNet1D(nn.Module):
 
         logits_bf16 = nn.Conv(self.num_classes, (1,), padding="SAME",
                               dtype=self.dtype, param_dtype=jnp.float32)(h)
-        return logits_bf16.astype(jnp.float32)
+        logits = logits_bf16.astype(jnp.float32)
+        if not return_auxiliary or not self.aux_offsets:
+            return logits
+
+        aux_logits_bf16 = nn.Conv(
+            self.num_classes * len(self.aux_offsets),
+            (1,),
+            padding="SAME",
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            name="aux_logits_head",
+        )(h)
+        aux_logits = aux_logits_bf16.reshape(
+            aux_logits_bf16.shape[:2] + (len(self.aux_offsets), self.num_classes)
+        )
+        return logits, aux_logits.astype(jnp.float32)
 
 # ---------------------------
 # Model: Mamba (simple Flax port)
@@ -247,11 +270,17 @@ class Mamba1D(nn.Module):
     dt_rank: int = 16
     d_conv: int = 4
     bidirectional: bool = True
+    aux_offsets: Tuple[int, ...] = cfg.AUX_NEIGHBOR_OFFSETS
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, tokens: jnp.ndarray, train: bool = True):
+    def __call__(
+        self,
+        tokens: jnp.ndarray,
+        train: bool = True,
+        return_auxiliary: bool = False,
+    ):
         h = nn.Embed(
             num_embeddings=cfg.NUM_TOKEN_EMBEDDINGS,
             features=int(self.d_model),
@@ -282,7 +311,21 @@ class Mamba1D(nn.Module):
             param_dtype=jnp.float32,
             use_bias=True,
         )(h)
-        return logits.astype(jnp.float32)
+        logits = logits.astype(jnp.float32)
+        if not return_auxiliary or not self.aux_offsets:
+            return logits
+
+        aux_logits = nn.Dense(
+            int(self.num_classes) * len(self.aux_offsets),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            use_bias=True,
+            name="aux_logits_head",
+        )(h)
+        aux_logits = aux_logits.reshape(
+            aux_logits.shape[:2] + (len(self.aux_offsets), int(self.num_classes))
+        )
+        return logits, aux_logits.astype(jnp.float32)
 
 
 def build_model(train_cfg: "TrainConfig", num_classes: int) -> nn.Module:
@@ -323,7 +366,12 @@ def count_params(params) -> int:
 def create_train_state(rng, cfg: "TrainConfig", num_classes: int):
     model = build_model(cfg, num_classes)
     dummy_tokens = jnp.zeros((1, cfg.MODEL_WINDOW_BYTES), dtype=jnp.int32)
-    variables = model.init({"params": rng, "dropout": rng}, dummy_tokens, train=True)
+    variables = model.init(
+        {"params": rng, "dropout": rng},
+        dummy_tokens,
+        train=True,
+        return_auxiliary=True,
+    )
     params = variables["params"]
     decay_steps = int(getattr(cfg, "schedule_steps", 0) or cfg.steps)
 
@@ -340,6 +388,153 @@ def create_train_state(rng, cfg: "TrainConfig", num_classes: int):
         ),
     )
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+
+
+def split_model_outputs(outputs) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+    if (
+        isinstance(outputs, tuple)
+        and len(outputs) == 2
+        and outputs[0] is not None
+    ):
+        return outputs[0], outputs[1]
+    return outputs, None
+
+
+def checkpoint_params_subtree(obj: Any):
+    if hasattr(obj, "params"):
+        return getattr(obj, "params")
+    if isinstance(obj, Mapping):
+        return obj.get("params", obj)
+    state_dict = serialization.to_state_dict(obj)
+    if isinstance(state_dict, Mapping):
+        return state_dict.get("params", state_dict)
+    return state_dict
+
+
+def _restore_leaf_is_compatible(target_leaf: Any, source_leaf: Any) -> bool:
+    try:
+        target_shape = tuple(np.shape(np.asarray(target_leaf)))
+        source_shape = tuple(np.shape(np.asarray(source_leaf)))
+        return target_shape == source_shape
+    except Exception:
+        return type(target_leaf) is type(source_leaf)
+
+
+def merge_compatible_state(target_obj: Any, source_obj: Any):
+    target_state = serialization.to_state_dict(target_obj)
+    source_state = serialization.to_state_dict(source_obj)
+
+    flat_target = flatten_dict(target_state)
+    flat_source = flatten_dict(source_state)
+    merged = dict(flat_target)
+
+    loaded = []
+    missing = []
+    mismatched = []
+    extra = []
+
+    for key, target_leaf in flat_target.items():
+        if key not in flat_source:
+            missing.append(key)
+            continue
+        source_leaf = flat_source[key]
+        if _restore_leaf_is_compatible(target_leaf, source_leaf):
+            merged[key] = source_leaf
+            loaded.append(key)
+        else:
+            mismatched.append(key)
+
+    for key in flat_source:
+        if key not in flat_target:
+            extra.append(key)
+
+    restored = serialization.from_state_dict(target_obj, unflatten_dict(merged))
+    return restored, {
+        "loaded": tuple(loaded),
+        "missing": tuple(missing),
+        "mismatched": tuple(mismatched),
+        "extra": tuple(extra),
+    }
+
+
+def seed_missing_auxiliary_heads_from_main(
+    target_params: Any,
+    source_params: Optional[Any] = None,
+) -> Tuple[Any, Optional[str]]:
+    """Initialize missing aux heads by tiling the main prediction head."""
+    offsets = tuple(getattr(cfg, "AUX_NEIGHBOR_OFFSETS", ()))
+    if not offsets:
+        return target_params, None
+
+    target_state = serialization.to_state_dict(target_params)
+    source_state = (
+        serialization.to_state_dict(source_params)
+        if source_params is not None
+        else {}
+    )
+    aux_head = target_state.get("aux_logits_head")
+    if not isinstance(aux_head, Mapping):
+        return target_params, None
+    if isinstance(source_state, Mapping) and "aux_logits_head" in source_state:
+        return target_params, None
+
+    aux_kernel = aux_head.get("kernel")
+    if aux_kernel is None:
+        return target_params, None
+
+    repeats = len(offsets)
+    for main_head_name in ("Conv_0", "Dense_0"):
+        main_head = target_state.get(main_head_name)
+        if not isinstance(main_head, Mapping):
+            continue
+
+        main_kernel = main_head.get("kernel")
+        if main_kernel is None:
+            continue
+
+        main_kernel_np = np.asarray(main_kernel)
+        aux_kernel_np = np.asarray(aux_kernel)
+        if (
+            main_kernel_np.ndim < 1
+            or aux_kernel_np.ndim < 1
+            or main_kernel_np.shape[:-1] != aux_kernel_np.shape[:-1]
+            or main_kernel_np.shape[-1] * repeats != aux_kernel_np.shape[-1]
+        ):
+            continue
+
+        updated_aux = dict(aux_head)
+        updated_aux["kernel"] = np.concatenate(
+            [main_kernel_np] * repeats,
+            axis=-1,
+        ).astype(aux_kernel_np.dtype, copy=False)
+
+        main_bias = main_head.get("bias")
+        aux_bias = aux_head.get("bias")
+        if main_bias is not None and aux_bias is not None:
+            main_bias_np = np.asarray(main_bias)
+            aux_bias_np = np.asarray(aux_bias)
+            if (
+                main_bias_np.ndim >= 1
+                and aux_bias_np.ndim >= 1
+                and main_bias_np.shape[:-1] == aux_bias_np.shape[:-1]
+                and main_bias_np.shape[-1] * repeats == aux_bias_np.shape[-1]
+            ):
+                updated_aux["bias"] = np.concatenate(
+                    [main_bias_np] * repeats,
+                    axis=-1,
+                ).astype(aux_bias_np.dtype, copy=False)
+
+        updated_state = dict(target_state)
+        updated_state["aux_logits_head"] = updated_aux
+        restored = serialization.from_state_dict(target_params, updated_state)
+        offset_desc = ", ".join(f"{offset:+d}" for offset in offsets)
+        note = (
+            "Auxiliary neighbor heads were missing in the checkpoint; "
+            f"initialized from {main_head_name} for offsets [{offset_desc}]."
+        )
+        return restored, note
+
+    return target_params, None
 
 def _ignored_token_mask(tokens: Optional[jnp.ndarray]) -> Optional[jnp.ndarray]:
     if tokens is None:
@@ -389,6 +584,71 @@ def cross_entropy_masked(
     loss = loss * mask.astype(loss.dtype)
     denom = jnp.maximum(1, jnp.sum(mask))
     return jnp.sum(loss) / denom
+
+
+def _shift_sequence(values: jnp.ndarray, offset: int, fill_value) -> jnp.ndarray:
+    shift = abs(int(offset))
+    if shift == 0:
+        return values
+    seq_len = values.shape[1]
+    if shift >= seq_len:
+        return jnp.full_like(values, fill_value)
+    fill = jnp.full(
+        values.shape[:1] + (shift,) + values.shape[2:],
+        fill_value,
+        dtype=values.dtype,
+    )
+    if offset > 0:
+        return jnp.concatenate([values[:, shift:, ...], fill], axis=1)
+    return jnp.concatenate([fill, values[:, : seq_len - shift, ...]], axis=1)
+
+
+def auxiliary_neighbor_cross_entropy(
+    aux_logits: Optional[jnp.ndarray],
+    labels: jnp.ndarray,
+    tokens: Optional[jnp.ndarray] = None,
+    pad_id: Optional[int] = None,
+) -> jnp.ndarray:
+    if aux_logits is None:
+        return jnp.zeros((), dtype=jnp.float32)
+    if pad_id is None:
+        pad_id = cfg.PAD_ID
+
+    offsets = tuple(getattr(cfg, "AUX_NEIGHBOR_OFFSETS", ()))
+    if not offsets:
+        return jnp.zeros((), dtype=aux_logits.dtype)
+
+    target_mask = _supervision_mask(labels, tokens, pad_id)
+    source_mask = labels != pad_id
+    total_loss = jnp.zeros((), dtype=aux_logits.dtype)
+    total_count = jnp.zeros((), dtype=jnp.int32)
+
+    for head_idx, offset in enumerate(offsets):
+        shifted_labels = _shift_sequence(labels, offset, 0)
+        shifted_mask = _shift_sequence(target_mask, offset, False)
+        shifted_mask = jnp.logical_and(shifted_mask, source_mask)
+        safe_labels = jnp.where(shifted_mask, shifted_labels, 0)
+        head_loss = optax.softmax_cross_entropy_with_integer_labels(
+            aux_logits[:, :, head_idx, :],
+            safe_labels.astype(jnp.int32),
+        )
+        total_loss = total_loss + jnp.sum(head_loss * shifted_mask.astype(head_loss.dtype))
+        total_count = total_count + jnp.sum(shifted_mask.astype(jnp.int32))
+
+    denom = jnp.maximum(1, total_count)
+    return total_loss / denom.astype(total_loss.dtype)
+
+
+def supervised_training_loss(
+    model_outputs,
+    labels: jnp.ndarray,
+    tokens: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    logits, aux_logits = split_model_outputs(model_outputs)
+    loss = cross_entropy_masked(logits, labels, tokens=tokens)
+    aux_weight = jnp.asarray(cfg.AUX_NEIGHBOR_LOSS_WEIGHT, dtype=logits.dtype)
+    aux_loss = auxiliary_neighbor_cross_entropy(aux_logits, labels, tokens=tokens)
+    return loss + aux_weight * aux_loss, logits
 
 
 @jax.jit
@@ -451,13 +711,14 @@ def train_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.n
     """Perform a single training step."""
     dropout_rng = jax.random.fold_in(rng, state.step)
     def loss_fn(params):
-        logits = state.apply_fn(
+        model_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng}
         )
-        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        loss, logits = supervised_training_loss(model_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
         return loss + intrinsic_oe, logits
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -469,13 +730,14 @@ def train_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, batch_labels
     """Debug-friendly, non-JITted training step."""
     dropout_rng = jax.random.fold_in(rng, state.step)
     def loss_fn(params):
-        logits = state.apply_fn(
+        model_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng}
         )
-        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        loss, logits = supervised_training_loss(model_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
         return loss + intrinsic_oe, logits
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -499,13 +761,14 @@ def train_step_with_oe(
     oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
 
     def loss_fn(params):
-        logits_id = state.apply_fn(
+        id_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng_id},
         )
-        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        ce_id, logits_id = supervised_training_loss(id_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
@@ -539,13 +802,14 @@ def train_step_with_oe_no_jit(
     oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
 
     def loss_fn(params):
-        logits_id = state.apply_fn(
+        id_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng_id},
         )
-        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        ce_id, logits_id = supervised_training_loss(id_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
@@ -571,13 +835,14 @@ def microbatch_grad_step(state: TrainState, batch_tokens: jnp.ndarray, batch_lab
     dropout_rng = jax.random.fold_in(rng, state.step)
 
     def loss_fn(params):
-        logits = state.apply_fn(
+        model_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng},
         )
-        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        loss, logits = supervised_training_loss(model_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
         return loss + intrinsic_oe, logits
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -600,13 +865,14 @@ def microbatch_grad_step_with_oe(
     oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
 
     def loss_fn(params):
-        logits_id = state.apply_fn(
+        id_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng_id},
         )
-        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        ce_id, logits_id = supervised_training_loss(id_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
@@ -630,13 +896,14 @@ def microbatch_grad_step_no_jit(state: TrainState, batch_tokens: jnp.ndarray, ba
     dropout_rng = jax.random.fold_in(rng, state.step)
 
     def loss_fn(params):
-        logits = state.apply_fn(
+        model_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng},
         )
-        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        loss, logits = supervised_training_loss(model_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
         return loss + intrinsic_oe, logits
 
@@ -659,13 +926,14 @@ def microbatch_grad_step_with_oe_no_jit(
     oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
 
     def loss_fn(params):
-        logits_id = state.apply_fn(
+        id_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng_id},
         )
-        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        ce_id, logits_id = supervised_training_loss(id_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_lambda = jnp.where(oe_lambda > 0.0, oe_lambda, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
@@ -729,13 +997,14 @@ def _p_train_step_impl(state, batch_tokens, batch_labels, rng):
     """Inner logic for pmap-ed single training step."""
     dropout_rng = jax.random.fold_in(rng, state.step)
     def loss_fn(params):
-        logits = state.apply_fn(
+        model_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng}
         )
-        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        loss, logits = supervised_training_loss(model_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
         return loss + intrinsic_oe, logits
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -756,13 +1025,14 @@ def _p_train_step_with_oe_impl(state, batch_tokens, batch_labels, outlier_tokens
     oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
 
     def loss_fn(params):
-        logits_id = state.apply_fn(
+        id_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng_id},
         )
-        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        ce_id, logits_id = supervised_training_loss(id_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_lambda = jnp.where(oe_lambda_f > 0.0, oe_lambda_f, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 
@@ -798,13 +1068,14 @@ def _p_microbatch_grad_step_impl(state, batch_tokens, batch_labels, rng):
     """Inner logic for pmap-ed microbatch gradient step (no optimizer update)."""
     dropout_rng = jax.random.fold_in(rng, state.step)
     def loss_fn(params):
-        logits = state.apply_fn(
+        model_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng},
         )
-        loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+        loss, logits = supervised_training_loss(model_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_oe = intrinsic_oe_loss(logits, batch_labels, tokens=batch_tokens)
         return loss + intrinsic_oe, logits
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -824,13 +1095,14 @@ def _p_microbatch_grad_step_with_oe_impl(state, batch_tokens, batch_labels, outl
     oe_lambda_f = jnp.asarray(oe_lambda, dtype=jnp.float32)
 
     def loss_fn(params):
-        logits_id = state.apply_fn(
+        id_outputs = state.apply_fn(
             {"params": params},
             batch_tokens,
             train=True,
+            return_auxiliary=True,
             rngs={"dropout": dropout_rng_id},
         )
-        ce_id = cross_entropy_masked(logits_id, batch_labels, tokens=batch_tokens)
+        ce_id, logits_id = supervised_training_loss(id_outputs, batch_labels, tokens=batch_tokens)
         intrinsic_lambda = jnp.where(oe_lambda_f > 0.0, oe_lambda_f, 0.1)
         intrinsic_oe = intrinsic_oe_loss(logits_id, batch_labels, tokens=batch_tokens, lambda_weight=intrinsic_lambda)
 

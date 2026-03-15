@@ -41,7 +41,12 @@ from utils.metrics_helper import (
     _valid_metric_mask,
     compute_metrics_from_confusion,
 )
-from utils.model import create_train_state, eval_step
+from utils.model import (
+    checkpoint_params_subtree,
+    create_train_state,
+    eval_step,
+    merge_compatible_state,
+)
 from utils.monitor_eval import evaluate_monitor_set, load_monitor_memmaps
 from utils.token_utils import sanitize_tokens
 
@@ -273,25 +278,38 @@ def _restore_state_from_checkpoint(state, checkpoint_path: str):
     if os.path.exists(ckpt_blob):
         with open(ckpt_blob, "rb") as f:
             raw = f.read()
-        try:
-            params = serialization.from_bytes(state.params, raw)
-        except Exception:
-            restored = serialization.from_bytes({"params": state.params}, raw)
-            if isinstance(restored, Mapping) and "params" in restored:
-                params = restored["params"]
-            else:
-                raise
+        restored = serialization.msgpack_restore(raw)
+        params, stats = merge_compatible_state(
+            state.params,
+            checkpoint_params_subtree(restored),
+        )
+        print(
+            "Checkpoint param merge: "
+            f"loaded={len(stats['loaded'])} missing={len(stats['missing'])} "
+            f"mismatched={len(stats['mismatched'])} extra={len(stats['extra'])}",
+            flush=True,
+        )
         return state.replace(params=params), f"raw-msgpack:{ckpt_blob}"
 
-    restored = checkpoints.restore_checkpoint(ckpt_dir, state, prefix=ckpt_prefix)
-    if restored is state:
-        restored = checkpoints.restore_checkpoint(checkpoint_path, state)
-    if restored is state:
+    restored = checkpoints.restore_checkpoint(ckpt_dir, target=None, prefix=ckpt_prefix)
+    if restored is None:
+        restored = checkpoints.restore_checkpoint(checkpoint_path, target=None)
+    if restored is None:
         raise FileNotFoundError(
             f"Checkpoint not found from '{checkpoint_path}'. "
             f"Tried raw file '{ckpt_blob}' and Flax checkpoints with prefix '{ckpt_prefix}'."
         )
-    return state.replace(params=restored.params), f"flax:{ckpt_dir} (prefix={ckpt_prefix})"
+    params, stats = merge_compatible_state(
+        state.params,
+        checkpoint_params_subtree(restored),
+    )
+    print(
+        "Checkpoint param merge: "
+        f"loaded={len(stats['loaded'])} missing={len(stats['missing'])} "
+        f"mismatched={len(stats['mismatched'])} extra={len(stats['extra'])}",
+        flush=True,
+    )
+    return state.replace(params=params), f"flax:{ckpt_dir} (prefix={ckpt_prefix})"
 
 
 def _build_tau_grid(args: argparse.Namespace) -> List[float]:
