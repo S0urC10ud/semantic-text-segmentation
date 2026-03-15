@@ -12,7 +12,6 @@ import optax
 import utils.config as cfg
 from flax import linen as nn
 from flax import serialization
-from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.training import train_state
 
 if TYPE_CHECKING:
@@ -424,31 +423,51 @@ def merge_compatible_state(target_obj: Any, source_obj: Any):
     target_state = serialization.to_state_dict(target_obj)
     source_state = serialization.to_state_dict(source_obj)
 
-    flat_target = flatten_dict(target_state)
-    flat_source = flatten_dict(source_state)
-    merged = dict(flat_target)
-
     loaded = []
     missing = []
     mismatched = []
     extra = []
 
-    for key, target_leaf in flat_target.items():
-        if key not in flat_source:
-            missing.append(key)
-            continue
-        source_leaf = flat_source[key]
-        if _restore_leaf_is_compatible(target_leaf, source_leaf):
-            merged[key] = source_leaf
-            loaded.append(key)
-        else:
-            mismatched.append(key)
+    def _collect_paths(node: Any, path: Tuple[str, ...]) -> list[Tuple[str, ...]]:
+        if isinstance(node, Mapping):
+            if not node:
+                return [path]
+            out: list[Tuple[str, ...]] = []
+            for key, value in node.items():
+                out.extend(_collect_paths(value, path + (str(key),)))
+            return out
+        return [path]
 
-    for key in flat_source:
-        if key not in flat_target:
-            extra.append(key)
+    def _merge_nodes(target_node: Any, source_node: Any, path: Tuple[str, ...]) -> Any:
+        if isinstance(target_node, Mapping):
+            if not isinstance(source_node, Mapping):
+                mismatched.extend(_collect_paths(target_node, path))
+                return target_node
+            merged_node = {}
+            for key, target_child in target_node.items():
+                key_str = str(key)
+                child_path = path + (key_str,)
+                if key not in source_node:
+                    missing.extend(_collect_paths(target_child, child_path))
+                    merged_node[key] = target_child
+                    continue
+                merged_node[key] = _merge_nodes(target_child, source_node[key], child_path)
+            for key, source_child in source_node.items():
+                if key not in target_node:
+                    extra.extend(_collect_paths(source_child, path + (str(key),)))
+            return merged_node
 
-    restored = serialization.from_state_dict(target_obj, unflatten_dict(merged))
+        if isinstance(source_node, Mapping):
+            mismatched.append(path)
+            return target_node
+        if _restore_leaf_is_compatible(target_node, source_node):
+            loaded.append(path)
+            return source_node
+        mismatched.append(path)
+        return target_node
+
+    merged_state = _merge_nodes(target_state, source_state, ())
+    restored = serialization.from_state_dict(target_obj, merged_state)
     return restored, {
         "loaded": tuple(loaded),
         "missing": tuple(missing),

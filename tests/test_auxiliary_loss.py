@@ -122,6 +122,28 @@ class TestCompatibleRestore(unittest.TestCase):
         self.assertIsNotNone(note)
         self.assertIn("initialized from Conv_0", note)
 
+    def test_merge_compatible_state_preserves_empty_optimizer_slots(self) -> None:
+        target = {
+            "opt_state": (
+                {},
+                {"count": jnp.array(0, dtype=jnp.int32)},
+            ),
+        }
+        source = {
+            "opt_state": (
+                {},
+                {"count": np.array(7, dtype=np.int32)},
+            ),
+        }
+
+        merged, stats = merge_compatible_state(target, source)
+
+        self.assertEqual(len(merged["opt_state"]), 2)
+        self.assertEqual(dict(merged["opt_state"][0]), {})
+        self.assertEqual(int(np.asarray(merged["opt_state"][1]["count"])), 7)
+        self.assertFalse(stats["missing"])
+        self.assertFalse(stats["mismatched"])
+
 
 if __name__ == "__main__":
     unittest.main()
