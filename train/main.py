@@ -487,6 +487,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--fine_tune_augment_monitor",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply training-style augmentations during monitor fine-tuning. "
+            "When enabled, augmentation fragments are drawn from monitor segments and, if available, "
+            "the active-learning SQLite store."
+        ),
+    )
+    parser.add_argument(
         "--num-gpus",
         type=int,
         default=2,
@@ -830,6 +840,7 @@ def main():
             "active_learning_store": args.active_learning_store,
             "active_learning_mix_prob": float(args.active_learning_mix_prob),
             "active_learning_max_windows": int(args.active_learning_max_windows),
+            "fine_tune_augment_monitor": bool(args.fine_tune_augment_monitor),
             "monitor_train_files": int(fine_tune_train_files_count),
             "monitor_eval_files": int(monitor_eval_files_count),
             "num_gpus": int(num_devices),
@@ -1117,7 +1128,14 @@ def main():
             raise RuntimeError(
                 "Fine-tune mode enabled but fine-tune data failed to load."
             )
-        data_fetcher = MonitorFineTuneBatcher(fine_tune_data, d_cfg, monitor_root=args.fine_tune_train_root)
+        data_fetcher = MonitorFineTuneBatcher(
+            fine_tune_data,
+            d_cfg,
+            monitor_root=args.fine_tune_train_root,
+            augment=bool(args.fine_tune_augment_monitor),
+            active_learning_store=args.active_learning_store,
+            active_learning_limit=int(args.active_learning_max_windows),
+        )
     else:
         data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
 

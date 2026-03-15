@@ -3,6 +3,9 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_ROOT = ROOT / "train"
@@ -16,6 +19,7 @@ from active_learning.oracle import BoundarySnippet
 from active_learning.round import (
     _build_parser,
     _build_snippets_for_samples_batch,
+    _iter_split_examples,
     _limit_snippets_for_oracle_requests,
     _make_snippet_id,
 )
@@ -180,6 +184,82 @@ class TestRoundOracleRequestCap(unittest.TestCase):
         )
         self.assertEqual(args.predict_batch_size, 12)
         self.assertEqual(args.gemini_thinking_level, "medium")
+
+    def test_iter_split_examples_uses_training_window_augmentation_for_train_split(self) -> None:
+        data_root = ROOT / "tmp-data-root"
+        train_dsets = {
+            int(cfg.LANG2ID["python"]): object(),
+            int(cfg.LANG2ID["javascript_typescript"]): object(),
+        }
+        padded = int(cfg.PAD_BYTE_ID)
+        first_tokens = np.array([ord("a"), ord("b"), ord("c"), padded], dtype=np.int32)
+        second_text = "# demo\n```js\nx\n```"
+        second_tokens = np.array([*(ord(ch) for ch in second_text), padded], dtype=np.int32)
+
+        first_meta = {
+            "mode": "mixed",
+            "requested_mode": "mixed",
+            "samples": [
+                {"language": "python", "final_bytes": 3},
+                {"language": "javascript_typescript", "final_bytes": 1},
+            ],
+            "host": {"language": "python", "source": "demo.py", "final_bytes": 3},
+            "line_injections": [],
+            "markdown_blocks": [],
+        }
+        second_meta = {
+            "mode": "markdown",
+            "requested_mode": "markdown",
+            "samples": [
+                {"language": "text", "final_bytes": 7},
+                {"language": "javascript_typescript", "final_bytes": 4},
+            ],
+            "line_injections": [],
+            "markdown_blocks": [{"language": "javascript_typescript"}],
+        }
+
+        with patch(
+            "active_learning.round.prepare_dsets_by_lang_with_splits",
+            return_value={"train": train_dsets},
+        ) as prep_mock, patch(
+            "active_learning.round.make_training_window_with_metadata",
+            side_effect=[
+                (first_tokens, np.zeros_like(first_tokens, dtype=np.uint8), first_meta),
+                (second_tokens, np.zeros_like(second_tokens, dtype=np.uint8), second_meta),
+            ],
+        ) as make_mock:
+            samples = list(
+                _iter_split_examples(
+                    data_root,
+                    "train",
+                    ["python", "javascript_typescript"],
+                    1,
+                    rng=np.random.default_rng(0),
+                    seen_hashes=set(),
+                )
+            )
+
+        self.assertEqual(prep_mock.call_count, 1)
+        self.assertEqual(make_mock.call_count, 2)
+        self.assertEqual(len(samples), 2)
+
+        lang_a, idx_a, text_a, hash_a, meta_a = samples[0]
+        self.assertEqual(lang_a, "python")
+        self.assertEqual(idx_a, 0)
+        self.assertEqual(text_a, "abc")
+        self.assertTrue(hash_a)
+        self.assertEqual(meta_a["sampling_mode"], "training_window")
+        self.assertEqual(meta_a["augmentation_mode"], "mixed")
+        self.assertEqual(meta_a["source_langs"], ["python", "javascript_typescript"])
+
+        lang_b, idx_b, text_b, hash_b, meta_b = samples[1]
+        self.assertEqual(lang_b, "markdown")
+        self.assertEqual(idx_b, 1)
+        self.assertEqual(text_b, second_text)
+        self.assertTrue(hash_b)
+        self.assertEqual(meta_b["sampling_mode"], "training_window")
+        self.assertEqual(meta_b["augmentation_mode"], "markdown")
+        self.assertEqual(meta_b["source_langs"][0], "markdown")
 
 
 if __name__ == "__main__":

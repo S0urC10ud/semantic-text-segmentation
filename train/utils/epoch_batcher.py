@@ -7,15 +7,397 @@ import queue
 import random
 import threading
 import time
-from typing import TYPE_CHECKING, Dict, List
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import datasets as hfds
 import numpy as np
 import utils.config as cfg
-from utils.window_generator import make_training_window
+from utils.window_generator import (
+    _choose_window_mode,
+    _make_markdown_window_impl,
+    make_line_injected_window,
+    make_mixed_window,
+    make_training_window,
+)
 
 if TYPE_CHECKING:
     from utils.config import DataConfig
+
+
+_PLACEHOLDER_CHAR = "\u00A4"
+_VISIBLE_ASCII_BYTES = tuple(range(0x20, 0x7F))
+_ALLOWED_TEXT_CHARS = {chr(b) for b in _VISIBLE_ASCII_BYTES}
+_ALLOWED_TEXT_CHARS.update({"\n", "\t", _PLACEHOLDER_CHAR})
+_MONITOR_SUBSTRING_REMOVAL_PROB = 0.5
+_MONITOR_SUBSTRING_REMOVAL_MAX_REMOVALS = 3
+_MONITOR_SPACE_BYTE = 0x20
+_MONITOR_NEWLINE_BYTE = 0x0A
+
+MonitorSegment = Tuple[int, int, int]
+
+
+def _normalize_monitor_text(text: str) -> str:
+    out_chars: List[str] = []
+    for ch in text:
+        if ch == "\r":
+            ch = "\n"
+        if ch in _ALLOWED_TEXT_CHARS:
+            out_chars.append(ch)
+        else:
+            out_chars.append(_PLACEHOLDER_CHAR)
+    return "".join(out_chars)
+
+
+def _label_name_to_id(label_name: str) -> Optional[int]:
+    low = str(label_name or "").strip().lower()
+    if not low:
+        return None
+    if low in cfg.LANG2ID:
+        return int(cfg.LANG2ID[low])
+    other_idx = getattr(cfg, "OTHER_CLASS_INDEX", None)
+    if low == "other" and other_idx is not None:
+        return int(other_idx)
+    return None
+
+
+def _monitor_id_to_label() -> Dict[int, str]:
+    mapping = {int(idx): str(name) for idx, name in cfg.ID2LANG.items()}
+    other_idx = getattr(cfg, "OTHER_CLASS_INDEX", None)
+    if other_idx is not None:
+        mapping[int(other_idx)] = "other"
+    return mapping
+
+
+def _append_fragment(
+    pools: Dict[int, List[Dict[str, object]]],
+    *,
+    label_id: int,
+    text: str,
+    source: str,
+) -> None:
+    if not text:
+        return
+    pools.setdefault(int(label_id), []).append(
+        {
+            "content": str(text),
+            "source": str(source),
+        }
+    )
+
+
+def _build_augmented_fragment_datasets(
+    monitor_data: Dict[str, np.ndarray],
+    *,
+    active_learning_store: str = "",
+    active_learning_limit: Optional[int] = None,
+) -> Dict[int, hfds.Dataset]:
+    pools: Dict[int, List[Dict[str, object]]] = {}
+    files = monitor_data["files"]
+    segments = monitor_data["segments"]
+    contents = monitor_data["contents"]
+    id2label = _monitor_id_to_label()
+
+    for file_idx, row in enumerate(files):
+        byte_len = int(row["byte_len"])
+        if byte_len <= 0:
+            continue
+        byte_start = int(row["byte_start"])
+        file_bytes = np.asarray(contents[byte_start : byte_start + byte_len], dtype=np.uint8)
+        raw_text = file_bytes.tobytes().decode("latin-1")
+        normalized_text = _normalize_monitor_text(raw_text)
+        if not normalized_text:
+            continue
+        seg_start = int(row["seg_start"])
+        seg_count = int(row["seg_count"])
+        seg_slice = segments[seg_start : seg_start + seg_count]
+        for seg_idx, seg in enumerate(seg_slice):
+            start = int(seg["start"])
+            end = int(seg["end"])
+            label_id = int(seg["label"])
+            if end <= start or start < 0 or end > len(normalized_text):
+                continue
+            if label_id == int(cfg.PAD_ID):
+                continue
+            if label_id not in id2label:
+                continue
+            fragment_text = normalized_text[start:end]
+            _append_fragment(
+                pools,
+                label_id=label_id,
+                text=fragment_text,
+                source=f"monitor:{file_idx}:{seg_idx}",
+            )
+
+    store_path = str(active_learning_store or "").strip()
+    if store_path:
+        from active_learning.label_store import LabelStore
+
+        store = LabelStore(store_path)
+        for row in store.iter_rows(limit=active_learning_limit, statuses=("ok",)):
+            text = str(row["snippet_text"] or "")
+            if not text:
+                continue
+            segments_json = LabelStore._segment_dicts(row)
+            for seg_idx, seg in enumerate(segments_json):
+                try:
+                    start = int(seg.get("start", 0))
+                    end = int(seg.get("end", 0))
+                    label_id = _label_name_to_id(str(seg.get("label", "")))
+                except Exception:
+                    continue
+                if label_id is None or end <= start or start < 0 or end > len(text):
+                    continue
+                fragment_text = text[start:end]
+                _append_fragment(
+                    pools,
+                    label_id=int(label_id),
+                    text=fragment_text,
+                    source=f"al:{int(row['id'])}:{seg_idx}",
+                )
+
+    out: Dict[int, hfds.Dataset] = {}
+    for label_id, rows in pools.items():
+        if not rows:
+            continue
+        out[int(label_id)] = hfds.Dataset.from_list(rows)
+    return out
+
+
+def _monitor_file_segments(
+    row: np.void,
+    segments: np.ndarray,
+    byte_len: int,
+) -> List[MonitorSegment]:
+    file_segments: List[MonitorSegment] = []
+    seg_start = int(row["seg_start"])
+    seg_count = int(row["seg_count"])
+    for seg in segments[seg_start : seg_start + seg_count]:
+        start = max(0, min(int(seg["start"]), int(byte_len)))
+        end = max(0, min(int(seg["end"]), int(byte_len)))
+        if end <= start:
+            continue
+        file_segments.append((start, end, int(seg["label"])))
+    return file_segments
+
+
+def _merge_monitor_segments(segments: List[MonitorSegment]) -> List[MonitorSegment]:
+    if not segments:
+        return []
+    merged: List[MonitorSegment] = []
+    for start, end, label in sorted(
+        ((int(start), int(end), int(label)) for start, end, label in segments),
+        key=lambda item: (item[0], item[1], item[2]),
+    ):
+        if end <= start:
+            continue
+        if merged:
+            prev_start, prev_end, prev_label = merged[-1]
+            if label == prev_label and start <= prev_end:
+                merged[-1] = (prev_start, max(prev_end, end), prev_label)
+                continue
+        merged.append((start, end, label))
+    return merged
+
+
+def _crop_monitor_window(
+    rng: np.random.Generator,
+    window_len: int,
+    file_bytes: np.ndarray,
+    file_segments: List[MonitorSegment],
+):
+    byte_len = int(file_bytes.size)
+    if byte_len <= 0:
+        return None
+
+    start = 0
+    if byte_len > window_len:
+        start = int(rng.integers(0, byte_len - window_len + 1))
+    end = start + min(window_len, byte_len)
+
+    x = np.full(window_len, cfg.PAD_BYTE_ID, dtype=np.int32)
+    x[: end - start] = np.asarray(file_bytes[start:end], dtype=np.uint8)
+
+    y = np.full(window_len, cfg.PAD_ID, dtype=np.uint8)
+    for seg_start, seg_end, label in file_segments:
+        overlap_s = max(int(seg_start), start)
+        overlap_e = min(int(seg_end), start + window_len)
+        if overlap_e <= overlap_s:
+            continue
+        y_start = overlap_s - start
+        y_end = overlap_e - start
+        y[y_start:y_end] = int(label)
+
+    return x, y
+
+
+def _monitor_line_bounds(file_bytes: np.ndarray) -> List[Tuple[int, int, int]]:
+    bounds: List[Tuple[int, int, int]] = []
+    line_start = 0
+    total = int(file_bytes.size)
+    while line_start < total:
+        idx = line_start
+        while idx < total and int(file_bytes[idx]) != _MONITOR_NEWLINE_BYTE:
+            idx += 1
+        content_end = idx
+        full_end = idx + 1 if idx < total and int(file_bytes[idx]) == _MONITOR_NEWLINE_BYTE else idx
+        bounds.append((line_start, content_end, full_end))
+        line_start = full_end
+    return bounds
+
+
+def _choose_monitor_line_removal_span(
+    rng: np.random.Generator,
+    file_bytes: np.ndarray,
+) -> Optional[Tuple[int, int]]:
+    total = int(file_bytes.size)
+    if total <= 1:
+        return None
+    candidates = [
+        (line_start, full_end)
+        for line_start, _content_end, full_end in _monitor_line_bounds(file_bytes)
+        if full_end > line_start and (full_end - line_start) < total
+    ]
+    if not candidates:
+        return None
+    idx = int(rng.integers(0, len(candidates)))
+    return candidates[idx]
+
+
+def _choose_monitor_space_removal_span(
+    rng: np.random.Generator,
+    file_bytes: np.ndarray,
+) -> Optional[Tuple[int, int]]:
+    total = int(file_bytes.size)
+    if total <= 1:
+        return None
+    candidate_lines: List[List[int]] = []
+    for line_start, content_end, _full_end in _monitor_line_bounds(file_bytes):
+        boundaries = [int(line_start)]
+        for idx in range(line_start, content_end):
+            if int(file_bytes[idx]) == _MONITOR_SPACE_BYTE and idx + 1 <= content_end:
+                boundaries.append(int(idx + 1))
+        if boundaries[-1] != int(content_end):
+            boundaries.append(int(content_end))
+        deduped: List[int] = []
+        for boundary in boundaries:
+            if not deduped or boundary != deduped[-1]:
+                deduped.append(int(boundary))
+        if len(deduped) >= 3:
+            candidate_lines.append(deduped)
+    if not candidate_lines:
+        return None
+
+    for _ in range(12):
+        boundaries = candidate_lines[int(rng.integers(0, len(candidate_lines)))]
+        start_idx = int(rng.integers(0, len(boundaries) - 1))
+        end_idx = int(rng.integers(start_idx + 1, len(boundaries)))
+        start = int(boundaries[start_idx])
+        end = int(boundaries[end_idx])
+        if end <= start:
+            continue
+        if start == boundaries[0] and end == boundaries[-1]:
+            continue
+        return start, end
+    return None
+
+
+def _choose_monitor_removal_span(
+    rng: np.random.Generator,
+    file_bytes: np.ndarray,
+) -> Optional[Tuple[int, int]]:
+    pick_line_first = bool(rng.random() < 0.5)
+    first = _choose_monitor_line_removal_span if pick_line_first else _choose_monitor_space_removal_span
+    second = _choose_monitor_space_removal_span if pick_line_first else _choose_monitor_line_removal_span
+    span = first(rng, file_bytes)
+    if span is not None:
+        return span
+    return second(rng, file_bytes)
+
+
+def _apply_monitor_removal_span(
+    file_bytes: np.ndarray,
+    file_segments: List[MonitorSegment],
+    start: int,
+    end: int,
+) -> Tuple[np.ndarray, List[MonitorSegment]]:
+    start = max(0, min(int(start), int(file_bytes.size)))
+    end = max(0, min(int(end), int(file_bytes.size)))
+    if end <= start:
+        return np.asarray(file_bytes, dtype=np.uint8), list(file_segments)
+
+    removed = end - start
+    trimmed = np.concatenate(
+        [
+            np.asarray(file_bytes[:start], dtype=np.uint8),
+            np.asarray(file_bytes[end:], dtype=np.uint8),
+        ]
+    )
+
+    out_segments: List[MonitorSegment] = []
+    for seg_start, seg_end, label in file_segments:
+        seg_start = int(seg_start)
+        seg_end = int(seg_end)
+        label = int(label)
+        if seg_end <= seg_start:
+            continue
+        if seg_end <= start:
+            out_segments.append((seg_start, seg_end, label))
+            continue
+        if seg_start >= end:
+            out_segments.append((seg_start - removed, seg_end - removed, label))
+            continue
+        if seg_start < start and seg_end > end:
+            out_segments.append((seg_start, seg_end - removed, label))
+            continue
+        if seg_start < start < seg_end <= end:
+            out_segments.append((seg_start, start, label))
+            continue
+        if start <= seg_start < end < seg_end:
+            out_segments.append((start, seg_end - removed, label))
+            continue
+
+    return trimmed, _merge_monitor_segments(out_segments)
+
+
+def _apply_monitor_substring_removal(
+    rng: np.random.Generator,
+    file_bytes: np.ndarray,
+    file_segments: List[MonitorSegment],
+    *,
+    apply_prob: float = _MONITOR_SUBSTRING_REMOVAL_PROB,
+    max_removals: int = _MONITOR_SUBSTRING_REMOVAL_MAX_REMOVALS,
+) -> Tuple[np.ndarray, List[MonitorSegment]]:
+    base_bytes = np.asarray(file_bytes, dtype=np.uint8)
+    base_segments = list(file_segments)
+    if base_bytes.size <= 1 or not base_segments:
+        return base_bytes, base_segments
+    if float(apply_prob) <= 0.0 or bool(rng.random() >= float(apply_prob)):
+        return base_bytes, base_segments
+
+    current_bytes = base_bytes
+    current_segments = list(base_segments)
+    target = max(1, int(rng.integers(1, max(1, int(max_removals)) + 1)))
+    attempts = 0
+    applied = 0
+    max_attempts = max(3, target * 4)
+    while applied < target and attempts < max_attempts:
+        attempts += 1
+        span = _choose_monitor_removal_span(rng, current_bytes)
+        if span is None:
+            break
+        next_bytes, next_segments = _apply_monitor_removal_span(
+            current_bytes,
+            current_segments,
+            span[0],
+            span[1],
+        )
+        if next_bytes.size <= 0 or not next_segments:
+            continue
+        current_bytes = next_bytes
+        current_segments = next_segments
+        applied += 1
+    return current_bytes, current_segments
 
 
 class EpochPrefetchBatcher:
@@ -172,8 +554,9 @@ class EpochPrefetchBatcher:
 class MonitorFineTuneBatcher:
     """
     Simple prefetching batcher for fine-tuning on the preprocessed monitor
-    memmap (monitor_preprocessed_a / _b). It samples random files and random
-    windows without any mixing/augmentation.
+    memmap (monitor_preprocessed_a / _b). By default it samples random files
+    and random windows without augmentation. When enabled, it can apply the
+    training window augmentations on top of monitor/al fragment pools.
     """
 
     def __init__(
@@ -181,10 +564,13 @@ class MonitorFineTuneBatcher:
         monitor_data: Dict[str, np.ndarray],
         data_cfg: "DataConfig",
         monitor_root: str,
+        *,
+        augment: bool = False,
+        active_learning_store: str = "",
+        active_learning_limit: Optional[int] = None,
     ):
         import multiprocessing as mp
         import sys
-        from pathlib import Path
         repo_root = str(Path(__file__).resolve().parents[2])
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
@@ -195,6 +581,7 @@ class MonitorFineTuneBatcher:
             )
 
         self.cfg = data_cfg
+        self.augment = bool(augment)
 
         ctx = mp.get_context("spawn")
         self.q = ctx.Queue(maxsize=max(2, data_cfg.prefetch_batches))
@@ -205,7 +592,21 @@ class MonitorFineTuneBatcher:
         self._processed_windows = 0
 
         for wid in range(max(1, data_cfg.num_workers)):
-            t = ctx.Process(target=self._worker_entry, args=(self.cfg, wid, monitor_root, self.q, self.stop_flag, self.total_files), daemon=True)
+            t = ctx.Process(
+                target=self._worker_entry,
+                args=(
+                    self.cfg,
+                    wid,
+                    monitor_root,
+                    self.q,
+                    self.stop_flag,
+                    self.total_files,
+                    bool(self.augment),
+                    str(active_learning_store or ""),
+                    None if active_learning_limit is None else int(active_learning_limit),
+                ),
+                daemon=True,
+            )
             t.start()
             self.threads.append(t)
 
@@ -227,7 +628,16 @@ class MonitorFineTuneBatcher:
             )
 
     @staticmethod
-    def _build_window(rng: np.random.Generator, window_len: int, files, contents, segments, total_files):
+    def _build_window(
+        rng: np.random.Generator,
+        window_len: int,
+        files,
+        contents,
+        segments,
+        total_files,
+        *,
+        allow_substring_removal: bool = False,
+    ):
         max_attempts = 32
         for _ in range(max_attempts):
             if total_files <= 0:
@@ -238,40 +648,105 @@ class MonitorFineTuneBatcher:
             if byte_len <= 0:
                 continue
 
-            start = 0
-            if byte_len > window_len:
-                start = int(rng.integers(0, byte_len - window_len + 1))
-            end = start + min(window_len, byte_len)
-
-            full_slice = contents[
-                int(row["byte_start"]) : int(row["byte_start"]) + byte_len
-            ]
-            x = np.full(window_len, cfg.PAD_BYTE_ID, dtype=np.int32)
-            x[: end - start] = np.asarray(full_slice[start:end], dtype=np.uint8)
-
-            y = np.full(window_len, cfg.PAD_ID, dtype=np.uint8)
-            seg_start = int(row["seg_start"])
-            seg_count = int(row["seg_count"])
-            seg_slice = segments[seg_start : seg_start + seg_count]
-            for seg in seg_slice:
-                seg_s = int(seg["start"])
-                seg_e = int(seg["end"])
-                label = int(seg["label"])
-                overlap_s = max(seg_s, start)
-                overlap_e = min(seg_e, start + window_len)
-                if overlap_e <= overlap_s:
-                    continue
-                y_start = overlap_s - start
-                y_end = overlap_e - start
-                y[y_start:y_end] = label
-
-            return x, y
+            file_bytes = np.asarray(
+                contents[
+                    int(row["byte_start"]) : int(row["byte_start"]) + byte_len
+                ],
+                dtype=np.uint8,
+            )
+            file_segments = _monitor_file_segments(row, segments, byte_len)
+            if allow_substring_removal:
+                file_bytes, file_segments = _apply_monitor_substring_removal(
+                    rng,
+                    file_bytes,
+                    file_segments,
+                )
+            window = _crop_monitor_window(
+                rng,
+                window_len,
+                file_bytes,
+                file_segments,
+            )
+            if window is None:
+                continue
+            return window
         return None
 
     @staticmethod
-    def _worker_entry(cfg_obj, wid, monitor_root, q, stop_flag, total_files):
+    def _build_augmented_window(
+        rng: np.random.Generator,
+        window_len: int,
+        files,
+        contents,
+        segments,
+        total_files: int,
+        fragment_dsets: Dict[int, hfds.Dataset],
+        data_cfg: "DataConfig",
+        *,
+        forced_mode: Optional[str] = None,
+    ):
+        mode = str(forced_mode or _choose_window_mode(data_cfg)).strip().lower()
+        if mode == "pure":
+            return MonitorFineTuneBatcher._build_window(
+                rng,
+                window_len,
+                files,
+                contents,
+                segments,
+                total_files,
+                allow_substring_removal=True,
+            )
+        if not fragment_dsets:
+            return MonitorFineTuneBatcher._build_window(
+                rng,
+                window_len,
+                files,
+                contents,
+                segments,
+                total_files,
+                allow_substring_removal=True,
+            )
+
+        seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        try:
+            random.seed(seed)
+            np.random.seed(seed)
+            if mode == "line_inject":
+                return make_line_injected_window(fragment_dsets, window_len, data_cfg)
+            if mode == "markdown":
+                x, y, _ = _make_markdown_window_impl(
+                    fragment_dsets,
+                    window_len,
+                    data_cfg,
+                    collect_meta=False,
+                )
+                return x, y
+            if mode == "mixed":
+                return make_mixed_window(
+                    fragment_dsets,
+                    window_len,
+                    int(data_cfg.min_seg_len),
+                )
+            return make_training_window(fragment_dsets, window_len, data_cfg)
+        finally:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+
+    @staticmethod
+    def _worker_entry(
+        cfg_obj,
+        wid,
+        monitor_root,
+        q,
+        stop_flag,
+        total_files,
+        augment,
+        active_learning_store,
+        active_learning_limit,
+    ):
         import sys
-        from pathlib import Path
         repo_root = str(Path(__file__).resolve().parents[2])
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
@@ -290,13 +765,28 @@ class MonitorFineTuneBatcher:
         files = monitor_data["files"]
         segments = monitor_data["segments"]
         contents = monitor_data["contents"]
+        fragment_dsets: Dict[int, hfds.Dataset] = {}
+        if augment:
+            fragment_dsets = _build_augmented_fragment_datasets(
+                monitor_data,
+                active_learning_store=active_learning_store,
+                active_learning_limit=active_learning_limit,
+            )
 
         rng = np.random.default_rng(cfg_obj.seed ^ wid ^ int(time.time()))
-        window_len = int(cfg_obj.window_max_bytes)
-        if window_len <= 0:
-            window_len = cfg.MODEL_WINDOW_BYTES
+        buckets = cfg_obj.buckets() if augment else [int(cfg_obj.window_max_bytes)]
+        buckets = [int(b) for b in buckets if int(b) > 0]
+        if not buckets:
+            buckets = [cfg.MODEL_WINDOW_BYTES]
+        hold = max(1, int(getattr(cfg_obj, "bucket_hold_steps", 1))) if augment else 1
+        window_len = int(buckets[0])
+        step_idx = 0
 
         while not stop_flag.is_set():
+            if step_idx % hold == 0:
+                bucket_idx = int(rng.integers(0, len(buckets))) if len(buckets) > 1 else 0
+                window_len = int(buckets[bucket_idx])
+            step_idx += 1
             xb = np.full(
                 (cfg_obj.batch_size, window_len),
                 cfg.PAD_BYTE_ID,
@@ -310,7 +800,26 @@ class MonitorFineTuneBatcher:
 
             filled = 0
             while filled < cfg_obj.batch_size and not stop_flag.is_set():
-                window = MonitorFineTuneBatcher._build_window(rng, window_len, files, contents, segments, total_files)
+                if augment:
+                    window = MonitorFineTuneBatcher._build_augmented_window(
+                        rng,
+                        window_len,
+                        files,
+                        contents,
+                        segments,
+                        total_files,
+                        fragment_dsets,
+                        cfg_obj,
+                    )
+                else:
+                    window = MonitorFineTuneBatcher._build_window(
+                        rng,
+                        window_len,
+                        files,
+                        contents,
+                        segments,
+                        total_files,
+                    )
                 if window is None:
                     # If we repeatedly fail to build a window, just break and
                     # reuse whatever portion we have so far.

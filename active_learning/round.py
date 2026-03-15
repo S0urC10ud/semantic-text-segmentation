@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ if str(TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAIN_ROOT))
 
 import utils.config as cfg  # noqa: E402
+from utils.data import prepare_dsets_by_lang_with_splits  # noqa: E402
+from utils.window_generator import make_training_window_with_metadata  # noqa: E402
 from viewers.core import (  # noqa: E402
     DEFAULT_CHANNELS,
     DEFAULT_CHUNK_SIZE,
@@ -187,7 +190,111 @@ def _build_predictor(args: argparse.Namespace) -> Predictor:
     )
 
 
-def _iter_split_examples(
+def _window_tokens_to_normalized_text(tokens: np.ndarray) -> str:
+    arr = np.asarray(tokens, dtype=np.int32)
+    if arr.size == 0:
+        return ""
+    valid = arr[(arr >= 0) & (arr < 256)]
+    if valid.size == 0:
+        return ""
+    text = valid.astype(np.uint8, copy=False).tobytes().decode("utf-8", "ignore")
+    return _normalize_input_text(text)
+
+
+def _collect_window_source_langs(metadata: Optional[Dict[str, object]]) -> List[str]:
+    if not isinstance(metadata, dict):
+        return []
+    out: List[str] = []
+    for entry in metadata.get("samples") or []:
+        if not isinstance(entry, dict):
+            continue
+        lang = str(entry.get("language", "")).strip()
+        if lang and lang not in out:
+            out.append(lang)
+    host = metadata.get("host")
+    if isinstance(host, dict):
+        lang = str(host.get("language", "")).strip()
+        if lang and lang not in out:
+            out.append(lang)
+    mode = str(metadata.get("mode", "")).strip()
+    if mode == "markdown" and "markdown" not in out:
+        out.insert(0, "markdown")
+    return out
+
+
+def _resolve_window_source_lang(metadata: Optional[Dict[str, object]]) -> str:
+    if not isinstance(metadata, dict):
+        return "unknown"
+    mode = str(metadata.get("mode", "")).strip()
+    if mode == "markdown":
+        return "markdown"
+    host = metadata.get("host")
+    if isinstance(host, dict):
+        host_lang = str(host.get("language", "")).strip()
+        if host_lang:
+            return host_lang
+
+    best_lang = ""
+    best_bytes = -1
+    unique_langs: List[str] = []
+    for entry in metadata.get("samples") or []:
+        if not isinstance(entry, dict):
+            continue
+        lang = str(entry.get("language", "")).strip()
+        if not lang:
+            continue
+        if lang not in unique_langs:
+            unique_langs.append(lang)
+        bytes_used = entry.get("final_bytes", entry.get("bytes", 0))
+        try:
+            score = int(bytes_used or 0)
+        except (TypeError, ValueError):
+            score = 0
+        if score > best_bytes:
+            best_bytes = score
+            best_lang = lang
+    if best_lang:
+        return best_lang
+    if len(unique_langs) == 1:
+        return unique_langs[0]
+    return "unknown"
+
+
+def _summarize_window_metadata(
+    metadata: Optional[Dict[str, object]],
+    *,
+    window_seed: int,
+) -> Dict[str, object]:
+    if not isinstance(metadata, dict):
+        return {
+            "sampling_mode": "training_window",
+            "window_seed": int(window_seed),
+            "augmentation_mode": "",
+            "augmentation_requested_mode": "",
+            "source_langs": [],
+        }
+    host = metadata.get("host")
+    host_summary = None
+    if isinstance(host, dict):
+        host_summary = {
+            "language": str(host.get("language", "")).strip(),
+            "source": str(host.get("source", "")).strip(),
+            "final_bytes": int(host.get("final_bytes", 0) or 0),
+        }
+    return {
+        "sampling_mode": "training_window",
+        "window_seed": int(window_seed),
+        "augmentation_mode": str(metadata.get("mode", "")).strip(),
+        "augmentation_requested_mode": str(metadata.get("requested_mode", "")).strip(),
+        "source_langs": _collect_window_source_langs(metadata),
+        "host": host_summary,
+        "line_injection_count": len(metadata.get("line_injections") or []),
+        "markdown_block_count": len(metadata.get("markdown_blocks") or []),
+        "source_count": len(metadata.get("samples") or []),
+    }
+
+
+def _iter_raw_split_examples(
     data_root: Path,
     split: str,
     langs: Sequence[str],
@@ -195,7 +302,7 @@ def _iter_split_examples(
     *,
     rng: np.random.Generator,
     seen_hashes: Optional[set[str]] = None,
-) -> Iterable[tuple[str, int, str, str]]:
+) -> Iterable[tuple[str, int, str, str, Dict[str, object]]]:
     seen = seen_hashes if seen_hashes is not None else set()
     for lang in langs:
         ds_path = data_root / split / lang / "dataset"
@@ -228,12 +335,129 @@ def _iter_split_examples(
                 continue
             seen.add(sample_hash)
             selected += 1
-            yield lang, int(idx), normalized, sample_hash
+            yield lang, int(idx), normalized, sample_hash, {"sampling_mode": "raw_dataset"}
         print(
             f"Sampling {lang}: selected={selected}/{limit}, "
             f"skipped_seen_hash={skipped_seen}, skipped_empty={skipped_empty}, dataset_size={total}.",
             flush=True,
         )
+
+
+def _iter_augmented_split_examples(
+    data_root: Path,
+    split: str,
+    langs: Sequence[str],
+    max_samples_per_lang: int,
+    *,
+    rng: np.random.Generator,
+    seen_hashes: Optional[set[str]] = None,
+) -> Iterable[tuple[str, int, str, str, Dict[str, object]]]:
+    seen = seen_hashes if seen_hashes is not None else set()
+    target_per_lang = max(0, int(max_samples_per_lang))
+    if target_per_lang <= 0:
+        return
+
+    dsets = prepare_dsets_by_lang_with_splits(
+        str(data_root),
+        include_languages=list(langs),
+        verbose=False,
+    )
+    dsets_by_lang = dsets.get(split) or {}
+    if not dsets_by_lang:
+        print(
+            f"No datasets available for augmented AL sampling on split='{split}'; "
+            "falling back to raw dataset rows.",
+            flush=True,
+        )
+        yield from _iter_raw_split_examples(
+            data_root,
+            split,
+            langs,
+            max_samples_per_lang,
+            rng=rng,
+            seen_hashes=seen,
+        )
+        return
+
+    data_cfg = cfg.DataConfig(data_root=str(data_root))
+    buckets = data_cfg.buckets()
+    total_target = target_per_lang * max(1, len(dsets_by_lang))
+    selected = 0
+    skipped_seen = 0
+    skipped_empty = 0
+    attempts = 0
+    max_attempts = max(total_target * 5, total_target + 16)
+
+    while selected < total_target and attempts < max_attempts:
+        attempts += 1
+        window_seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        try:
+            random.seed(window_seed)
+            np.random.seed(window_seed)
+            target_len = int(random.choice(buckets))
+            tokens, _, window_meta = make_training_window_with_metadata(
+                dsets_by_lang,
+                target_len,
+                data_cfg,
+            )
+        finally:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+
+        normalized = _window_tokens_to_normalized_text(tokens)
+        if not normalized:
+            skipped_empty += 1
+            continue
+        sample_hash = _hash_text(normalized)
+        if sample_hash in seen:
+            skipped_seen += 1
+            continue
+        seen.add(sample_hash)
+        representative_lang = _resolve_window_source_lang(window_meta)
+        sample_meta = _summarize_window_metadata(window_meta, window_seed=window_seed)
+        yield representative_lang, selected, normalized, sample_hash, sample_meta
+        selected += 1
+
+    print(
+        "Augmented AL sampling: "
+        f"selected={selected}/{total_target}, "
+        f"skipped_seen_hash={skipped_seen}, "
+        f"skipped_empty={skipped_empty}, "
+        f"attempts={attempts}, "
+        f"available_langs={len(dsets_by_lang)}.",
+        flush=True,
+    )
+
+
+def _iter_split_examples(
+    data_root: Path,
+    split: str,
+    langs: Sequence[str],
+    max_samples_per_lang: int,
+    *,
+    rng: np.random.Generator,
+    seen_hashes: Optional[set[str]] = None,
+) -> Iterable[tuple[str, int, str, str, Dict[str, object]]]:
+    if str(split) in {"train", "val", "test"}:
+        yield from _iter_augmented_split_examples(
+            data_root,
+            split,
+            langs,
+            max_samples_per_lang,
+            rng=rng,
+            seen_hashes=seen_hashes,
+        )
+        return
+    yield from _iter_raw_split_examples(
+        data_root,
+        split,
+        langs,
+        max_samples_per_lang,
+        rng=rng,
+        seen_hashes=seen_hashes,
+    )
 
 
 def _build_snippets_from_prediction(
@@ -242,6 +466,7 @@ def _build_snippets_from_prediction(
     lang: str,
     sample_index: int,
     sample_hash: str,
+    sample_metadata: Optional[Dict[str, object]],
     char_labels: Sequence[int],
     char_probs: Sequence[Dict[str, float]],
     max_candidates_per_sample: int,
@@ -297,6 +522,7 @@ def _build_snippets_from_prediction(
                 "right_label_id": int(cand.right_label),
                 "left_label": id2lang.get(int(cand.left_label), "other"),
                 "right_label": id2lang.get(int(cand.right_label), "other"),
+                **(dict(sample_metadata) if isinstance(sample_metadata, dict) else {}),
             },
         )
         out.append((snippet, cand))
@@ -313,6 +539,7 @@ def _build_snippets_for_sample(
     context_chars: int,
     min_score: float,
     sample_hash: Optional[str] = None,
+    sample_metadata: Optional[Dict[str, object]] = None,
 ) -> tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]:
     normalized = normalized_text
     _, char_labels, char_probs, _ = predictor.segment_text(normalized, min_run_chars=1)
@@ -322,6 +549,7 @@ def _build_snippets_for_sample(
         lang=lang,
         sample_index=sample_index,
         sample_hash=resolved_hash,
+        sample_metadata=sample_metadata,
         char_labels=char_labels,
         char_probs=char_probs,
         max_candidates_per_sample=max_candidates_per_sample,
@@ -332,7 +560,7 @@ def _build_snippets_for_sample(
 
 def _build_snippets_for_samples_batch(
     *,
-    samples: Sequence[tuple[str, int, str, str]],
+    samples: Sequence[tuple],
     predictor: Predictor,
     max_candidates_per_sample: int,
     context_chars: int,
@@ -340,7 +568,7 @@ def _build_snippets_for_samples_batch(
 ) -> List[tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]]:
     if not samples:
         return []
-    texts = [normalized for _, _, normalized, _ in samples]
+    texts = [str(sample[2]) for sample in samples]
     segmented = predictor.segment_texts(texts, min_run_chars=1)
     if len(segmented) != len(samples):
         raise RuntimeError(
@@ -348,7 +576,12 @@ def _build_snippets_for_samples_batch(
             f"expected {len(samples)}, got {len(segmented)}."
         )
     out: List[tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]] = []
-    for (lang, sample_index, normalized, sample_hash), result in zip(samples, segmented):
+    for sample, result in zip(samples, segmented):
+        lang = str(sample[0])
+        sample_index = int(sample[1])
+        normalized = str(sample[2])
+        sample_hash = str(sample[3])
+        sample_metadata = dict(sample[4]) if len(sample) > 4 and isinstance(sample[4], dict) else None
         _, char_labels, char_probs, _ = result
         out.append(
             _build_snippets_from_prediction(
@@ -356,6 +589,7 @@ def _build_snippets_for_samples_batch(
                 lang=lang,
                 sample_index=int(sample_index),
                 sample_hash=str(sample_hash),
+                sample_metadata=sample_metadata,
                 char_labels=char_labels,
                 char_probs=char_probs,
                 max_candidates_per_sample=max_candidates_per_sample,
@@ -448,7 +682,7 @@ def run_one_round(
     total_samples_seen = 0
     total_samples_with_candidates = 0
 
-    def _process_scored_batch(samples_batch: Sequence[tuple[str, int, str, str]]) -> None:
+    def _process_scored_batch(samples_batch: Sequence[tuple]) -> None:
         nonlocal total_samples_with_candidates
         if not samples_batch:
             return
@@ -459,10 +693,12 @@ def run_one_round(
             context_chars=context_chars,
             min_score=min_score,
         )
-        for (lang, sample_idx, normalized, sample_hash), (
-            sample_snippets,
-            sample_pred_segments,
-        ) in zip(samples_batch, batch_results):
+        for sample, (sample_snippets, sample_pred_segments) in zip(samples_batch, batch_results):
+            lang = str(sample[0])
+            sample_idx = int(sample[1])
+            normalized = str(sample[2])
+            sample_hash = str(sample[3])
+            sample_metadata = dict(sample[4]) if len(sample) > 4 and isinstance(sample[4], dict) else {}
             if sample_snippets:
                 total_samples_with_candidates += 1
             trigger_ranges: List[Dict[str, object]] = []
@@ -506,12 +742,13 @@ def run_one_round(
                         "max_candidates_per_sample": int(max_candidates_per_sample),
                         "min_score": float(min_score),
                         "context_chars": int(context_chars),
+                        **sample_metadata,
                     },
                 )
             )
 
-    pending_samples: List[tuple[str, int, str, str]] = []
-    for lang, sample_idx, normalized, sample_hash in _iter_split_examples(
+    pending_samples: List[tuple] = []
+    for lang, sample_idx, normalized, sample_hash, sample_metadata in _iter_split_examples(
         Path(data_root),
         split,
         langs,
@@ -520,7 +757,15 @@ def run_one_round(
         seen_hashes=seen_hashes if skip_seen_hashes else None,
     ):
         total_samples_seen += 1
-        pending_samples.append((str(lang), int(sample_idx), normalized, str(sample_hash)))
+        pending_samples.append(
+            (
+                str(lang),
+                int(sample_idx),
+                normalized,
+                str(sample_hash),
+                dict(sample_metadata) if isinstance(sample_metadata, dict) else {},
+            )
+        )
         if len(pending_samples) >= scoring_text_batch_size:
             _process_scored_batch(pending_samples)
             pending_samples = []
