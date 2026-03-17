@@ -151,7 +151,10 @@ def evaluate_monitor_set(
     rng,
     limit: Optional[int] = None,
     eval_step_fn=None,
+    eval_step_with_logits_fn=None,
     other_threshold: float = 0.0,
+    deterministic: bool = False,
+    deterministic_seed: int = 123,
 ) -> Dict[str, Any]:
     if eval_step_fn is None:
         raise ValueError("evaluate_monitor_set requires eval_step_fn=eval_step")
@@ -161,9 +164,15 @@ def evaluate_monitor_set(
     contents = monitor_data["contents"]
     num_files = len(files)
 
-    rng, choice_rng = jax.random.split(rng)
-    seed = int(jax.random.randint(choice_rng, (), 0, 2**31 - 1).item())
-    np_rng = np.random.default_rng(seed)
+    if deterministic:
+        seed = int(deterministic_seed)
+        np_rng = np.random.default_rng(seed)
+        eval_rng = jax.random.PRNGKey(seed)
+    else:
+        rng, choice_rng = jax.random.split(rng)
+        seed = int(jax.random.randint(choice_rng, (), 0, 2**31 - 1).item())
+        np_rng = np.random.default_rng(seed)
+        eval_rng = rng
 
     indices = np.arange(num_files, dtype=np.int64)
     if limit is not None and limit > 0 and limit < len(indices):
@@ -203,16 +212,26 @@ def evaluate_monitor_set(
         if other_idx is not None:
             labels_for_loss[labels_for_loss == int(other_idx)] = cfg.PAD_ID
 
-        batch_rng, logits_rng = jax.random.split(batch_rng)
-        loss, acc = eval_step_fn(
-            state,
-            jnp.array(xb, dtype=jnp.int32),
-            jnp.array(labels_for_loss, dtype=jnp.uint8),
-            batch_rng,
-        )
+        xb_jnp = jnp.array(xb, dtype=jnp.int32)
+        yb_jnp = jnp.array(labels_for_loss, dtype=jnp.uint8)
+        if eval_step_with_logits_fn is not None:
+            loss, acc, logits = eval_step_with_logits_fn(
+                state,
+                xb_jnp,
+                yb_jnp,
+                batch_rng,
+            )
+        else:
+            batch_rng, logits_rng = jax.random.split(batch_rng)
+            loss, acc = eval_step_fn(
+                state,
+                xb_jnp,
+                yb_jnp,
+                batch_rng,
+            )
+            logits = _forward_logits(state, xb_jnp, logits_rng)
         losses.append(float(loss))
         accs.append(float(acc))
-        logits = _forward_logits(state, jnp.array(xb, dtype=jnp.int32), logits_rng)
         logits_np = np.asarray(logits)
         preds = np.asarray(np.argmax(logits_np, axis=-1), dtype=np.int32)
         y_true = yb.astype(np.int32)
@@ -261,11 +280,11 @@ def evaluate_monitor_set(
         xb_batch.append(xb)
         yb_batch.append(yb)
         if len(xb_batch) == batch_size:
-            rng, batch_rng = jax.random.split(rng)
+            eval_rng, batch_rng = jax.random.split(eval_rng)
             _flush_batch(batch_rng)
 
     if xb_batch:
-        rng, batch_rng = jax.random.split(rng)
+        eval_rng, batch_rng = jax.random.split(eval_rng)
         _flush_batch(batch_rng)
 
     import numpy as _np
@@ -279,4 +298,6 @@ def evaluate_monitor_set(
         "windows": int(len(indices) - skipped),
         "conf_thresh": conf_thresh,
         "acc_thresh_mean": float(_np.mean(accs_thresh)) if accs_thresh else None,
+        "deterministic": bool(deterministic),
+        "deterministic_seed": int(seed),
     }

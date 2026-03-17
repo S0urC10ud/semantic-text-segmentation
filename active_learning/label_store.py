@@ -9,6 +9,8 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS: Tuple[str, ...] = ("monitor_b",)
+
 
 @dataclass(frozen=True)
 class StoredRefinement:
@@ -322,13 +324,21 @@ class LabelStore:
         *,
         limit: Optional[int] = None,
         statuses: Optional[Sequence[str]] = ("ok",),
+        exclude_source_splits: Optional[Sequence[str]] = None,
     ) -> Iterator[sqlite3.Row]:
         query = "SELECT * FROM refinements"
         params: List[object] = []
+        where_clauses: List[str] = []
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
-            query += f" WHERE status IN ({placeholders})"
+            where_clauses.append(f"status IN ({placeholders})")
             params.extend(list(statuses))
+        if exclude_source_splits:
+            placeholders = ",".join("?" for _ in exclude_source_splits)
+            where_clauses.append(f"source_split NOT IN ({placeholders})")
+            params.extend([str(split) for split in exclude_source_splits])
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
         query += " ORDER BY id ASC"
         if limit is not None and limit > 0:
             query += " LIMIT ?"
@@ -367,13 +377,17 @@ class LabelStore:
         max_windows: Optional[int] = None,
         fallback_label: str = "other",
         statuses: Sequence[str] = ("ok",),
+        exclude_source_splits: Sequence[str] = DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
         Convert stored refinements into fixed-size byte-level windows.
         """
         windows: List[Tuple[np.ndarray, np.ndarray]] = []
         fallback_id = int(label_to_id.get(fallback_label, pad_label_id))
-        for row in self.iter_rows(statuses=statuses):
+        for row in self.iter_rows(
+            statuses=statuses,
+            exclude_source_splits=exclude_source_splits,
+        ):
             text = str(row["snippet_text"] or "")
             if not text:
                 continue

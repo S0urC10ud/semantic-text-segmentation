@@ -989,6 +989,25 @@ def eval_step(state: TrainState, batch_tokens: jnp.ndarray, batch_labels: jnp.nd
     return loss, acc
 
 
+@jax.jit
+def eval_step_with_logits(
+    state: TrainState,
+    batch_tokens: jnp.ndarray,
+    batch_labels: jnp.ndarray,
+    rng,
+):
+    """Perform a single evaluation step and return logits from the same forward pass."""
+    logits = state.apply_fn(
+        {"params": state.params},
+        batch_tokens,
+        train=False,
+        rngs={"dropout": rng}
+    )
+    loss = cross_entropy_masked(logits, batch_labels, tokens=batch_tokens)
+    acc = accuracy_masked(logits, batch_labels, tokens=batch_tokens)
+    return loss, acc, logits
+
+
 # ---------------------------
 # Multi-GPU (pmap) utilities
 # ---------------------------

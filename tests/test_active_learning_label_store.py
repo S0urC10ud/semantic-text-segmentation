@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_ROOT = ROOT / "train"
 if str(ROOT) not in sys.path:
@@ -211,6 +213,78 @@ class TestLabelStore(unittest.TestCase):
             _, labels = windows[0]
             self.assertTrue(all(int(v) == 1 for v in labels[:15]))
             self.assertEqual(int(labels[15]), 0)
+
+    def test_build_training_windows_excludes_monitor_b_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "al.sqlite"
+            store = LabelStore(db_path)
+
+            store.add_many(
+                [
+                    StoredRefinement(
+                        round_id="r1",
+                        source_split="train",
+                        source_lang="python",
+                        sample_index=0,
+                        sample_hash="hash_train",
+                        boundary_index=2,
+                        snippet_start=0,
+                        snippet_end=4,
+                        snippet_text="abcd",
+                        oracle_name="stub",
+                        oracle_model="stub",
+                        oracle_run_id="",
+                        status="ok",
+                        acquisition_score=1.0,
+                        predicted_segments=[],
+                        refined_segments=[{"start": 0, "end": 4, "label": "python"}],
+                        metadata={},
+                    ),
+                    StoredRefinement(
+                        round_id="r1",
+                        source_split="monitor_b",
+                        source_lang="python",
+                        sample_index=1,
+                        sample_hash="hash_monitor_b",
+                        boundary_index=2,
+                        snippet_start=0,
+                        snippet_end=4,
+                        snippet_text="WXYZ",
+                        oracle_name="stub",
+                        oracle_model="stub",
+                        oracle_run_id="",
+                        status="ok",
+                        acquisition_score=1.0,
+                        predicted_segments=[],
+                        refined_segments=[{"start": 0, "end": 4, "label": "python"}],
+                        metadata={},
+                    ),
+                ]
+            )
+
+            default_windows = store.build_training_windows(
+                window_bytes=8,
+                pad_byte_id=0,
+                pad_label_id=255,
+                label_to_id={"python": 0, "other": 1},
+                fallback_label="other",
+            )
+            self.assertEqual(len(default_windows), 1)
+            default_x, _ = default_windows[0]
+            np.testing.assert_array_equal(
+                default_x[:4],
+                np.frombuffer(b"abcd", dtype=np.uint8).astype(np.int32),
+            )
+
+            all_windows = store.build_training_windows(
+                window_bytes=8,
+                pad_byte_id=0,
+                pad_label_id=255,
+                label_to_id={"python": 0, "other": 1},
+                fallback_label="other",
+                exclude_source_splits=(),
+            )
+            self.assertEqual(len(all_windows), 2)
 
 
 if __name__ == "__main__":

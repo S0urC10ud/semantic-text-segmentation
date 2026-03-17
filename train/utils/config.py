@@ -180,7 +180,10 @@ class TrainConfig:
     preview_count: int = 10
     monitor_eval_every: int = 0
     monitor_eval_limit: int = 4096
+    monitor_eval_batch_size: int = 0
     monitor_eval_root: str = "../downloader/monitor_preprocessed"
+    monitor_eval_deterministic: bool = False
+    monitor_eval_seed: int = 123
     monitor_other_threshold: float = 0.0
     oe_lambda: float = 0.1
     oe_ratio: float = 0.05

@@ -61,6 +61,29 @@ def _label_name_to_id(label_name: str) -> Optional[int]:
     return None
 
 
+def _sample_monitor_file_index(
+    rng: np.random.Generator,
+    total_files: int,
+    *,
+    preferred_file_indices: Optional[np.ndarray] = None,
+    preferred_prob: float = 0.0,
+) -> int:
+    if total_files <= 0:
+        raise ValueError("total_files must be positive when sampling monitor files")
+
+    prob = float(max(0.0, min(1.0, preferred_prob)))
+    if (
+        preferred_file_indices is not None
+        and int(len(preferred_file_indices)) > 0
+        and prob > 0.0
+        and float(rng.random()) < prob
+    ):
+        pick = int(rng.integers(0, int(len(preferred_file_indices))))
+        return int(preferred_file_indices[pick])
+
+    return int(rng.integers(0, int(total_files)))
+
+
 def _monitor_id_to_label() -> Dict[int, str]:
     mapping = {int(idx): str(name) for idx, name in cfg.ID2LANG.items()}
     other_idx = getattr(cfg, "OTHER_CLASS_INDEX", None)
@@ -131,10 +154,17 @@ def _build_augmented_fragment_datasets(
 
     store_path = str(active_learning_store or "").strip()
     if store_path:
-        from active_learning.label_store import LabelStore
+        from active_learning.label_store import (
+            DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
+            LabelStore,
+        )
 
         store = LabelStore(store_path)
-        for row in store.iter_rows(limit=active_learning_limit, statuses=("ok",)):
+        for row in store.iter_rows(
+            limit=active_learning_limit,
+            statuses=("ok",),
+            exclude_source_splits=DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
+        ):
             text = str(row["snippet_text"] or "")
             if not text:
                 continue
@@ -568,6 +598,8 @@ class MonitorFineTuneBatcher:
         augment: bool = False,
         active_learning_store: str = "",
         active_learning_limit: Optional[int] = None,
+        dense_bias_label: str = "",
+        dense_bias_prob: float = 0.0,
     ):
         import multiprocessing as mp
         import sys
@@ -582,6 +614,9 @@ class MonitorFineTuneBatcher:
 
         self.cfg = data_cfg
         self.augment = bool(augment)
+        self.dense_bias_label = str(dense_bias_label or "").strip().lower()
+        self.dense_bias_prob = float(max(0.0, min(1.0, dense_bias_prob)))
+        self.dense_bias_type_id: Optional[int] = None
 
         ctx = mp.get_context("spawn")
         self.q = ctx.Queue(maxsize=max(2, data_cfg.prefetch_batches))
@@ -590,6 +625,42 @@ class MonitorFineTuneBatcher:
 
         self.total_files = int(len(monitor_data["files"]))
         self._processed_windows = 0
+
+        if self.dense_bias_label and self.dense_bias_prob > 0.0:
+            meta = monitor_data.get("meta") or {}
+            meta_lang2id = {
+                str(k).strip().lower(): int(v)
+                for k, v in (meta.get("lang2id") or {}).items()
+            }
+            type_id = meta_lang2id.get(self.dense_bias_label)
+            if type_id is None:
+                type_id = _label_name_to_id(self.dense_bias_label)
+            if type_id is None:
+                print(
+                    "Monitor fine-tune dense bias disabled: "
+                    f"unknown label '{self.dense_bias_label}'.",
+                    flush=True,
+                )
+            else:
+                match_count = int(
+                    np.count_nonzero(monitor_data["files"]["type_id"] == int(type_id))
+                )
+                if match_count <= 0:
+                    print(
+                        "Monitor fine-tune dense bias disabled: "
+                        f"label '{self.dense_bias_label}' has no files in {monitor_root}.",
+                        flush=True,
+                    )
+                else:
+                    self.dense_bias_type_id = int(type_id)
+                    print(
+                        "Monitor fine-tune dense bias enabled: "
+                        f"label={self.dense_bias_label} "
+                        f"type_id={self.dense_bias_type_id} "
+                        f"prob={self.dense_bias_prob:.3f} "
+                        f"files={match_count}/{self.total_files}",
+                        flush=True,
+                    )
 
         for wid in range(max(1, data_cfg.num_workers)):
             t = ctx.Process(
@@ -604,6 +675,8 @@ class MonitorFineTuneBatcher:
                     bool(self.augment),
                     str(active_learning_store or ""),
                     None if active_learning_limit is None else int(active_learning_limit),
+                    self.dense_bias_type_id,
+                    self.dense_bias_prob,
                 ),
                 daemon=True,
             )
@@ -637,12 +710,19 @@ class MonitorFineTuneBatcher:
         total_files,
         *,
         allow_substring_removal: bool = False,
+        preferred_file_indices: Optional[np.ndarray] = None,
+        preferred_prob: float = 0.0,
     ):
         max_attempts = 32
         for _ in range(max_attempts):
             if total_files <= 0:
                 return None
-            file_idx = int(rng.integers(0, total_files))
+            file_idx = _sample_monitor_file_index(
+                rng,
+                total_files,
+                preferred_file_indices=preferred_file_indices,
+                preferred_prob=preferred_prob,
+            )
             row = files[file_idx]
             byte_len = int(row["byte_len"])
             if byte_len <= 0:
@@ -684,6 +764,8 @@ class MonitorFineTuneBatcher:
         data_cfg: "DataConfig",
         *,
         forced_mode: Optional[str] = None,
+        preferred_file_indices: Optional[np.ndarray] = None,
+        preferred_prob: float = 0.0,
     ):
         mode = str(forced_mode or _choose_window_mode(data_cfg)).strip().lower()
         if mode == "pure":
@@ -695,6 +777,8 @@ class MonitorFineTuneBatcher:
                 segments,
                 total_files,
                 allow_substring_removal=True,
+                preferred_file_indices=preferred_file_indices,
+                preferred_prob=preferred_prob,
             )
         if not fragment_dsets:
             return MonitorFineTuneBatcher._build_window(
@@ -705,6 +789,8 @@ class MonitorFineTuneBatcher:
                 segments,
                 total_files,
                 allow_substring_removal=True,
+                preferred_file_indices=preferred_file_indices,
+                preferred_prob=preferred_prob,
             )
 
         seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
@@ -745,6 +831,8 @@ class MonitorFineTuneBatcher:
         augment,
         active_learning_store,
         active_learning_limit,
+        dense_bias_type_id,
+        dense_bias_prob,
     ):
         import sys
         repo_root = str(Path(__file__).resolve().parents[2])
@@ -772,6 +860,13 @@ class MonitorFineTuneBatcher:
                 active_learning_store=active_learning_store,
                 active_learning_limit=active_learning_limit,
             )
+
+        preferred_file_indices: Optional[np.ndarray] = None
+        bias_prob = float(max(0.0, min(1.0, dense_bias_prob)))
+        if dense_bias_type_id is not None and bias_prob > 0.0:
+            matches = np.flatnonzero(files["type_id"] == int(dense_bias_type_id))
+            if int(matches.size) > 0:
+                preferred_file_indices = matches.astype(np.int64, copy=False)
 
         rng = np.random.default_rng(cfg_obj.seed ^ wid ^ int(time.time()))
         buckets = cfg_obj.buckets() if augment else [int(cfg_obj.window_max_bytes)]
@@ -810,6 +905,8 @@ class MonitorFineTuneBatcher:
                         total_files,
                         fragment_dsets,
                         cfg_obj,
+                        preferred_file_indices=preferred_file_indices,
+                        preferred_prob=bias_prob,
                     )
                 else:
                     window = MonitorFineTuneBatcher._build_window(
@@ -819,6 +916,8 @@ class MonitorFineTuneBatcher:
                         contents,
                         segments,
                         total_files,
+                        preferred_file_indices=preferred_file_indices,
+                        preferred_prob=bias_prob,
                     )
                 if window is None:
                     # If we repeatedly fail to build a window, just break and

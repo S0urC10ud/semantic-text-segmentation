@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from .label_store import LabelStore
+from .label_store import LabelStore, DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS
 
 
 @dataclass
@@ -27,6 +27,7 @@ class ActiveLearningReplay:
         max_windows: Optional[int],
         seed: int,
         fallback_label: str = "other",
+        exclude_source_splits: Tuple[str, ...] = DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
     ) -> "ActiveLearningReplay":
         store = LabelStore(store_path)
         windows = store.build_training_windows(
@@ -36,6 +37,7 @@ class ActiveLearningReplay:
             label_to_id=label_to_id,
             max_windows=max_windows,
             fallback_label=str(fallback_label),
+            exclude_source_splits=exclude_source_splits,
         )
         if not windows:
             return cls(

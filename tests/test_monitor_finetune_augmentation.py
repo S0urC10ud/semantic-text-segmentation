@@ -49,6 +49,32 @@ def _monitor_data() -> dict:
     }
 
 
+def _monitor_data_two_files() -> dict:
+    py_id = int(cfg.LANG2ID["python"])
+    cs_id = int(cfg.LANG2ID["csharp"])
+    files = np.array(
+        [
+            (0, 4, 0, 1, 0, py_id),
+            (4, 4, 1, 1, 0, cs_id),
+        ],
+        dtype=FILE_DTYPE,
+    )
+    segments = np.array(
+        [
+            (0, 0, 4, py_id),
+            (1, 0, 4, cs_id),
+        ],
+        dtype=SEG_DTYPE,
+    )
+    contents = np.frombuffer(b"aaaaBBBB", dtype=np.uint8)
+    return {
+        "meta": {},
+        "files": files,
+        "segments": segments,
+        "contents": contents,
+    }
+
+
 class TestMonitorFineTuneAugmentation(unittest.TestCase):
     def test_apply_monitor_removal_span_line_keeps_following_labels_aligned(self) -> None:
         py_id = int(cfg.LANG2ID["python"])
@@ -101,29 +127,53 @@ class TestMonitorFineTuneAugmentation(unittest.TestCase):
     def test_build_augmented_fragment_datasets_includes_monitor_and_sqlite_segments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LabelStore(Path(tmpdir) / "al.sqlite")
-            store.add(
-                StoredRefinement(
-                    round_id="r1",
-                    source_split="train",
-                    source_lang="python",
-                    sample_index=0,
-                    sample_hash="hash-1",
-                    boundary_index=2,
-                    snippet_start=0,
-                    snippet_end=4,
-                    snippet_text="xyZZ",
-                    oracle_name="stub",
-                    oracle_model="stub",
-                    oracle_run_id="",
-                    status="ok",
-                    acquisition_score=1.0,
-                    predicted_segments=[],
-                    refined_segments=[
-                        {"start": 0, "end": 2, "label": "python"},
-                        {"start": 2, "end": 4, "label": "sql"},
-                    ],
-                    metadata={},
-                )
+            store.add_many(
+                [
+                    StoredRefinement(
+                        round_id="r1",
+                        source_split="train",
+                        source_lang="python",
+                        sample_index=0,
+                        sample_hash="hash-1",
+                        boundary_index=2,
+                        snippet_start=0,
+                        snippet_end=4,
+                        snippet_text="xyZZ",
+                        oracle_name="stub",
+                        oracle_model="stub",
+                        oracle_run_id="",
+                        status="ok",
+                        acquisition_score=1.0,
+                        predicted_segments=[],
+                        refined_segments=[
+                            {"start": 0, "end": 2, "label": "python"},
+                            {"start": 2, "end": 4, "label": "sql"},
+                        ],
+                        metadata={},
+                    ),
+                    StoredRefinement(
+                        round_id="r1",
+                        source_split="monitor_b",
+                        source_lang="python",
+                        sample_index=1,
+                        sample_hash="hash-monitor-b",
+                        boundary_index=2,
+                        snippet_start=0,
+                        snippet_end=4,
+                        snippet_text="qqRR",
+                        oracle_name="stub",
+                        oracle_model="stub",
+                        oracle_run_id="",
+                        status="ok",
+                        acquisition_score=1.0,
+                        predicted_segments=[],
+                        refined_segments=[
+                            {"start": 0, "end": 2, "label": "python"},
+                            {"start": 2, "end": 4, "label": "sql"},
+                        ],
+                        metadata={},
+                    ),
+                ]
             )
 
             dsets = _build_augmented_fragment_datasets(
@@ -158,6 +208,29 @@ class TestMonitorFineTuneAugmentation(unittest.TestCase):
         np.testing.assert_array_equal(
             y[:6],
             np.array([py_id, py_id, sql_id, sql_id, sql_id, sql_id], dtype=np.uint8),
+        )
+
+    def test_build_window_dense_bias_prefers_requested_label(self) -> None:
+        monitor_data = _monitor_data_two_files()
+        cs_id = int(cfg.LANG2ID["csharp"])
+        x, y = MonitorFineTuneBatcher._build_window(
+            np.random.default_rng(0),
+            4,
+            monitor_data["files"],
+            monitor_data["contents"],
+            monitor_data["segments"],
+            len(monitor_data["files"]),
+            preferred_file_indices=np.array([1], dtype=np.int64),
+            preferred_prob=1.0,
+        )
+
+        np.testing.assert_array_equal(
+            x[:4],
+            np.frombuffer(b"BBBB", dtype=np.uint8).astype(np.int32),
+        )
+        np.testing.assert_array_equal(
+            y[:4],
+            np.array([cs_id, cs_id, cs_id, cs_id], dtype=np.uint8),
         )
 
     def test_build_augmented_window_mixed_keeps_labels_aligned(self) -> None:

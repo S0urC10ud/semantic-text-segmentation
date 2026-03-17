@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import sys
@@ -52,6 +53,7 @@ from utils.model import (
     train_step,
     train_step_with_oe,
     eval_step,
+    eval_step_with_logits,
     TrainState,
     count_params,
     train_step_no_jit,
@@ -188,6 +190,14 @@ def _find_local_wandb_config(repo_root: Path, run_id: str) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def _find_local_wandb_summary(repo_root: Path, run_id: str) -> Path | None:
+    wandb_root = repo_root / "wandb"
+    if not wandb_root.exists():
+        return None
+    candidates = sorted(wandb_root.glob(f"run-*-{run_id}/files/wandb-summary.json"))
+    return candidates[-1] if candidates else None
+
+
 def _read_wandb_config_value(config_path: Path, key: str) -> str | None:
     """Read a simple top-level `key: { value: ... }` entry from wandb config.yaml."""
     try:
@@ -209,6 +219,111 @@ def _read_wandb_config_value(config_path: Path, key: str) -> str | None:
                         value = value[1:-1]
                     return value
     return None
+
+
+def _read_local_wandb_summary(summary_path: Path) -> Dict[str, object] | None:
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _collect_monitor_per_class_f1(
+    summary: Dict[str, object],
+    *,
+    prefix: str,
+) -> list[tuple[float, str, str]]:
+    rows: list[tuple[float, str, str]] = []
+    for key, raw_value in summary.items():
+        if not key.startswith(prefix) or not key.endswith("/f1"):
+            continue
+        try:
+            score = float(raw_value)
+        except Exception:
+            continue
+        if not np.isfinite(score):
+            continue
+        class_token = key[len(prefix):-len("/f1")]
+        label = class_token.split("_", 1)[1] if "_" in class_token else class_token
+        label = str(label).strip().lower()
+        if not label or label == "other":
+            continue
+        rows.append((score, label, key))
+    rows.sort(key=lambda item: (item[0], item[1], item[2]))
+    return rows
+
+
+def _select_weakest_monitor_label(
+    summary: Dict[str, object],
+) -> tuple[str, str, float] | None:
+    for prefix in ("monitor_thresh/per_class/", "monitor/per_class/"):
+        rows = _collect_monitor_per_class_f1(summary, prefix=prefix)
+        if rows:
+            score, label, key = rows[0]
+            return label, key, score
+    return None
+
+
+def _resolve_fine_tune_dense_bias(
+    repo_root: Path,
+    args,
+) -> tuple[str, str, float, str]:
+    prob = float(max(0.0, min(1.0, getattr(args, "fine_tune_dense_bias_prob", 0.0))))
+    raw_label = str(getattr(args, "fine_tune_dense_bias_label", "") or "").strip().lower()
+    if prob <= 0.0:
+        return "", "", float("nan"), ""
+
+    if raw_label and raw_label != "auto":
+        print(
+            f"Dense bias label fixed by CLI: label={raw_label} prob={prob:.3f}",
+            flush=True,
+        )
+        return raw_label, "", float("nan"), ""
+
+    candidate_run_ids: list[str] = []
+    for candidate in (
+        getattr(args, "continue_run_id", ""),
+        getattr(args, "wandb_run_id", ""),
+        getattr(args, "fine_tune_dense_bias_source_run_id", ""),
+        getattr(args, "fine_tune_run_id", ""),
+    ):
+        run_id = str(candidate or "").strip()
+        if run_id and run_id not in candidate_run_ids:
+            candidate_run_ids.append(run_id)
+
+    for run_id in candidate_run_ids:
+        summary_path = _find_local_wandb_summary(repo_root, run_id)
+        if summary_path is None:
+            continue
+        summary = _read_local_wandb_summary(summary_path)
+        if not summary:
+            continue
+        selected = _select_weakest_monitor_label(summary)
+        if selected is None:
+            continue
+        label, key, score = selected
+        metric_prefix = key.rsplit("/", 2)[0] + "/"
+        weakest = _collect_monitor_per_class_f1(summary, prefix=metric_prefix)[:3]
+        weakest_preview = ", ".join(
+            f"{lbl}={val:.4f}" for val, lbl, _ in weakest
+        )
+        print(
+            "Auto dense bias selection: "
+            f"run={run_id} summary={summary_path} "
+            f"metric={key} value={score:.4f} "
+            f"chosen_label={label} prob={prob:.3f}"
+            + (f" weakest=[{weakest_preview}]" if weakest_preview else ""),
+            flush=True,
+        )
+        return label, key, score, run_id
+
+    print(
+        "Auto dense bias disabled: no local W&B summary with per-class monitor F1 "
+        f"was found for candidate runs {candidate_run_ids}.",
+        flush=True,
+    )
+    return "", "", float("nan"), ""
 
 
 def _make_eval_batch(
@@ -361,6 +476,24 @@ def main():
         help="Max monitor files to sample per monitor eval (-1 = use all files; be careful, this is slow).",
     )
     parser.add_argument(
+        "--monitor_eval_batch_size",
+        type=int,
+        default=0,
+        help="Batch size for monitor eval only (0 = reuse train batch size).",
+    )
+    parser.add_argument(
+        "--monitor_eval_deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use a fixed-seed monitor eval subset and fixed window sampling on every monitor run.",
+    )
+    parser.add_argument(
+        "--monitor_eval_seed",
+        type=int,
+        default=123,
+        help="Seed used when --monitor_eval_deterministic is enabled.",
+    )
+    parser.add_argument(
         "--monitor_eval_root",
         type=str,
         default=str(default_monitor_root),
@@ -497,6 +630,33 @@ def main():
         ),
     )
     parser.add_argument(
+        "--fine_tune_dense_bias_label",
+        type=str,
+        default="",
+        help=(
+            "Optional monitor label to sample slightly more often from the dense fine-tune set. "
+            "Use 'auto' or leave empty to pick the weakest class from a local W&B summary."
+        ),
+    )
+    parser.add_argument(
+        "--fine_tune_dense_bias_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability of drawing a dense fine-tune monitor file from "
+            "--fine_tune_dense_bias_label instead of uniform sampling."
+        ),
+    )
+    parser.add_argument(
+        "--fine_tune_dense_bias_source_run_id",
+        type=str,
+        default="",
+        help=(
+            "Optional fallback W&B run id whose latest local summary should be used when "
+            "auto-selecting the dense-bias label."
+        ),
+    )
+    parser.add_argument(
         "--num-gpus",
         type=int,
         default=2,
@@ -562,6 +722,11 @@ def main():
         raise ValueError("--oe-lambda must be >= 0")
     if args.oe_ratio < 0.0:
         raise ValueError("--oe-ratio must be >= 0")
+
+    dense_bias_label_resolved, dense_bias_metric_key, dense_bias_metric_value, dense_bias_metric_run_id = (
+        _resolve_fine_tune_dense_bias(repo_root, args)
+    )
+    args.fine_tune_dense_bias_label = dense_bias_label_resolved
 
     # --- Multi-GPU validation (fail fast) ---
     num_devices = args.num_gpus
@@ -716,7 +881,10 @@ def main():
         eval_batches=int(args.eval_batches),
         monitor_eval_every=int(monitor_every),
         monitor_eval_limit=int(args.monitor_eval_limit),
+        monitor_eval_batch_size=int(args.monitor_eval_batch_size),
         monitor_eval_root=args.monitor_eval_root,
+        monitor_eval_deterministic=bool(args.monitor_eval_deterministic),
+        monitor_eval_seed=int(args.monitor_eval_seed),
         monitor_other_threshold=float(args.monitor_other_threshold),
         oe_lambda=float(args.oe_lambda),
         oe_ratio=float(args.oe_ratio),
@@ -804,6 +972,17 @@ def main():
                     f"Monitor eval enabled: {total_files} files from {monitor_root}",
                     flush=True,
                 )
+                monitor_bs = int(t_cfg.monitor_eval_batch_size) if int(t_cfg.monitor_eval_batch_size) > 0 else int(d_cfg.batch_size)
+                print(
+                    f"Monitor eval batch size: {monitor_bs}",
+                    flush=True,
+                )
+                if bool(t_cfg.monitor_eval_deterministic):
+                    limit_desc = "all files" if int(t_cfg.monitor_eval_limit) < 0 else f"{int(t_cfg.monitor_eval_limit)} files"
+                    print(
+                        f"Monitor eval deterministic mode: fixed {limit_desc} with seed {int(t_cfg.monitor_eval_seed)}.",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"⚠️  Monitor eval disabled (load failure): {e}", flush=True)
                 t_cfg.monitor_eval_every = 0
@@ -841,6 +1020,16 @@ def main():
             "active_learning_mix_prob": float(args.active_learning_mix_prob),
             "active_learning_max_windows": int(args.active_learning_max_windows),
             "fine_tune_augment_monitor": bool(args.fine_tune_augment_monitor),
+            "fine_tune_dense_bias_label": str(args.fine_tune_dense_bias_label or ""),
+            "fine_tune_dense_bias_prob": float(args.fine_tune_dense_bias_prob),
+            "fine_tune_dense_bias_source_run_id": str(args.fine_tune_dense_bias_source_run_id or ""),
+            "fine_tune_dense_bias_metric_key": str(dense_bias_metric_key or ""),
+            "fine_tune_dense_bias_metric_run_id": str(dense_bias_metric_run_id or ""),
+            "fine_tune_dense_bias_metric_value": (
+                float(dense_bias_metric_value)
+                if np.isfinite(dense_bias_metric_value)
+                else None
+            ),
             "monitor_train_files": int(fine_tune_train_files_count),
             "monitor_eval_files": int(monitor_eval_files_count),
             "num_gpus": int(num_devices),
@@ -1135,6 +1324,8 @@ def main():
             augment=bool(args.fine_tune_augment_monitor),
             active_learning_store=args.active_learning_store,
             active_learning_limit=int(args.active_learning_max_windows),
+            dense_bias_label=str(args.fine_tune_dense_bias_label or ""),
+            dense_bias_prob=float(args.fine_tune_dense_bias_prob),
         )
     else:
         data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
@@ -1297,18 +1488,32 @@ def main():
         print_metrics_table(per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID)
 
         if monitor_data is not None and t_cfg.monitor_eval_every > 0:
-            print("Running monitor evaluation...", flush=True)
+            if bool(t_cfg.monitor_eval_deterministic):
+                print(
+                    f"Running monitor evaluation (deterministic seed={int(t_cfg.monitor_eval_seed)})...",
+                    flush=True,
+                )
+            else:
+                print("Running monitor evaluation...", flush=True)
             eval_rng, monitor_rng = jax.random.split(eval_rng)
             limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)
+            monitor_batch_size = (
+                int(t_cfg.monitor_eval_batch_size)
+                if int(t_cfg.monitor_eval_batch_size) > 0
+                else int(d_cfg.batch_size)
+            )
             monitor_stats = evaluate_monitor_set(
                 state=eval_state,
                 monitor_data=monitor_data,
                 L=d_cfg.window_max_bytes,
-                batch_size=d_cfg.batch_size,
+                batch_size=monitor_batch_size,
                 rng=monitor_rng,
                 limit=limit,
                 eval_step_fn=eval_step,
+                eval_step_with_logits_fn=eval_step_with_logits,
                 other_threshold=t_cfg.monitor_other_threshold,
+                deterministic=bool(t_cfg.monitor_eval_deterministic),
+                deterministic_seed=int(t_cfg.monitor_eval_seed),
             )
 
             per_class_m, aggregates_m = compute_metrics_from_confusion(
@@ -1798,18 +2003,32 @@ def main():
                     )
 
                     if monitor_data is not None and t_cfg.monitor_eval_every > 0:
-                        print("Running monitor evaluation...", flush=True)
+                        if bool(t_cfg.monitor_eval_deterministic):
+                            print(
+                                f"Running monitor evaluation (deterministic seed={int(t_cfg.monitor_eval_seed)})...",
+                                flush=True,
+                            )
+                        else:
+                            print("Running monitor evaluation...", flush=True)
                         eval_rng, monitor_rng = jax.random.split(eval_rng)
                         limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)
+                        monitor_batch_size = (
+                            int(t_cfg.monitor_eval_batch_size)
+                            if int(t_cfg.monitor_eval_batch_size) > 0
+                            else int(d_cfg.batch_size)
+                        )
                         monitor_stats = evaluate_monitor_set(
                             state=eval_state,
                             monitor_data=monitor_data,
                             L=d_cfg.window_max_bytes,
-                            batch_size=d_cfg.batch_size,
+                            batch_size=monitor_batch_size,
                             rng=monitor_rng,
                             limit=limit,
                             eval_step_fn=eval_step,
+                            eval_step_with_logits_fn=eval_step_with_logits,
                             other_threshold=t_cfg.monitor_other_threshold,
+                            deterministic=bool(t_cfg.monitor_eval_deterministic),
+                            deterministic_seed=int(t_cfg.monitor_eval_seed),
                         )
                         # Base monitor confusion: only trained classes.
                         per_class_m, aggregates_m = compute_metrics_from_confusion(

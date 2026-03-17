@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Monitor Error Viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Monitor <span>Error Viewer</span></div>
+    <div class="controls">
+      <label>Content Type
+        <select id="focusSelect">
+          <option value="">all</option>
+        </select>
+      </label>
+      <label>Sort
+        <select id="sortSelect"></select>
+      </label>
+      <label>Search
+        <input id="searchInput" type="search" placeholder="label, file type, preview..." />
+      </label>
+      <label>Page Size
+        <select id="pageSizeSelect">
+          <option value="10">10</option>
+          <option value="20" selected>20</option>
+          <option value="40">40</option>
+          <option value="80">80</option>
+        </select>
+      </label>
+      <label class="checkbox">
+        <input id="mistakesOnlyCheckbox" type="checkbox" checked />
+        <span>Mistakes only</span>
+      </label>
+      <button id="refreshBtn" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <h2>Overview</h2>
+      <div id="cards" class="cards"></div>
+      <div class="panel-grid">
+        <div class="subpanel">
+          <h3>Weakest Content Types</h3>
+          <div id="labelRows" class="label-list"></div>
+        </div>
+        <div class="subpanel">
+          <h3>Selection</h3>
+          <div id="selectionMeta" class="selection-meta"></div>
+          <div id="selectionStats" class="stats-grid"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Samples</h2>
+      <div id="sampleMeta" class="sample-meta"></div>
+      <table class="sample-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Focus</th>
+            <th>File Type</th>
+            <th>Support</th>
+            <th>F1</th>
+            <th>Precision</th>
+            <th>Recall</th>
+            <th>Diff</th>
+            <th>Accuracy</th>
+            <th>Preview</th>
+          </tr>
+        </thead>
+        <tbody id="sampleRows"></tbody>
+      </table>
+      <div class="pager">
+        <button id="prevPage" type="button">Prev</button>
+        <span id="pageInfo"></span>
+        <button id="nextPage" type="button">Next</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Sample Detail</h2>
+      <div id="detailMeta" class="detail-meta">Select a sample row to inspect model errors.</div>
+      <div id="detailCards" class="cards compact-cards"></div>
+      <div class="panel-grid detail-top-grid">
+        <div class="subpanel">
+          <h3>Legend</h3>
+          <div id="legend" class="legend"></div>
+        </div>
+        <div class="subpanel">
+          <h3>Top Confusions</h3>
+          <div id="confusionRows" class="confusion-list"></div>
+        </div>
+      </div>
+      <div class="compare-grid">
+        <div class="render-block">
+          <div class="render-title">Ground Truth</div>
+          <div id="truthRender" class="render"></div>
+        </div>
+        <div class="render-block">
+          <div class="render-title">Prediction</div>
+          <div id="predRender" class="render"></div>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <div class="render-block">
+          <h3>Ground-Truth Runs</h3>
+          <div id="truthRuns" class="run-list"></div>
+        </div>
+        <div class="render-block">
+          <h3>Predicted Runs</h3>
+          <div id="predRuns" class="run-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="tooltip" class="tooltip hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
