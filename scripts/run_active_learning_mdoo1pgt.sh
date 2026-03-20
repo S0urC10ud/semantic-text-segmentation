@@ -13,9 +13,9 @@ set -euo pipefail
 # ── Configuration ──────────────────────────────────────────────
 PROJECT="magika-segment-feb-2026"
 ZONE="europe-west1-c"
-INSTANCE="thesis-t4-robust"
+INSTANCE="thesis-l4-robust"
 REMOTE_USER="martindallinger2002_gmail_com"
-REPO_DIR="/home/${REMOTE_USER}/semantic-text-segmentation"
+REPO_DIR="/home/martindallinger2002_gmail_com/semantic-text-segmentation"
 
 # ── The training script that runs ON the VM ────────────────────
 read -r -d '' TRAINING_SCRIPT << 'TRAINING_EOF' || true

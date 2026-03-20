@@ -12,7 +12,7 @@ set -euo pipefail
 # ── Configuration ──────────────────────────────────────────────
 PROJECT="magika-segment-feb-2026"
 ZONE="europe-west1-c"
-INSTANCE="thesis-t4-robust"
+INSTANCE="thesis-l4-robust"
 REMOTE_USER="martindallinger2002_gmail_com"
 REPO_DIR="/home/${REMOTE_USER}/semantic-text-segmentation"
 
