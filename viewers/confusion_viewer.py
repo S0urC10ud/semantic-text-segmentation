@@ -7,9 +7,11 @@ validation windows rendered in the familiar segment viewer style.
 import os
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 import argparse
 import collections
+import gc
 import importlib.util
 import json
 import random
@@ -1333,6 +1335,7 @@ try:
         dtype_str=args.dtype,
         chunk=args.chunk,
         other_threshold=args.other_threshold,
+        inference_batch_size=args.batch_size,
     )
 except Exception as exc:
     load_error = str(exc)
@@ -1441,11 +1444,20 @@ if load_error is None and predictor is not None:
         if monitor_root_arg:
             monitor_root = Path(monitor_root_arg).expanduser()
             if monitor_root.exists():
+                print(
+                    f"📈 Building monitor confusion from {monitor_root} (limit={args.monitor_limit or 0})",
+                    flush=True,
+                )
+                
+                # Free up memory from the previous phase BEFORE loading memmaps or running monitor eval
+                gc.collect()
                 try:
-                    print(
-                        f"📈 Building monitor confusion from {monitor_root} (limit={args.monitor_limit or 0})",
-                        flush=True,
-                    )
+                    if hasattr(jax, "clear_caches"):
+                        jax.clear_caches()
+                except Exception:
+                    pass
+
+                try:
                     MONITOR_DATA = load_monitor_memmaps(monitor_root)
                     _MONITOR_PRED_CACHE.clear()
                     monitor_conf, monitor_examples, monitor_pointers, monitor_meta = _collect_monitor_confusion(
