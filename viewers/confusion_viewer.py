@@ -780,6 +780,9 @@ def _collect_monitor_confusion(
         byte_len = int(row["byte_len"])
         if byte_len <= 0:
             continue
+        
+        if (file_idx + 1) % 50 == 0 or file_idx == 0 or file_idx == limit - 1:
+            print(f"   ⌛ Processing monitor file {file_idx + 1}/{limit} ({byte_len} bytes)...", flush=True)
         byte_start = int(row["byte_start"])
         raw = np.asarray(contents[byte_start : byte_start + byte_len], dtype=np.uint8)
         sanitized = _sanitize_model_bytes(raw)
@@ -787,13 +790,17 @@ def _collect_monitor_confusion(
         seg_count = int(row["seg_count"])
         seg_slice = segments[seg_start : seg_start + seg_count]
         true_labels = _build_monitor_true_labels(len(sanitized), seg_slice)
-        pred_bytes, probs = predictor._segment_bytes(sanitized)
+        # Optimization: use return_max_probs=True to avoid full (L, 35) prob matrix if possible.
+        # However, _segment_bytes currently returns (labels, probs, max_probs).
+        # We pass use_threshold to return_max_probs.
+        pred_bytes, probs, max_probs = predictor._segment_bytes(sanitized, return_max_probs=use_threshold)
+        
         preds_core = pred_bytes.astype(np.int32)
         preds_thresh = preds_core.copy()
         if use_threshold:
-            max_prob_full = np.max(probs, axis=-1)
-            low_conf_mask = max_prob_full < float(other_threshold)
-            preds_thresh[low_conf_mask] = int(other_id)
+            # probs is None if return_max_probs was used to save memory in _segment_bytes
+            # max_probs is already calculated.
+            preds_thresh[max_probs < float(other_threshold)] = int(other_id)
         valid_mask = (true_labels != cfg.PAD_ID)
         if not valid_mask.any():
             continue
@@ -1065,12 +1072,18 @@ parser.add_argument(
 )
 parser.add_argument("--colors", type=str, default=None, help="Optional colors; positional or lang=#hex mapping.")
 parser.add_argument("--data-root", type=str, default=None, help="Path to Arrow data root (defaults to downloader/arrow_out).")
-parser.add_argument("--batch-size", type=int, default=16, help="Batch size for confusion sampling.")
+parser.add_argument("--batch-size", type=int, default=8, help="Batch size for confusion sampling.")
 parser.add_argument(
     "--eval-batches",
     type=int,
-    default=25,
-    help="Base number of batches to sample (internally multiplied by 10).",
+    default=0,
+    help="Base number of batches to sample (internally multiplied by 10). Superseded by --eval-samples.",
+)
+parser.add_argument(
+    "--eval-samples",
+    type=int,
+    default=4000,
+    help="Total number of windows to sample for confusion matrix.",
 )
 parser.add_argument(
     "--examples-per-cell",
@@ -1140,7 +1153,11 @@ if not resolved_data_root.exists():
         f"Set --data-root to the directory containing train/val/test Arrow shards."
     )
 args.data_root = str(resolved_data_root)
-effective_eval_batches = max(1, int(args.eval_batches) * 10)
+
+if args.eval_batches > 0:
+    effective_eval_batches = max(1, int(args.eval_batches) * 10)
+else:
+    effective_eval_batches = max(1, (int(args.eval_samples) + args.batch_size - 1) // args.batch_size)
 
 label_names = auto_hparams.get("label_names")
 if label_names:

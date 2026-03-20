@@ -1335,73 +1335,121 @@ class Predictor:
         self,
         byte_arrays: Sequence[np.ndarray],
         chunk: int = None,
-    ) -> tuple[List[np.ndarray], List[np.ndarray], List[List[Tuple[int, int]]]]:
+        return_probs: bool = True,
+        return_max_probs: bool = False,
+    ) -> tuple[List[np.ndarray], List[Optional[np.ndarray]], List[Optional[np.ndarray]], List[List[Tuple[int, int]]]]:
         chunk_size = self._resolve_chunk_size(chunk)
         arrays = [_sanitize_model_bytes(np.asarray(arr, dtype=np.uint8)) for arr in byte_arrays]
-        probs_accum_list: List[np.ndarray] = [
-            np.zeros((int(arr.shape[0]), self.num_classes), dtype=np.float32)
-            for arr in arrays
-        ]
-        weight_accum_list: List[np.ndarray] = [
-            np.zeros((int(arr.shape[0]),), dtype=np.float32)
-            for arr in arrays
-        ]
-        spans_by_text: List[List[Tuple[int, int]]] = []
-        window_refs: List[Tuple[int, int, int, np.ndarray]] = []
-
-        for text_idx, arr in enumerate(arrays):
-            spans = self._build_window_spans(int(arr.shape[0]), chunk_size)
-            spans_by_text.append(spans)
-            for start, end in spans:
-                window_refs.append((text_idx, int(start), int(end), arr[start:end]))
-
-        if not window_refs:
-            byte_labels = [np.zeros((int(arr.shape[0]),), dtype=np.uint8) for arr in arrays]
-            return byte_labels, probs_accum_list, spans_by_text
-
-        batch_size = int(self.inference_batch_size)
-        for i in range(0, len(window_refs), batch_size):
-            batch = window_refs[i:i + batch_size]
-            actual = len(batch)
-            tokens = np.full((batch_size, chunk_size), PAD_BYTE_ID, dtype=np.int32)
-            for j, (_, _, _, window_bytes) in enumerate(batch):
-                length = min(int(window_bytes.shape[0]), chunk_size)
-                if length > 0:
-                    tokens[j, :length] = window_bytes[:length].astype(np.int32)
-            tokens = _sanitize_model_tokens(tokens)
-            logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
-            probs_batch = np.asarray(jax.nn.softmax(logits, axis=-1), dtype=np.float32)
-            probs_batch = probs_batch[:actual, :chunk_size]
-
-            for j, (text_idx, start, end, _) in enumerate(batch):
-                plen = int(end) - int(start)
-                if plen <= 0:
-                    continue
-                weights = self._window_weights(plen)
-                window_probs = probs_batch[j, :plen]
-                probs_accum_list[text_idx][start:end] += window_probs * weights[:, None]
-                weight_accum_list[text_idx][start:end] += weights
-
+        
+        final_probs_list: List[Optional[np.ndarray]] = []
+        final_max_probs_list: List[Optional[np.ndarray]] = []
         byte_labels: List[np.ndarray] = []
-        for probs_accum, weight_accum in zip(probs_accum_list, weight_accum_list):
-            if probs_accum.size <= 0:
-                byte_labels.append(np.zeros((0,), dtype=np.uint8))
-                continue
-            if np.any(weight_accum > 0):
-                nonzero = weight_accum > 0
-                probs_accum[nonzero] /= weight_accum[nonzero, None]
-                zero_mask = ~nonzero
-                if np.any(zero_mask):
-                    probs_accum[zero_mask] = 1.0 / self.num_classes
-            else:
-                probs_accum[:] = 1.0 / self.num_classes
-            byte_labels.append(np.argmax(probs_accum, axis=-1).astype(np.uint8))
-        return byte_labels, probs_accum_list, spans_by_text
 
-    def _segment_bytes(self, byte_arr: np.ndarray, chunk: int = None) -> tuple[np.ndarray, np.ndarray]:
-        byte_labels, byte_probs, spans_by_text = self._segment_bytes_batch([byte_arr], chunk=chunk)
+        # Internal helper to process a set of windows and accumulate into target arrays
+        def _process_windows(win_refs, target_p_acc, target_w_acc):
+            batch_size = int(self.inference_batch_size)
+            for i in range(0, len(win_refs), batch_size):
+                batch = win_refs[i : i + batch_size]
+                actual = len(batch)
+                tokens = np.full((batch_size, chunk_size), PAD_BYTE_ID, dtype=np.int32)
+                for j, (_, _, _, window_bytes) in enumerate(batch):
+                    length = min(int(window_bytes.shape[0]), chunk_size)
+                    if length > 0:
+                        tokens[j, :length] = window_bytes[:length].astype(np.int32)
+                
+                tokens = _sanitize_model_tokens(tokens)
+                logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
+                probs_batch = np.asarray(jax.nn.softmax(logits, axis=-1), dtype=np.float32)
+                probs_batch = probs_batch[:actual, :chunk_size]
+                
+                for j, (_, start, end, _) in enumerate(batch):
+                    plen = int(end) - int(start)
+                    if plen <= 0:
+                        continue
+                    weights = self._window_weights(plen)
+                    window_probs = probs_batch[j, :plen]
+                    target_p_acc[start:end] += window_probs * weights[:, None]
+                    target_w_acc[start:end] += weights
+
+        for arr in arrays:
+            L = int(arr.shape[0])
+            # If the text is huge and we don't need full probs returned, process it in super-chunks
+            # to cap the size of the internal probability accumulation matrix.
+            # 512KB * 35 classes * 4 bytes = ~70MB.
+            super_chunk_size = 512 * 1024 
+            if L > super_chunk_size and not return_probs:
+                labels_out = np.zeros((L,), dtype=np.uint8)
+                max_probs_out = np.zeros((L,), dtype=np.float32) if return_max_probs else None
+                
+                # Overlap of 2x chunk_size ensures window weighting is stable at boundaries
+                overlap = 2 * chunk_size
+                for start in range(0, L, super_chunk_size - overlap):
+                    end = min(L, start + super_chunk_size)
+                    sub_arr = arr[start:end]
+                    sub_L = len(sub_arr)
+                    
+                    sub_spans = self._build_window_spans(sub_L, chunk_size)
+                    sub_win_refs = [(0, s, e, sub_arr[s:e]) for s, e in sub_spans]
+                    
+                    sub_probs = np.zeros((sub_L, self.num_classes), dtype=np.float32)
+                    sub_weights = np.zeros((sub_L,), dtype=np.float32)
+                    
+                    _process_windows(sub_win_refs, sub_probs, sub_weights)
+                    
+                    nonzero = sub_weights > 0
+                    sub_probs[nonzero] /= sub_weights[nonzero, None]
+                    
+                    sub_labels = np.argmax(sub_probs, axis=-1).astype(np.uint8)
+                    
+                    # Copy results back, prioritizing the middle parts of super-chunks
+                    copy_start_in_sub = 0 if start == 0 else (overlap // 2)
+                    copy_start_in_full = start + copy_start_in_sub
+                    copy_end_in_full = L if end == L else (start + super_chunk_size - (overlap // 2))
+                    
+                    copy_len = copy_end_in_full - copy_start_in_full
+                    if copy_len > 0:
+                        labels_out[copy_start_in_full:copy_end_in_full] = sub_labels[copy_start_in_sub : copy_start_in_sub + copy_len]
+                        if return_max_probs:
+                            max_probs_out[copy_start_in_full:copy_end_in_full] = np.max(sub_probs[copy_start_in_sub : copy_start_in_sub + copy_len], axis=-1)
+                    
+                    if end == L:
+                        break
+                
+                byte_labels.append(labels_out)
+                final_probs_list.append(None)
+                final_max_probs_list.append(max_probs_out)
+            else:
+                # Standard single-pass accumulation for smaller arrays or when full probs are requested
+                p_acc = np.zeros((L, self.num_classes), dtype=np.float32)
+                w_acc = np.zeros((L,), dtype=np.float32)
+                
+                spans = self._build_window_spans(L, chunk_size)
+                win_refs = [(0, s, e, arr[s:e]) for s, e in spans]
+                _process_windows(win_refs, p_acc, w_acc)
+                
+                nonzero = w_acc > 0
+                if np.any(nonzero):
+                    p_acc[nonzero] /= w_acc[nonzero, None]
+                    p_acc[~nonzero] = 1.0 / self.num_classes
+                else:
+                    p_acc[:] = 1.0 / self.num_classes
+                
+                byte_labels.append(np.argmax(p_acc, axis=-1).astype(np.uint8))
+                final_max_probs_list.append(np.max(p_acc, axis=-1) if return_max_probs else None)
+                final_probs_list.append(p_acc if return_probs else None)
+
+        spans_by_text = [self._build_window_spans(int(arr.shape[0]), chunk_size) for arr in arrays]
+        return byte_labels, final_probs_list, final_max_probs_list, spans_by_text
+
+    def _segment_bytes(self, byte_arr: np.ndarray, chunk: int = None, return_max_probs: bool = False) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        byte_labels, byte_probs, max_probs, spans_by_text = self._segment_bytes_batch(
+            [byte_arr], 
+            chunk=chunk, 
+            return_probs=not return_max_probs, # If we want max_probs, we might be able to discard full probs
+            return_max_probs=return_max_probs
+        )
         self._last_window_spans = list(spans_by_text[0]) if spans_by_text else []
-        return byte_labels[0], byte_probs[0]
+        return byte_labels[0], byte_probs[0], max_probs[0]
 
     @staticmethod
     def _build_windows_info(text: str, spans: Sequence[Tuple[int, int]]) -> List[Dict[str, int]]:
@@ -1577,7 +1625,7 @@ class Predictor:
             _sanitize_model_bytes(np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8))
             for text in texts
         ]
-        byte_labels_by_text, byte_probs_by_text, spans_by_text = self._segment_bytes_batch(
+        byte_labels_by_text, byte_probs_by_text, max_probs_by_text, spans_by_text = self._segment_bytes_batch(
             byte_arrays,
             chunk=chunk,
         )
