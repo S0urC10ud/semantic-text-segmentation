@@ -1533,6 +1533,10 @@ class Predictor:
                 none_probs = [None for _ in byte_labels]
                 none_max_probs = [None for _ in byte_labels]
                 return byte_labels, none_probs, none_max_probs, spans_by_text
+            if not return_probs and return_max_probs:
+                byte_labels, max_probs_out, spans_by_text = self._fast_engine.segment_bytes_batch_labels_and_max_probs(byte_arrays)
+                none_probs = [None for _ in byte_labels]
+                return byte_labels, none_probs, max_probs_out, spans_by_text
 
             byte_labels, byte_probs, spans_by_text = self._fast_engine.segment_bytes_batch(byte_arrays)
             probs_out: List[Optional[np.ndarray]] = byte_probs if return_probs else [None for _ in byte_labels]

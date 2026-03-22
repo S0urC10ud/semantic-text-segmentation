@@ -246,6 +246,33 @@ class TestInferenceBackend(unittest.TestCase):
             for got, want in zip(fast_probs, legacy_probs):
                 np.testing.assert_allclose(got, want, atol=1e-5, rtol=1e-5)
 
+    def test_fast_max_probs_matches_legacy_for_over_chunk_inputs(self) -> None:
+        for arch in ("unet1d", "mamba"):
+            apply_fn, meta = _build_model_apply(arch, num_classes=4)
+            chunk_size = 64
+            arrays = [_ascii_bytes(97, offset=2), _ascii_bytes(129, offset=9)]
+            engine = self._make_engine(
+                apply_fn=apply_fn,
+                meta=meta,
+                num_classes=4,
+                chunk_size=chunk_size,
+                batch_size=3,
+                inference_backend="fast",
+                full_memory_budget_bytes=1,
+            )
+            fast_labels, fast_max_probs, _ = engine.segment_bytes_batch_labels_and_max_probs(arrays)
+            legacy_labels, legacy_probs, _ = _legacy_segment_bytes_batch(
+                apply_fn=apply_fn,
+                num_classes=4,
+                chunk_size=chunk_size,
+                batch_size=3,
+                byte_arrays=arrays,
+            )
+            for got, want in zip(fast_labels, legacy_labels):
+                np.testing.assert_array_equal(got, want)
+            for got, want in zip(fast_max_probs, legacy_probs):
+                np.testing.assert_allclose(got, np.max(want, axis=-1), atol=1e-5, rtol=1e-5)
+
     def test_full_path_pads_to_batch_local_max(self) -> None:
         def apply_fn(tok: jnp.ndarray) -> jnp.ndarray:
             tok_f = tok.astype(jnp.float32)
@@ -282,6 +309,25 @@ class TestInferenceBackend(unittest.TestCase):
         records = [record for record in engine.execution_history if record.mode == "segment_full"]
         self.assertEqual([record.actual_batch_size for record in records], [2, 1])
         self.assertEqual([record.padded_length for record in records], [12, 8])
+
+    def test_low_memory_cpu_buckets_short_stream_shapes_to_chunk_size(self) -> None:
+        def apply_fn(tok: jnp.ndarray) -> jnp.ndarray:
+            tok_f = tok.astype(jnp.float32)
+            return jnp.stack([tok_f, -tok_f, tok_f * 0.5], axis=-1)
+
+        engine = self._make_engine(
+            apply_fn=jax.jit(apply_fn, backend="cpu"),
+            meta={"arch": "unet1d", "model_dim": 8, "channels": (8,), "mamba_layers": 1, "mamba_d_state": 4, "mamba_expand": 1, "mamba_bidirectional": True},
+            num_classes=3,
+            chunk_size=64,
+            batch_size=1,
+            inference_backend="auto",
+            full_memory_budget_bytes=1,
+        )
+        engine.segment_bytes_batch([_ascii_bytes(13)])
+        records = [record for record in engine.execution_history if record.mode == "segment_stream"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].padded_length, 64)
 
     def test_build_window_spans_covers_tail_without_gaps(self) -> None:
         length = 97

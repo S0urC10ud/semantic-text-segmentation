@@ -211,10 +211,21 @@ class FastInferenceEngine:
         n = int(length)
         if n <= 0:
             return 0
-        if self.execution_platform != "gpu":
-            return n
-        bucket = 256
-        return int(((n + bucket - 1) // bucket) * bucket)
+        if self.execution_platform == "gpu":
+            bucket = 256
+            return int(((n + bucket - 1) // bucket) * bucket)
+        if (
+            self.execution_platform == "cpu"
+            and self.full_memory_budget_bytes <= 512 * 1024 * 1024
+        ):
+            # On very small RAM machines, many one-off file lengths can create
+            # a large CPU compile cache. Pad short sequences to the canonical
+            # window size and coarsely bucket longer ones to keep shapes stable.
+            if n <= self.chunk_size:
+                return int(self.chunk_size)
+            bucket = 256
+            return int(((n + bucket - 1) // bucket) * bucket)
+        return n
 
     def _is_mamba_arch(self) -> bool:
         return self.arch in {"mamba", "mamba1d", "bimamba", "ssm"}
@@ -413,6 +424,28 @@ class FastInferenceEngine:
         labels = jnp.argmax(logits, axis=-1).astype(jnp.uint8)
         return np.asarray(jax.device_get(labels), dtype=np.uint8)
 
+    def _apply_argmax_and_max_prob(
+        self,
+        arrays: Sequence[np.ndarray],
+        *,
+        path: str,
+        mode: str,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        tokens = self._prepare_tokens(arrays, path=path, mode=mode)
+        if tokens.size == 0:
+            return (
+                np.zeros((tokens.shape[0], tokens.shape[1]), dtype=np.uint8),
+                np.zeros((tokens.shape[0], tokens.shape[1]), dtype=np.float32),
+            )
+        logits = self.apply_tokens(jnp.asarray(tokens, dtype=jnp.int32))
+        labels = jnp.argmax(logits, axis=-1).astype(jnp.uint8)
+        max_logits = jnp.max(logits, axis=-1, keepdims=True)
+        shifted = logits - max_logits
+        denom = jnp.sum(jnp.exp(shifted), axis=-1)
+        max_probs = jnp.reciprocal(jnp.maximum(denom, 1e-9)).astype(jnp.float32)
+        labels_np, max_probs_np = jax.device_get((labels, max_probs))
+        return np.asarray(labels_np, dtype=np.uint8), np.asarray(max_probs_np, dtype=np.float32)
+
     def predict_logits(self, token_batch: np.ndarray) -> np.ndarray:
         arr = np.asarray(token_batch, dtype=np.int32)
         if arr.ndim == 1:
@@ -572,6 +605,68 @@ class FastInferenceEngine:
             idx += take
         return out_labels, out_spans
 
+    def segment_bytes_batch_labels_and_max_probs(
+        self,
+        byte_arrays: Sequence[np.ndarray],
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], List[List[Tuple[int, int]]]]:
+        arrays = [self.sanitize_bytes(np.asarray(arr, dtype=np.uint8)) for arr in byte_arrays]
+        out_labels: List[np.ndarray] = []
+        out_max_probs: List[np.ndarray] = []
+        out_spans: List[List[Tuple[int, int]]] = []
+        if not arrays:
+            return out_labels, out_max_probs, out_spans
+
+        idx = 0
+        while idx < len(arrays):
+            take, path = self._choose_text_batch(arrays, idx)
+            batch = arrays[idx:idx + take]
+            try:
+                if path == "fast_full":
+                    batch_labels, batch_max_probs, batch_spans = self._segment_full_batch_labels_and_max_probs(batch)
+                else:
+                    batch_labels, batch_max_probs, batch_spans = self._segment_stream_batch_labels_and_max_probs(batch)
+            except Exception as exc:
+                if path == "fast_full":
+                    trigger = "oom_or_size" if self._looks_like_oom(exc) else "runtime_error"
+                    reason = str(exc)
+                    if self.inference_backend == "auto":
+                        self._emit_auto_fallback(
+                            from_path="fast_full",
+                            to_path="fast_stream",
+                            trigger=trigger,
+                            reason=reason,
+                        )
+                        try:
+                            batch_labels, batch_max_probs, batch_spans = self._segment_stream_batch_labels_and_max_probs(batch)
+                        except Exception as stream_exc:
+                            final_trigger = "oom_or_size" if self._looks_like_oom(stream_exc) else "runtime_error"
+                            raise FastInferenceFailure(
+                                source_path="fast_stream",
+                                trigger=final_trigger,
+                                reason=str(stream_exc),
+                                cause=stream_exc,
+                            ) from stream_exc
+                    else:
+                        raise FastInferenceFailure(
+                            source_path="fast_full",
+                            trigger=trigger,
+                            reason=reason,
+                            cause=exc,
+                        ) from exc
+                else:
+                    trigger = "oom_or_size" if self._looks_like_oom(exc) else "runtime_error"
+                    raise FastInferenceFailure(
+                        source_path="fast_stream",
+                        trigger=trigger,
+                        reason=str(exc),
+                        cause=exc,
+                    ) from exc
+            out_labels.extend(batch_labels)
+            out_max_probs.extend(batch_max_probs)
+            out_spans.extend(batch_spans)
+            idx += take
+        return out_labels, out_max_probs, out_spans
+
     def _choose_text_batch(
         self,
         arrays: Sequence[np.ndarray],
@@ -638,6 +733,30 @@ class FastInferenceEngine:
             out_labels.append(np.asarray(labels_batch[row, :length], dtype=np.uint8) if length > 0 else np.zeros((0,), dtype=np.uint8))
             out_spans.append([(0, length)] if length > 0 else [])
         return out_labels, out_spans
+
+    def _segment_full_batch_labels_and_max_probs(
+        self,
+        arrays: Sequence[np.ndarray],
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], List[List[Tuple[int, int]]]]:
+        labels_batch, max_probs_batch = self._apply_argmax_and_max_prob(
+            arrays,
+            path="fast_full",
+            mode="segment_full_max_probs",
+        )
+        out_labels: List[np.ndarray] = []
+        out_max_probs: List[np.ndarray] = []
+        out_spans: List[List[Tuple[int, int]]] = []
+        for row, arr in enumerate(arrays):
+            length = int(arr.shape[0])
+            if length > 0:
+                out_labels.append(np.asarray(labels_batch[row, :length], dtype=np.uint8))
+                out_max_probs.append(np.asarray(max_probs_batch[row, :length], dtype=np.float32))
+                out_spans.append([(0, length)])
+            else:
+                out_labels.append(np.zeros((0,), dtype=np.uint8))
+                out_max_probs.append(np.zeros((0,), dtype=np.float32))
+                out_spans.append([])
+        return out_labels, out_max_probs, out_spans
 
     def _segment_stream_batch(
         self,
@@ -754,3 +873,74 @@ class FastInferenceEngine:
                 continue
             out_labels.append(np.argmax(vote_accum, axis=-1).astype(np.uint8))
         return out_labels, spans_by_text
+
+    def _segment_stream_batch_labels_and_max_probs(
+        self,
+        arrays: Sequence[np.ndarray],
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], List[List[Tuple[int, int]]]]:
+        probs_accum_list: List[np.ndarray] = [
+            np.zeros((int(arr.shape[0]), self.num_classes), dtype=np.float32)
+            for arr in arrays
+        ]
+        weight_accum_list: List[np.ndarray] = [
+            np.zeros((int(arr.shape[0]),), dtype=np.float32)
+            for arr in arrays
+        ]
+        spans_by_text: List[List[Tuple[int, int]]] = []
+        window_refs: List[Tuple[int, int, int, np.ndarray]] = []
+
+        for text_idx, arr in enumerate(arrays):
+            spans = build_window_spans(int(arr.shape[0]), self.chunk_size)
+            spans_by_text.append(spans)
+            for start, end in spans:
+                window_refs.append((text_idx, int(start), int(end), arr[start:end]))
+
+        if not window_refs:
+            empty_labels = [np.zeros((int(arr.shape[0]),), dtype=np.uint8) for arr in arrays]
+            empty_max_probs = [np.zeros((int(arr.shape[0]),), dtype=np.float32) for arr in arrays]
+            return empty_labels, empty_max_probs, spans_by_text
+
+        win_idx = 0
+        while win_idx < len(window_refs):
+            take = min(self.batch_size, len(window_refs) - win_idx)
+            while take > 1:
+                batch_lengths = [int(window_refs[win_idx + offset][3].shape[0]) for offset in range(take)]
+                if self._estimate_batch_bytes(batch_lengths) <= self.full_memory_budget_bytes:
+                    break
+                take = take - 1 if take <= 4 else max(1, take // 2)
+            batch_refs = window_refs[win_idx:win_idx + take]
+            batch_arrays = [ref[3] for ref in batch_refs]
+            probs_batch = self._apply_and_softmax(
+                batch_arrays,
+                path="fast_stream",
+                mode="segment_stream_max_probs",
+            )
+            for row, (text_idx, start, end, _) in enumerate(batch_refs):
+                plen = int(end) - int(start)
+                if plen <= 0:
+                    continue
+                weights = self._window_weights_cached(plen)
+                window_probs = np.asarray(probs_batch[row, :plen], dtype=np.float32)
+                probs_accum_list[text_idx][start:end] += window_probs * weights[:, None]
+                weight_accum_list[text_idx][start:end] += weights
+            win_idx += take
+
+        out_labels: List[np.ndarray] = []
+        out_max_probs: List[np.ndarray] = []
+        for probs_accum, weight_accum in zip(probs_accum_list, weight_accum_list):
+            if probs_accum.size == 0:
+                out_labels.append(np.zeros((0,), dtype=np.uint8))
+                out_max_probs.append(np.zeros((0,), dtype=np.float32))
+                continue
+            nonzero = weight_accum > 0
+            if np.any(nonzero):
+                probs_accum = probs_accum.copy()
+                probs_accum[nonzero] /= weight_accum[nonzero, None]
+                zero_mask = ~nonzero
+                if np.any(zero_mask):
+                    probs_accum[zero_mask] = 1.0 / self.num_classes
+            else:
+                probs_accum = np.full_like(probs_accum, 1.0 / self.num_classes, dtype=np.float32)
+            out_labels.append(np.argmax(probs_accum, axis=-1).astype(np.uint8))
+            out_max_probs.append(np.max(probs_accum, axis=-1).astype(np.float32))
+        return out_labels, out_max_probs, spans_by_text

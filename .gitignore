@@ -3,6 +3,7 @@
 # ----------------------------------------
 
 # Byte-compiled Python files
+**/.DS_Store
 __pycache__/
 downloader/mon_preprocessed_before_relabeling/*
 evaluation/reports/**

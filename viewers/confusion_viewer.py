@@ -810,7 +810,19 @@ def _collect_monitor_confusion(
         # Optimization: use return_max_probs=True to avoid full (L, 35) prob matrix if possible.
         # However, _segment_bytes currently returns (labels, probs, max_probs).
         # We pass use_threshold to return_max_probs.
-        pred_bytes, _, max_probs = predictor._segment_bytes(sanitized, return_max_probs=use_threshold)
+        if use_threshold:
+            pred_bytes, _, max_probs = predictor._segment_bytes(
+                sanitized,
+                return_max_probs=True,
+            )
+        else:
+            pred_batch, _, _, _ = predictor._segment_bytes_batch(
+                [sanitized],
+                return_probs=False,
+                return_max_probs=False,
+            )
+            pred_bytes = pred_batch[0]
+            max_probs = None
         
         preds_core = pred_bytes.astype(np.int32)
         preds_thresh = preds_core.copy()
