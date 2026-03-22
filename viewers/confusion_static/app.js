@@ -3,6 +3,7 @@ let LABELS = [];
 let ACTIVE_DATASET = null;
 let DATASET_OPTIONS = [];
 let tooltip = null;
+let exampleRequestController = null;
 const DEFAULT_CELL_WIDTH = 34;
 const MIN_CELL_WIDTH = 22;
 const TRUE_AXIS_WIDTH = 70;
@@ -44,6 +45,10 @@ function setMatrixLoading(message = 'Loading confusion matrix…'){
 }
 
 function resetSampleView(){
+  if (exampleRequestController){
+    exampleRequestController.abort();
+    exampleRequestController = null;
+  }
   const meta = el('#cellMeta');
   if (meta){
     meta.textContent = 'Select any cell to view examples.';
@@ -160,17 +165,25 @@ function renderMatrix(data){
     for (let col = 0; col < n; col++){
       const pct = data.row_normalized[row][col] || 0;
       const count = data.matrix[row][col] || 0;
+      const pool = Number(data.cell_examples?.[`${row}_${col}`] || 0);
+      const hasExample = pool > 0;
       const cell = document.createElement('div');
       cell.className = 'cell';
       cell.dataset.row = row;
       cell.dataset.col = col;
+      cell.dataset.pool = String(pool);
       cell.innerHTML = `<div class="count">${count}×</div>
         <div class="pct">${(pct * 100).toFixed(1)}%</div>`;
       const logComponent = Math.min(1, Math.log10(pct * 9 + 1));
       const intensity = count > 0 ? logComponent : 0;
       cell.style.background = `rgba(11,94,215,${intensity * 0.7})`;
-      cell.title = `${data.labels[row].name} → ${data.labels[col].name}: ${(pct * 100).toFixed(2)}% (${count})`;
-      cell.addEventListener('click', () => loadExample(row, col));
+      if (hasExample){
+        cell.title = `${data.labels[row].name} → ${data.labels[col].name}: ${(pct * 100).toFixed(2)}% (${count}, pool ${pool})`;
+        cell.addEventListener('click', () => loadExample(row, col));
+      }else{
+        cell.classList.add('empty');
+        cell.title = `${data.labels[row].name} → ${data.labels[col].name}: no cached example`;
+      }
       matrixEl.appendChild(cell);
     }
   }
@@ -196,6 +209,11 @@ function shortLabel(name){
 async function loadExample(trueId, predId){
   const meta = el('#cellMeta');
   meta.textContent = 'Loading example…';
+  if (exampleRequestController){
+    exampleRequestController.abort();
+  }
+  const controller = new AbortController();
+  exampleRequestController = controller;
   setSampleLoading(true);
   try{
     const params = new URLSearchParams({
@@ -207,7 +225,8 @@ async function loadExample(trueId, predId){
       params.set('dataset', ACTIVE_DATASET);
     }
     const res = await fetch(`/api/example?${params.toString()}`, {
-      cache: 'no-store'
+      cache: 'no-store',
+      signal: controller.signal
     });
     if (!res.ok){
       const err = await res.json().catch(()=>({}));
@@ -216,9 +235,19 @@ async function loadExample(trueId, predId){
     const data = await res.json();
     updateSample(data);
   }catch(err){
+    if (err.name === 'AbortError'){
+      return;
+    }
+    if (err.message === 'No cached examples for this cell.'){
+      meta.textContent = 'No cached example for this cell. Pick a highlighted cell to inspect.';
+      return;
+    }
     meta.textContent = `Error: ${err.message}`;
   }finally{
-    setSampleLoading(false);
+    if (exampleRequestController === controller){
+      exampleRequestController = null;
+      setSampleLoading(false);
+    }
   }
 }
 

@@ -17,6 +17,7 @@ import json
 import random
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -716,6 +717,28 @@ def _build_monitor_true_labels(byte_len: int, seg_slice: Iterable[Any]) -> np.nd
     return labels
 
 
+def _load_monitor_file_arrays(
+    file_idx: int,
+    monitor_data: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    files = monitor_data["files"]
+    if file_idx < 0 or file_idx >= len(files):
+        raise IndexError(f"Monitor file index {file_idx} out of range")
+    row = files[file_idx]
+    byte_len = int(row["byte_len"])
+    if byte_len <= 0:
+        raise ValueError("Monitor file has no bytes to render.")
+    byte_start = int(row["byte_start"])
+    contents = monitor_data["contents"]
+    raw = np.asarray(contents[byte_start : byte_start + byte_len], dtype=np.uint8)
+    sanitized = _sanitize_model_bytes(raw)
+    seg_start = int(row["seg_start"])
+    seg_count = int(row["seg_count"])
+    seg_slice = monitor_data["segments"][seg_start : seg_start + seg_count]
+    true_labels = _build_monitor_true_labels(len(sanitized), seg_slice)
+    return sanitized, true_labels, _monitor_row_meta(row, file_idx)
+
+
 def _maybe_collect_monitor_example(
     *,
     file_idx: int,
@@ -763,8 +786,6 @@ def _collect_monitor_confusion(
     monitor_limit: int = 0,
 ) -> Tuple[np.ndarray, Dict[Tuple[int, int], List[int]], List[MonitorExamplePointer], Dict[str, Any]]:
     files = monitor_data["files"]
-    segments = monitor_data["segments"]
-    contents = monitor_data["contents"]
     total_available = len(files)
     limit = total_available if monitor_limit <= 0 else min(total_available, int(monitor_limit))
     conf_mat = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -785,21 +806,17 @@ def _collect_monitor_confusion(
         
         if (file_idx + 1) % 50 == 0 or file_idx == 0 or file_idx == limit - 1:
             print(f"   ⌛ Processing monitor file {file_idx + 1}/{limit} ({byte_len} bytes)...", flush=True)
-        byte_start = int(row["byte_start"])
-        raw = np.asarray(contents[byte_start : byte_start + byte_len], dtype=np.uint8)
-        sanitized = _sanitize_model_bytes(raw)
-        seg_start = int(row["seg_start"])
-        seg_count = int(row["seg_count"])
-        seg_slice = segments[seg_start : seg_start + seg_count]
-        true_labels = _build_monitor_true_labels(len(sanitized), seg_slice)
+        sanitized, true_labels, row_meta = _load_monitor_file_arrays(file_idx, monitor_data)
         # Optimization: use return_max_probs=True to avoid full (L, 35) prob matrix if possible.
         # However, _segment_bytes currently returns (labels, probs, max_probs).
         # We pass use_threshold to return_max_probs.
-        pred_bytes, probs, max_probs = predictor._segment_bytes(sanitized, return_max_probs=use_threshold)
+        pred_bytes, _, max_probs = predictor._segment_bytes(sanitized, return_max_probs=use_threshold)
         
         preds_core = pred_bytes.astype(np.int32)
         preds_thresh = preds_core.copy()
         if use_threshold:
+            if max_probs is None:
+                raise RuntimeError("Monitor confusion inference did not return max probabilities.")
             # probs is None if return_max_probs was used to save memory in _segment_bytes
             # max_probs is already calculated.
             preds_thresh[max_probs < float(other_threshold)] = int(other_id)
@@ -826,7 +843,6 @@ def _collect_monitor_confusion(
         # Use the same thresholded labels when bucketing examples.
         indices = np.nonzero(effective_mask)[0]
         if indices.size > 0:
-            row_meta = _monitor_row_meta(row, file_idx)
             run_start = int(indices[0])
             run_end = run_start
             run_true = int(true_labels[run_start])
@@ -883,43 +899,6 @@ def _collect_monitor_confusion(
     return conf_mat, cell_examples, pointers, meta
 
 
-def _ensure_monitor_prediction(
-    file_idx: int,
-    monitor_data: Dict[str, Any],
-    predictor: Predictor,
-) -> Dict[str, Any]:
-    global _MONITOR_PRED_CACHE
-    cache = _MONITOR_PRED_CACHE
-    if cache.get("file_idx") == file_idx:
-        return cache
-    files = monitor_data["files"]
-    if file_idx < 0 or file_idx >= len(files):
-        raise IndexError(f"Monitor file index {file_idx} out of range")
-    row = files[file_idx]
-    byte_len = int(row["byte_len"])
-    if byte_len <= 0:
-        raise ValueError("Monitor file has no bytes to render.")
-    byte_start = int(row["byte_start"])
-    contents = monitor_data["contents"]
-    raw = np.asarray(contents[byte_start : byte_start + byte_len], dtype=np.uint8)
-    sanitized = _sanitize_model_bytes(raw)
-    seg_start = int(row["seg_start"])
-    seg_count = int(row["seg_count"])
-    seg_slice = monitor_data["segments"][seg_start : seg_start + seg_count]
-    true_labels = _build_monitor_true_labels(len(sanitized), seg_slice)
-    pred_bytes, probs = predictor._segment_bytes(sanitized)
-    cache = {
-        "file_idx": file_idx,
-        "tokens": sanitized,
-        "true": true_labels,
-        "pred": pred_bytes.astype(np.int32),
-        "probs": np.asarray(probs, dtype=np.float32),
-        "row_meta": _monitor_row_meta(row, file_idx),
-    }
-    _MONITOR_PRED_CACHE = cache
-    return cache
-
-
 def _build_monitor_sample_payload(
     pointer: MonitorExamplePointer,
     true_id: int,
@@ -931,19 +910,28 @@ def _build_monitor_sample_payload(
     id2color: Dict[int, str],
     colors_arg: Optional[str],
 ) -> Dict[str, Any]:
-    cache = _ensure_monitor_prediction(pointer.file_idx, monitor_data, predictor)
-    tokens = cache["tokens"]
-    truth = cache["true"]
-    preds = cache["pred"]
-    probs = cache["probs"]
+    tokens, truth, row_meta = _load_monitor_file_arrays(pointer.file_idx, monitor_data)
     start = max(0, min(len(tokens), int(pointer.byte_start)))
     end = max(start, min(len(tokens), int(pointer.byte_end)))
     if end <= start:
         end = min(len(tokens), start + predictor.chunk)
-    snippet_tokens = tokens[start:end]
-    snippet_truth = truth[start:end]
-    snippet_preds = preds[start:end]
-    snippet_probs = probs[start:end]
+    # Render examples from a bounded local slice instead of re-running the
+    # entire monitor file. This keeps click-time memory use predictable even
+    # when the source file is much larger than the viewer window.
+    context = max(0, int(predictor.chunk) // 2)
+    infer_start = max(0, start - context)
+    infer_end = min(len(tokens), end + context)
+    infer_tokens = tokens[infer_start:infer_end]
+    infer_truth = truth[infer_start:infer_end]
+    infer_preds, infer_probs, _ = predictor._segment_bytes(infer_tokens)
+    if infer_probs is None:
+        raise RuntimeError("Monitor example inference did not return per-byte probabilities.")
+    local_start = start - infer_start
+    local_end = local_start + (end - start)
+    snippet_tokens = infer_tokens[local_start:local_end]
+    snippet_truth = infer_truth[local_start:local_end]
+    snippet_preds = infer_preds[local_start:local_end]
+    snippet_probs = np.asarray(infer_probs[local_start:local_end], dtype=np.float32)
     text = _normalize_input_text(_tokens_to_text(snippet_tokens))
     pred_char_labels, char_probs = predictor._byte_labels_to_char_labels(text, snippet_preds, snippet_probs)
     true_char_labels, _ = predictor._byte_labels_to_char_labels(text, snippet_truth, None)
@@ -991,7 +979,7 @@ def _build_monitor_sample_payload(
         }
         for label_id in palette_ids
     ]
-    merged_meta = dict(cache.get("row_meta", {}))
+    merged_meta = dict(row_meta)
     merged_meta.update(pointer.meta or {})
     merged_meta["slice"] = f"{start}-{end}"
     return {
@@ -1323,7 +1311,7 @@ DATASET_LABELS = {
 DATASET_STATES: Dict[str, Dict[str, Any]] = {}
 DEFAULT_DATASET: str = "val"
 MONITOR_DATA: Optional[Dict[str, Any]] = None
-_MONITOR_PRED_CACHE: Dict[str, Any] = {}
+_EXAMPLE_RENDER_LOCK = threading.Lock()
 
 load_error: Optional[str] = None
 predictor: Optional[Predictor] = None
@@ -1469,7 +1457,6 @@ if load_error is None and predictor is not None:
 
                 try:
                     MONITOR_DATA = load_monitor_memmaps(monitor_root)
-                    _MONITOR_PRED_CACHE.clear()
                     monitor_conf, monitor_examples, monitor_pointers, monitor_meta = _collect_monitor_confusion(
                         predictor=predictor,
                         monitor_data=MONITOR_DATA,
@@ -1515,7 +1502,6 @@ if load_error is None and predictor is not None:
                     )
                 except Exception as exc:
                     MONITOR_DATA = None
-                    _MONITOR_PRED_CACHE.clear()
                     print(f"⚠️  Failed to build monitor confusion: {exc}", flush=True)
             else:
                 print(f"⚠️  Monitor root not found at {monitor_root}, skipping monitor dataset.", flush=True)
@@ -1603,34 +1589,35 @@ def api_example(true_id: int, pred_id: int, dataset: Optional[str] = None):
     ids = cell_examples.get(key)
     if not ids:
         raise HTTPException(status_code=404, detail="No cached examples for this cell.")
-    sample_id = random.choice(ids)
-    sample = samples[sample_id]
-    color_map = state.get("colors") or ID2COLOR
-    if state.get("sample_type") == "monitor":
-        if MONITOR_DATA is None:
-            raise HTTPException(status_code=503, detail="Monitor dataset not loaded.")
-        payload = _build_monitor_sample_payload(
-            pointer=sample,
-            true_id=true_id,
-            pred_id=pred_id,
-            predictor=predictor,
-            monitor_data=MONITOR_DATA,
-            id2name=ID2NAME,
-            id2canon=ID2CANONICAL,
-            id2color=color_map,
-            colors_arg=args.colors,
-        )
-    else:
-        payload = _build_sample_payload(
-            sample=sample,
-            true_id=true_id,
-            pred_id=pred_id,
-            predictor=predictor,
-            id2name=ID2NAME,
-            id2canon=ID2CANONICAL,
-            id2color=color_map,
-            colors_arg=args.colors,
-        )
+    with _EXAMPLE_RENDER_LOCK:
+        sample_id = random.choice(ids)
+        sample = samples[sample_id]
+        color_map = state.get("colors") or ID2COLOR
+        if state.get("sample_type") == "monitor":
+            if MONITOR_DATA is None:
+                raise HTTPException(status_code=503, detail="Monitor dataset not loaded.")
+            payload = _build_monitor_sample_payload(
+                pointer=sample,
+                true_id=true_id,
+                pred_id=pred_id,
+                predictor=predictor,
+                monitor_data=MONITOR_DATA,
+                id2name=ID2NAME,
+                id2canon=ID2CANONICAL,
+                id2color=color_map,
+                colors_arg=args.colors,
+            )
+        else:
+            payload = _build_sample_payload(
+                sample=sample,
+                true_id=true_id,
+                pred_id=pred_id,
+                predictor=predictor,
+                id2name=ID2NAME,
+                id2canon=ID2CANONICAL,
+                id2color=color_map,
+                colors_arg=args.colors,
+            )
     payload.update(
         {
             "dataset": {"id": dataset_id, "name": DATASET_LABELS.get(dataset_id, dataset_id.title())},

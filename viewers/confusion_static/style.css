@@ -148,10 +148,22 @@ body{
   transition:background .15s ease, transform .15s ease;
   border:1px solid rgba(0,0,0,.04);
 }
+.matrix .cell.empty{
+  cursor:default;
+}
 .matrix .cell:hover{
   transform:translateY(-1px);
   box-shadow:0 5px 18px rgba(15,23,42,.12);
   z-index:2;
+}
+.matrix .cell.empty:hover{
+  transform:none;
+  box-shadow:none;
+  z-index:auto;
+}
+.matrix .cell.empty .count,
+.matrix .cell.empty .pct{
+  opacity:0.45;
 }
 .matrix .cell .pct{
   font-size:calc(var(--cell-size)*0.22);
