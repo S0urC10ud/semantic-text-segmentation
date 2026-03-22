@@ -433,7 +433,7 @@ class MonitorErrorStore:
             np.asarray(arr[arr != cfg.PAD_BYTE_ID], dtype=np.uint8)
             for arr in token_windows
         ]
-        pred_by_text, prob_by_text, _ = self.predictor._segment_bytes_batch(byte_arrays)
+        pred_by_text, prob_by_text, _, _ = self.predictor._segment_bytes_batch(byte_arrays)
         out_labels: List[np.ndarray] = []
         out_probs: List[np.ndarray] = []
         other_idx = int(getattr(cfg, "OTHER_CLASS_INDEX", cfg.NUM_CLASSES))
@@ -735,6 +735,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-label-limit", type=int, default=128, help="Max windows to index per focal label.")
     parser.add_argument("--min-label-bytes", type=int, default=64, help="Minimum bytes of the focal label within a file to index it.")
     parser.add_argument("--inference-batch-size", type=int, default=16, help="Batch size for model window inference.")
+    parser.add_argument(
+        "--inference-backend",
+        type=str,
+        default="auto",
+        choices=("auto", "fast", "legacy"),
+        help="Inference backend for viewer predictions. 'auto' prefers the shared fast backend.",
+    )
     parser.add_argument("--model-dim", type=int, default=None)
     parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float32", "float16"])
     parser.add_argument("--host", type=str, default="127.0.0.1")
@@ -770,6 +777,8 @@ def _resolve_predictor(args: argparse.Namespace) -> Predictor:
         chunk=int(args.chunk),
         other_threshold=float(args.other_threshold),
         inference_batch_size=int(args.inference_batch_size),
+        device=args.device,
+        inference_backend=args.inference_backend,
     )
     return predictor
 

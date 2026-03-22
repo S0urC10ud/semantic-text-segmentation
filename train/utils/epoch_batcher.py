@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import datasets as hfds
 import numpy as np
 import utils.config as cfg
+from utils.full_sequence import build_monitor_file_sequence, pack_sequence_pieces
 from utils.window_generator import (
     _choose_window_mode,
     _make_markdown_window_impl,
@@ -600,6 +601,8 @@ class MonitorFineTuneBatcher:
         active_learning_limit: Optional[int] = None,
         dense_bias_label: str = "",
         dense_bias_prob: float = 0.0,
+        full_files: bool = False,
+        full_file_max_bytes: int = 10000,
     ):
         import multiprocessing as mp
         import sys
@@ -614,6 +617,8 @@ class MonitorFineTuneBatcher:
 
         self.cfg = data_cfg
         self.augment = bool(augment)
+        self.full_files = bool(full_files)
+        self.full_file_max_bytes = max(1, int(full_file_max_bytes))
         self.dense_bias_label = str(dense_bias_label or "").strip().lower()
         self.dense_bias_prob = float(max(0.0, min(1.0, dense_bias_prob)))
         self.dense_bias_type_id: Optional[int] = None
@@ -677,6 +682,8 @@ class MonitorFineTuneBatcher:
                     None if active_learning_limit is None else int(active_learning_limit),
                     self.dense_bias_type_id,
                     self.dense_bias_prob,
+                    self.full_files,
+                    self.full_file_max_bytes,
                 ),
                 daemon=True,
             )
@@ -821,6 +828,103 @@ class MonitorFineTuneBatcher:
             np.random.set_state(np_state)
 
     @staticmethod
+    def _build_full_sequence(
+        rng: np.random.Generator,
+        target_len: int,
+        files,
+        contents,
+        segments,
+        total_files,
+        *,
+        preferred_file_indices: Optional[np.ndarray] = None,
+        preferred_prob: float = 0.0,
+    ):
+        if total_files <= 0:
+            return None
+        file_idx = _sample_monitor_file_index(
+            rng,
+            total_files,
+            preferred_file_indices=preferred_file_indices,
+            preferred_prob=preferred_prob,
+        )
+        x, y, _ = build_monitor_file_sequence(
+            files,
+            contents,
+            segments,
+            int(file_idx),
+            target_len=int(target_len),
+            pad_byte_id=int(cfg.PAD_BYTE_ID),
+            pad_label_id=int(cfg.PAD_ID),
+            rng=rng,
+            random_crop=True,
+        )
+        return x, y
+
+    @staticmethod
+    def _build_augmented_full_sequence(
+        rng: np.random.Generator,
+        target_len: int,
+        files,
+        contents,
+        segments,
+        total_files: int,
+        fragment_dsets: Dict[int, hfds.Dataset],
+        data_cfg: "DataConfig",
+        *,
+        preferred_file_indices: Optional[np.ndarray] = None,
+        preferred_prob: float = 0.0,
+    ):
+        pieces: List[tuple[np.ndarray, np.ndarray]] = []
+        built = 0
+        component_len = max(1, min(int(cfg.MODEL_WINDOW_BYTES), int(target_len)))
+        attempts = 0
+        max_attempts = max(4, (int(target_len) // max(1, component_len)) * 8)
+        while built < int(target_len) and attempts < max_attempts:
+            attempts += 1
+            forced_mode = str(_choose_window_mode(data_cfg)).strip().lower()
+            if forced_mode == "pure":
+                piece = MonitorFineTuneBatcher._build_full_sequence(
+                    rng,
+                    component_len,
+                    files,
+                    contents,
+                    segments,
+                    total_files,
+                    preferred_file_indices=preferred_file_indices,
+                    preferred_prob=preferred_prob,
+                )
+            else:
+                piece = MonitorFineTuneBatcher._build_augmented_window(
+                    rng,
+                    component_len,
+                    files,
+                    contents,
+                    segments,
+                    total_files,
+                    fragment_dsets,
+                    data_cfg,
+                    forced_mode=forced_mode,
+                    preferred_file_indices=preferred_file_indices,
+                    preferred_prob=preferred_prob,
+                )
+            if piece is None:
+                continue
+            pieces.append(piece)
+            built += int(np.count_nonzero((np.asarray(piece[0]) >= 0) & (np.asarray(piece[0]) < cfg.BYTE_VOCAB_SIZE)))
+            if len(pieces) > 1:
+                built += 2
+        if not pieces:
+            return None
+        x, y, _ = pack_sequence_pieces(
+            pieces,
+            target_len=int(target_len),
+            pad_byte_id=int(cfg.PAD_BYTE_ID),
+            pad_label_id=int(cfg.PAD_ID),
+            separator_label_id=int(cfg.PAD_ID),
+        )
+        return x, y
+
+    @staticmethod
     def _worker_entry(
         cfg_obj,
         wid,
@@ -833,6 +937,8 @@ class MonitorFineTuneBatcher:
         active_learning_limit,
         dense_bias_type_id,
         dense_bias_prob,
+        full_files,
+        full_file_max_bytes,
     ):
         import sys
         repo_root = str(Path(__file__).resolve().parents[2])
@@ -869,10 +975,12 @@ class MonitorFineTuneBatcher:
                 preferred_file_indices = matches.astype(np.int64, copy=False)
 
         rng = np.random.default_rng(cfg_obj.seed ^ wid ^ int(time.time()))
-        buckets = cfg_obj.buckets() if augment else [int(cfg_obj.window_max_bytes)]
+        full_files = bool(full_files)
+        target_sequence_len = max(1, int(full_file_max_bytes)) if full_files else int(cfg_obj.window_max_bytes)
+        buckets = cfg_obj.buckets() if augment and not full_files else [target_sequence_len]
         buckets = [int(b) for b in buckets if int(b) > 0]
         if not buckets:
-            buckets = [cfg.MODEL_WINDOW_BYTES]
+            buckets = [target_sequence_len]
         hold = max(1, int(getattr(cfg_obj, "bucket_hold_steps", 1))) if augment else 1
         window_len = int(buckets[0])
         step_idx = 0
@@ -895,7 +1003,31 @@ class MonitorFineTuneBatcher:
 
             filled = 0
             while filled < cfg_obj.batch_size and not stop_flag.is_set():
-                if augment:
+                if full_files and augment:
+                    window = MonitorFineTuneBatcher._build_augmented_full_sequence(
+                        rng,
+                        window_len,
+                        files,
+                        contents,
+                        segments,
+                        total_files,
+                        fragment_dsets,
+                        cfg_obj,
+                        preferred_file_indices=preferred_file_indices,
+                        preferred_prob=bias_prob,
+                    )
+                elif full_files:
+                    window = MonitorFineTuneBatcher._build_full_sequence(
+                        rng,
+                        window_len,
+                        files,
+                        contents,
+                        segments,
+                        total_files,
+                        preferred_file_indices=preferred_file_indices,
+                        preferred_prob=bias_prob,
+                    )
+                elif augment:
                     window = MonitorFineTuneBatcher._build_augmented_window(
                         rng,
                         window_len,

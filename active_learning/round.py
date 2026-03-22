@@ -13,6 +13,11 @@ from typing import Dict, Iterable, List, Optional, Sequence
 import numpy as np
 from datasets import load_from_disk  # type: ignore
 
+try:
+    from tqdm.auto import tqdm as _tqdm  # type: ignore
+except Exception:
+    _tqdm = None
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRAIN_ROOT = REPO_ROOT / "train"
 if str(TRAIN_ROOT) not in sys.path:
@@ -20,6 +25,7 @@ if str(TRAIN_ROOT) not in sys.path:
 
 import utils.config as cfg  # noqa: E402
 from utils.data import prepare_dsets_by_lang_with_splits  # noqa: E402
+from utils.full_sequence import make_training_full_sequence_with_metadata  # noqa: E402
 from utils.window_generator import make_training_window_with_metadata  # noqa: E402
 from viewers.core import (  # noqa: E402
     DEFAULT_CHANNELS,
@@ -34,6 +40,7 @@ from viewers.core import (  # noqa: E402
 from .acquisition import CandidateSpan, select_candidate_spans
 from .label_store import LabelStore, StoredInferenceSample, StoredRefinement
 from .oracle import BoundarySnippet, GeminiBoundaryOracle, StubOracle
+from .sample_prefetch import FullSequenceSamplePrefetcher
 
 
 def _now_utc() -> str:
@@ -47,6 +54,11 @@ def _hash_text(text: str) -> str:
 def _make_snippet_id(sample_hash: str, start: int, end: int, boundary: int) -> str:
     raw = f"{sample_hash}:{int(start)}:{int(end)}:{int(boundary)}"
     # Keep snippet IDs compact for oracle prompts/logs to reduce token usage.
+    return hashlib.blake2s(raw.encode("utf-8", "ignore"), digest_size=5).hexdigest()
+
+
+def _make_sample_prompt_id(sample_hash: str) -> str:
+    raw = f"{sample_hash}:full"
     return hashlib.blake2s(raw.encode("utf-8", "ignore"), digest_size=5).hexdigest()
 
 
@@ -294,6 +306,83 @@ def _summarize_window_metadata(
     }
 
 
+def _collect_full_sequence_source_langs(metadata: Optional[Dict[str, object]]) -> List[str]:
+    if not isinstance(metadata, dict):
+        return []
+    out: List[str] = []
+    for component in metadata.get("components") or []:
+        langs = _collect_window_source_langs(component if isinstance(component, dict) else None)
+        for lang in langs:
+            if lang and lang not in out:
+                out.append(lang)
+    return out
+
+
+def _resolve_full_sequence_source_lang(metadata: Optional[Dict[str, object]]) -> str:
+    if not isinstance(metadata, dict):
+        return "unknown"
+    counts: Dict[str, int] = {}
+    order: List[str] = []
+    for component in metadata.get("components") or []:
+        lang = _resolve_window_source_lang(component if isinstance(component, dict) else None)
+        if not lang or lang == "unknown":
+            continue
+        counts[lang] = counts.get(lang, 0) + 1
+        if lang not in order:
+            order.append(lang)
+    if not counts:
+        return "unknown"
+    return sorted(order, key=lambda item: (-counts.get(item, 0), order.index(item)))[0]
+
+
+def _summarize_full_sequence_metadata(
+    metadata: Optional[Dict[str, object]],
+    *,
+    window_seed: int,
+) -> Dict[str, object]:
+    if not isinstance(metadata, dict):
+        return {
+            "sampling_mode": "training_full_sequence",
+            "window_seed": int(window_seed),
+            "component_count": 0,
+            "source_langs": [],
+            "target_bytes": int(cfg.MODEL_WINDOW_BYTES),
+        }
+    return {
+        "sampling_mode": "training_full_sequence",
+        "window_seed": int(window_seed),
+        "component_count": int(metadata.get("component_count", 0) or 0),
+        "component_window_bytes": int(metadata.get("component_window_bytes", cfg.MODEL_WINDOW_BYTES) or cfg.MODEL_WINDOW_BYTES),
+        "target_bytes": int(metadata.get("target_bytes", cfg.MODEL_WINDOW_BYTES) or cfg.MODEL_WINDOW_BYTES),
+        "source_langs": _collect_full_sequence_source_langs(metadata),
+    }
+
+
+def _maybe_make_progress_bar(*, total: int, desc: str):
+    if _tqdm is None or total <= 0:
+        return None
+    return _tqdm(
+        total=int(total),
+        desc=str(desc),
+        unit="sample",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+
+def _update_progress_bar(progress_bar, *, attempts: int, skipped_seen: int, skipped_empty: int) -> None:
+    if progress_bar is None:
+        return
+    progress_bar.set_postfix(
+        {
+            "attempts": int(attempts),
+            "dup": int(skipped_seen),
+            "empty": int(skipped_empty),
+        },
+        refresh=False,
+    )
+
+
 def _iter_raw_split_examples(
     data_root: Path,
     split: str,
@@ -387,41 +476,237 @@ def _iter_augmented_split_examples(
     skipped_empty = 0
     attempts = 0
     max_attempts = max(total_target * 5, total_target + 16)
+    progress_bar = _maybe_make_progress_bar(
+        total=total_target,
+        desc=f"Acquire {split} augmented samples",
+    )
+    try:
+        while selected < total_target and attempts < max_attempts:
+            attempts += 1
+            if attempts == 1 or attempts % 16 == 0:
+                _update_progress_bar(
+                    progress_bar,
+                    attempts=attempts,
+                    skipped_seen=skipped_seen,
+                    skipped_empty=skipped_empty,
+                )
+            window_seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+            py_state = random.getstate()
+            np_state = np.random.get_state()
+            try:
+                random.seed(window_seed)
+                np.random.seed(window_seed)
+                target_len = int(random.choice(buckets))
+                tokens, _, window_meta = make_training_window_with_metadata(
+                    dsets_by_lang,
+                    target_len,
+                    data_cfg,
+                )
+            finally:
+                random.setstate(py_state)
+                np.random.set_state(np_state)
 
-    while selected < total_target and attempts < max_attempts:
-        attempts += 1
-        window_seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
-        py_state = random.getstate()
-        np_state = np.random.get_state()
-        try:
-            random.seed(window_seed)
-            np.random.seed(window_seed)
-            target_len = int(random.choice(buckets))
-            tokens, _, window_meta = make_training_window_with_metadata(
-                dsets_by_lang,
-                target_len,
-                data_cfg,
-            )
-        finally:
-            random.setstate(py_state)
-            np.random.set_state(np_state)
-
-        normalized = _window_tokens_to_normalized_text(tokens)
-        if not normalized:
-            skipped_empty += 1
-            continue
-        sample_hash = _hash_text(normalized)
-        if sample_hash in seen:
-            skipped_seen += 1
-            continue
-        seen.add(sample_hash)
-        representative_lang = _resolve_window_source_lang(window_meta)
-        sample_meta = _summarize_window_metadata(window_meta, window_seed=window_seed)
-        yield representative_lang, selected, normalized, sample_hash, sample_meta
-        selected += 1
+            normalized = _window_tokens_to_normalized_text(tokens)
+            if not normalized:
+                skipped_empty += 1
+                continue
+            sample_hash = _hash_text(normalized)
+            if sample_hash in seen:
+                skipped_seen += 1
+                continue
+            seen.add(sample_hash)
+            sample_index = selected
+            selected += 1
+            if progress_bar is not None:
+                progress_bar.update(1)
+                _update_progress_bar(
+                    progress_bar,
+                    attempts=attempts,
+                    skipped_seen=skipped_seen,
+                    skipped_empty=skipped_empty,
+                )
+            representative_lang = _resolve_window_source_lang(window_meta)
+            sample_meta = _summarize_window_metadata(window_meta, window_seed=window_seed)
+            yield representative_lang, sample_index, normalized, sample_hash, sample_meta
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
 
     print(
         "Augmented AL sampling: "
+        f"selected={selected}/{total_target}, "
+        f"skipped_seen_hash={skipped_seen}, "
+        f"skipped_empty={skipped_empty}, "
+        f"attempts={attempts}, "
+        f"available_langs={len(dsets_by_lang)}.",
+        flush=True,
+    )
+
+
+def _iter_augmented_full_split_examples(
+    data_root: Path,
+    split: str,
+    langs: Sequence[str],
+    max_samples_per_lang: int,
+    *,
+    rng: np.random.Generator,
+    full_file_max_bytes: int,
+    sample_workers: int = 1,
+    sample_prefetch: int = 0,
+    sample_seed: Optional[int] = None,
+    seen_hashes: Optional[set[str]] = None,
+) -> Iterable[tuple[str, int, str, str, Dict[str, object]]]:
+    seen = seen_hashes if seen_hashes is not None else set()
+    target_per_lang = max(0, int(max_samples_per_lang))
+    if target_per_lang <= 0:
+        return
+
+    dsets = prepare_dsets_by_lang_with_splits(
+        str(data_root),
+        include_languages=list(langs),
+        verbose=False,
+    )
+    dsets_by_lang = dsets.get(split) or {}
+    if not dsets_by_lang:
+        print(
+            f"No datasets available for full-file AL sampling on split='{split}'; "
+            "falling back to raw dataset rows.",
+            flush=True,
+        )
+        yield from _iter_raw_split_examples(
+            data_root,
+            split,
+            langs,
+            max_samples_per_lang,
+            rng=rng,
+            seen_hashes=seen,
+        )
+        return
+
+    data_cfg = cfg.DataConfig(data_root=str(data_root))
+    total_target = target_per_lang * max(1, len(dsets_by_lang))
+    selected = 0
+    skipped_seen = 0
+    skipped_empty = 0
+    attempts = 0
+    max_attempts = max(total_target * 5, total_target + 16)
+    progress_bar = _maybe_make_progress_bar(
+        total=total_target,
+        desc=f"Acquire {split} full-file samples",
+    )
+    try:
+        worker_count = max(1, int(sample_workers))
+        if worker_count > 1:
+            prefetch_size = int(sample_prefetch) if int(sample_prefetch) > 0 else max(16, worker_count * 8)
+            prefetcher = FullSequenceSamplePrefetcher(
+                data_root=str(data_root),
+                split=str(split),
+                langs=list(langs),
+                target_len=int(full_file_max_bytes),
+                num_workers=worker_count,
+                prefetch=prefetch_size,
+                base_seed=sample_seed,
+            )
+            try:
+                while selected < total_target and attempts < max_attempts:
+                    attempts += 1
+                    if attempts == 1 or attempts % 16 == 0:
+                        _update_progress_bar(
+                            progress_bar,
+                            attempts=attempts,
+                            skipped_seen=skipped_seen,
+                            skipped_empty=skipped_empty,
+                        )
+                    item = prefetcher.get(timeout=30.0)
+                    status = str(item.get("status", "error"))
+                    if status == "empty":
+                        skipped_empty += 1
+                        continue
+                    if status != "ok":
+                        raise RuntimeError(
+                            f"Full-file AL sample prefetch failed: {item.get('message', 'unknown_error')}"
+                        )
+                    normalized = str(item.get("normalized", ""))
+                    if not normalized:
+                        skipped_empty += 1
+                        continue
+                    sample_hash = str(item.get("sample_hash", ""))
+                    if not sample_hash:
+                        skipped_empty += 1
+                        continue
+                    if sample_hash in seen:
+                        skipped_seen += 1
+                        continue
+                    seen.add(sample_hash)
+                    sample_index = selected
+                    selected += 1
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                        _update_progress_bar(
+                            progress_bar,
+                            attempts=attempts,
+                            skipped_seen=skipped_seen,
+                            skipped_empty=skipped_empty,
+                        )
+                    representative_lang = str(item.get("lang", "unknown"))
+                    sample_meta = dict(item.get("metadata") or {})
+                    yield representative_lang, sample_index, normalized, sample_hash, sample_meta
+                return
+            finally:
+                prefetcher.close()
+        while selected < total_target and attempts < max_attempts:
+            attempts += 1
+            if attempts == 1 or attempts % 16 == 0:
+                _update_progress_bar(
+                    progress_bar,
+                    attempts=attempts,
+                    skipped_seen=skipped_seen,
+                    skipped_empty=skipped_empty,
+                )
+            window_seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+            py_state = random.getstate()
+            np_state = np.random.get_state()
+            try:
+                random.seed(window_seed)
+                np.random.seed(window_seed)
+                tokens, _, full_meta = make_training_full_sequence_with_metadata(
+                    dsets_by_lang,
+                    data_cfg,
+                    target_len=int(full_file_max_bytes),
+                )
+            finally:
+                random.setstate(py_state)
+                np.random.set_state(np_state)
+
+            normalized = _window_tokens_to_normalized_text(tokens)
+            if not normalized:
+                skipped_empty += 1
+                continue
+            sample_hash = _hash_text(normalized)
+            if sample_hash in seen:
+                skipped_seen += 1
+                continue
+            seen.add(sample_hash)
+            sample_index = selected
+            selected += 1
+            if progress_bar is not None:
+                progress_bar.update(1)
+                _update_progress_bar(
+                    progress_bar,
+                    attempts=attempts,
+                    skipped_seen=skipped_seen,
+                    skipped_empty=skipped_empty,
+                )
+            representative_lang = _resolve_full_sequence_source_lang(full_meta)
+            sample_meta = _summarize_full_sequence_metadata(full_meta, window_seed=window_seed)
+            sample_meta["full_file_mode"] = True
+            yield representative_lang, sample_index, normalized, sample_hash, sample_meta
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    print(
+        "Augmented AL full-file sampling: "
         f"selected={selected}/{total_target}, "
         f"skipped_seen_hash={skipped_seen}, "
         f"skipped_empty={skipped_empty}, "
@@ -438,17 +723,36 @@ def _iter_split_examples(
     max_samples_per_lang: int,
     *,
     rng: np.random.Generator,
+    full_files: bool = False,
+    full_file_max_bytes: int = 10000,
+    sample_workers: int = 1,
+    sample_prefetch: int = 0,
+    sample_seed: Optional[int] = None,
     seen_hashes: Optional[set[str]] = None,
 ) -> Iterable[tuple[str, int, str, str, Dict[str, object]]]:
     if str(split) in {"train", "val", "test"}:
-        yield from _iter_augmented_split_examples(
-            data_root,
-            split,
-            langs,
-            max_samples_per_lang,
-            rng=rng,
-            seen_hashes=seen_hashes,
-        )
+        if full_files:
+            yield from _iter_augmented_full_split_examples(
+                data_root,
+                split,
+                langs,
+                max_samples_per_lang,
+                rng=rng,
+                full_file_max_bytes=int(full_file_max_bytes),
+                sample_workers=int(sample_workers),
+                sample_prefetch=int(sample_prefetch),
+                sample_seed=sample_seed,
+                seen_hashes=seen_hashes,
+            )
+        else:
+            yield from _iter_augmented_split_examples(
+                data_root,
+                split,
+                langs,
+                max_samples_per_lang,
+                rng=rng,
+                seen_hashes=seen_hashes,
+            )
         return
     yield from _iter_raw_split_examples(
         data_root,
@@ -472,6 +776,7 @@ def _build_snippets_from_prediction(
     max_candidates_per_sample: int,
     context_chars: int,
     min_score: float,
+    full_files: bool = False,
 ) -> tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]:
     normalized = normalized_text
     if not char_labels or not char_probs:
@@ -489,6 +794,52 @@ def _build_snippets_from_prediction(
         min_score=float(min_score),
         other_id=getattr(cfg, "OTHER_CLASS_INDEX", None),
     )
+    if bool(full_files):
+        if not candidates:
+            return [], sample_pred_segments
+        top_cand = max(candidates, key=lambda item: float(item.score))
+        trigger_ranges = [
+            {
+                "start": int(cand.start),
+                "end": int(cand.end),
+                "boundary": int(cand.boundary),
+                "score": float(cand.score),
+                "entropy_mean": float(cand.entropy_mean),
+                "flip_rate": float(cand.flip_rate),
+                "is_other_boundary": bool(cand.is_other_boundary),
+                "left_label_id": int(cand.left_label),
+                "right_label_id": int(cand.right_label),
+                "left_label": id2lang.get(int(cand.left_label), "other"),
+                "right_label": id2lang.get(int(cand.right_label), "other"),
+            }
+            for cand in candidates
+        ]
+        snippet = BoundarySnippet(
+            snippet_id=_make_sample_prompt_id(sample_hash),
+            text=normalized,
+            global_start=0,
+            global_end=int(len(normalized)),
+            boundary=int(top_cand.boundary),
+            predicted_labels=pred_label_names,
+            metadata={
+                "source_lang": lang,
+                "sample_index": int(sample_index),
+                "sample_hash": sample_hash,
+                "boundary_global": int(top_cand.boundary),
+                "score": float(top_cand.score),
+                "entropy_mean": float(top_cand.entropy_mean),
+                "flip_rate": float(top_cand.flip_rate),
+                "is_other_boundary": bool(top_cand.is_other_boundary),
+                "left_label_id": int(top_cand.left_label),
+                "right_label_id": int(top_cand.right_label),
+                "left_label": id2lang.get(int(top_cand.left_label), "other"),
+                "right_label": id2lang.get(int(top_cand.right_label), "other"),
+                "trigger_ranges": trigger_ranges,
+                "full_file_mode": True,
+                **(dict(sample_metadata) if isinstance(sample_metadata, dict) else {}),
+            },
+        )
+        return [(snippet, top_cand)], sample_pred_segments
     out: List[tuple[BoundarySnippet, CandidateSpan]] = []
     for cand in candidates:
         snippet_labels = [
@@ -538,6 +889,7 @@ def _build_snippets_for_sample(
     max_candidates_per_sample: int,
     context_chars: int,
     min_score: float,
+    full_files: bool = False,
     sample_hash: Optional[str] = None,
     sample_metadata: Optional[Dict[str, object]] = None,
 ) -> tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]:
@@ -555,6 +907,7 @@ def _build_snippets_for_sample(
         max_candidates_per_sample=max_candidates_per_sample,
         context_chars=context_chars,
         min_score=min_score,
+        full_files=bool(full_files),
     )
 
 
@@ -565,6 +918,7 @@ def _build_snippets_for_samples_batch(
     max_candidates_per_sample: int,
     context_chars: int,
     min_score: float,
+    full_files: bool = False,
 ) -> List[tuple[List[tuple[BoundarySnippet, CandidateSpan]], List[Dict[str, object]]]]:
     if not samples:
         return []
@@ -595,6 +949,7 @@ def _build_snippets_for_samples_batch(
                 max_candidates_per_sample=max_candidates_per_sample,
                 context_chars=context_chars,
                 min_score=min_score,
+                full_files=bool(full_files),
             )
         )
     return out
@@ -624,6 +979,47 @@ def _limit_snippets_for_oracle_requests(
     return ordered[:snippet_cap]
 
 
+def _configure_oracle_parallel_requests(
+    oracle: object,
+    *,
+    max_oracle_requests: Optional[int],
+) -> int:
+    parallel_requests = 1
+    if max_oracle_requests is not None:
+        parallel_requests = max(1, int(max_oracle_requests))
+    if hasattr(oracle, "max_parallel_requests"):
+        setattr(oracle, "max_parallel_requests", int(parallel_requests))
+    return int(parallel_requests)
+
+
+def _looks_like_oracle_unavailable_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "503" in message
+        or "status': 'unavailable'" in message
+        or '"status": "unavailable"' in message
+        or "status': 'service_unavailable'" in message
+        or '"status": "service_unavailable"' in message
+        or "currently experiencing high demand" in message
+        or "unavailable" in message and "oracle failed completely" in message
+    )
+
+
+def _print_oracle_unavailable_banner(*, error: str, queried_count: int, round_id: str) -> None:
+    banner = "=" * 100
+    print(banner, flush=True)
+    print("!!! GEMINI / ORACLE API UNAVAILABLE - SKIPPING NEW LABELS FOR THIS ROUND !!!", flush=True)
+    print(
+        "!!! NO NEW LABELS WERE STORED THIS ROUND BECAUSE THE ORACLE API IS CURRENTLY DOWN / OVERLOADED !!!",
+        flush=True,
+    )
+    print(
+        f"!!! round_id={round_id} queried_snippets={int(queried_count)} error={error}",
+        flush=True,
+    )
+    print(banner, flush=True)
+
+
 def run_one_round(
     *,
     ckpt_path: str,
@@ -640,8 +1036,14 @@ def run_one_round(
     sample_seed: Optional[int] = None,
     skip_seen_hashes: bool = True,
     max_oracle_requests: Optional[int] = 3,
+    full_files: bool = False,
+    full_file_max_bytes: int = 10000,
+    sample_workers: int = 1,
+    sample_prefetch: int = 0,
 ) -> Dict[str, object]:
     context_chars = min(250, max(8, int(context_chars)))
+    full_files = bool(full_files)
+    full_file_max_bytes = max(1, int(full_file_max_bytes))
     round_id = datetime.now(timezone.utc).strftime("al-%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     predictor_args = argparse.Namespace(
         ckpt=ckpt_path,
@@ -662,6 +1064,8 @@ def run_one_round(
     if predictor_kwargs:
         for key, value in predictor_kwargs.items():
             setattr(predictor_args, key, value)
+    if full_files:
+        predictor_args.chunk = int(full_file_max_bytes)
     predictor = _build_predictor(predictor_args)
     store = LabelStore(store_path)
     rng = np.random.default_rng(sample_seed)
@@ -681,9 +1085,10 @@ def run_one_round(
     inference_rows: List[StoredInferenceSample] = []
     total_samples_seen = 0
     total_samples_with_candidates = 0
+    total_candidate_triggers = 0
 
     def _process_scored_batch(samples_batch: Sequence[tuple]) -> None:
-        nonlocal total_samples_with_candidates
+        nonlocal total_samples_with_candidates, total_candidate_triggers
         if not samples_batch:
             return
         batch_results = _build_snippets_for_samples_batch(
@@ -692,6 +1097,7 @@ def run_one_round(
             max_candidates_per_sample=max_candidates_per_sample,
             context_chars=context_chars,
             min_score=min_score,
+            full_files=bool(full_files),
         )
         for sample, (sample_snippets, sample_pred_segments) in zip(samples_batch, batch_results):
             lang = str(sample[0])
@@ -702,6 +1108,7 @@ def run_one_round(
             if sample_snippets:
                 total_samples_with_candidates += 1
             trigger_ranges: List[Dict[str, object]] = []
+            sample_candidate_count = 0
             for snippet, cand in sample_snippets:
                 snippets.append(snippet)
                 score_by_id[snippet.snippet_id] = float(cand.score)
@@ -709,21 +1116,27 @@ def run_one_round(
                     snippet.predicted_labels
                 )
                 source_by_id[snippet.snippet_id] = dict(snippet.metadata)
-                trigger_ranges.append(
-                    {
-                        "start": int(cand.start),
-                        "end": int(cand.end),
-                        "boundary": int(cand.boundary),
-                        "score": float(cand.score),
-                        "entropy_mean": float(cand.entropy_mean),
-                        "flip_rate": float(cand.flip_rate),
-                        "is_other_boundary": bool(cand.is_other_boundary),
-                        "left_label_id": int(cand.left_label),
-                        "right_label_id": int(cand.right_label),
-                        "left_label": cfg.ID2LANG.get(int(cand.left_label), "other"),
-                        "right_label": cfg.ID2LANG.get(int(cand.right_label), "other"),
-                    }
-                )
+                if bool(full_files):
+                    trigger_ranges = list(snippet.metadata.get("trigger_ranges") or [])
+                    sample_candidate_count = max(sample_candidate_count, len(trigger_ranges))
+                else:
+                    trigger_ranges.append(
+                        {
+                            "start": int(cand.start),
+                            "end": int(cand.end),
+                            "boundary": int(cand.boundary),
+                            "score": float(cand.score),
+                            "entropy_mean": float(cand.entropy_mean),
+                            "flip_rate": float(cand.flip_rate),
+                            "is_other_boundary": bool(cand.is_other_boundary),
+                            "left_label_id": int(cand.left_label),
+                            "right_label_id": int(cand.right_label),
+                            "left_label": cfg.ID2LANG.get(int(cand.left_label), "other"),
+                            "right_label": cfg.ID2LANG.get(int(cand.right_label), "other"),
+                        }
+                    )
+                    sample_candidate_count += 1
+            total_candidate_triggers += int(sample_candidate_count)
 
             inference_rows.append(
                 StoredInferenceSample(
@@ -735,13 +1148,15 @@ def run_one_round(
                     sample_text=normalized,
                     char_count=int(len(normalized)),
                     queried_for_oracle=False,
-                    candidate_count=int(len(sample_snippets)),
+                    candidate_count=int(sample_candidate_count),
                     trigger_ranges=trigger_ranges,
                     predicted_segments=sample_pred_segments,
                     metadata={
                         "max_candidates_per_sample": int(max_candidates_per_sample),
                         "min_score": float(min_score),
                         "context_chars": int(context_chars),
+                        "full_file_mode": bool(full_files),
+                        "full_file_max_bytes": int(full_file_max_bytes),
                         **sample_metadata,
                     },
                 )
@@ -754,6 +1169,11 @@ def run_one_round(
         langs,
         max_samples_per_lang,
         rng=rng,
+        full_files=bool(full_files),
+        full_file_max_bytes=int(full_file_max_bytes),
+        sample_workers=int(sample_workers),
+        sample_prefetch=int(sample_prefetch),
+        sample_seed=sample_seed,
         seen_hashes=seen_hashes if skip_seen_hashes else None,
     ):
         total_samples_seen += 1
@@ -833,7 +1253,7 @@ def run_one_round(
             "round_id": round_id,
             "status": "oracle_capped",
             "samples": 0,
-            "candidate_snippets": int(len(snippets)),
+            "candidate_snippets": int(total_candidate_triggers),
             "inference_samples": int(inference_inserted),
             "stored": 0,
             "store_path": str(Path(store_path).resolve()),
@@ -865,8 +1285,47 @@ def run_one_round(
         f"flip_rate(avg/min/max)={queried_flip.mean():.3f}/{queried_flip.min():.3f}/{queried_flip.max():.3f}",
         flush=True,
     )
+    parallel_requests = _configure_oracle_parallel_requests(
+        oracle,
+        max_oracle_requests=max_oracle_requests,
+    )
+    oracle_batch_size = max(1, int(getattr(oracle, "batch_size", 1)))
+    estimated_request_batches = int(
+        (len(queried_snippets) + oracle_batch_size - 1) // oracle_batch_size
+    )
+    print(
+        "Oracle dispatch config: "
+        f"batch_size={oracle_batch_size}, "
+        f"parallel_requests={parallel_requests}, "
+        f"estimated_batches={estimated_request_batches}.",
+        flush=True,
+    )
 
-    refined = oracle.annotate(queried_snippets)
+    try:
+        refined = oracle.annotate(queried_snippets)
+    except RuntimeError as exc:
+        if not _looks_like_oracle_unavailable_error(exc):
+            raise
+        error_text = str(exc).strip()
+        _print_oracle_unavailable_banner(
+            error=error_text,
+            queried_count=len(queried_snippets),
+            round_id=round_id,
+        )
+        return {
+            "round_id": round_id,
+            "status": "oracle_unavailable",
+            "samples": 0,
+            "candidate_snippets": int(total_candidate_triggers),
+            "inference_samples": int(inference_inserted),
+            "stored": 0,
+            "oracle_model_outputs": 0,
+            "oracle_fallback_snippets": 0,
+            "oracle_skipped_snippets": 0,
+            "oracle_error": error_text,
+            "store_path": str(Path(store_path).resolve()),
+            "timestamp": _now_utc(),
+        }
     print(
         f"Oracle returned refinements for {len(refined)}/{len(queried_snippets)} snippets.",
         flush=True,
@@ -1101,7 +1560,7 @@ def run_one_round(
         "round_id": round_id,
         "status": "ok",
         "samples": len(queried_snippets),
-        "candidate_snippets": int(len(snippets)),
+        "candidate_snippets": int(total_candidate_triggers),
         "inference_samples": int(inference_inserted),
         "stored": inserted,
         "store_path": str(Path(store_path).resolve()),
@@ -1122,6 +1581,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--langs", type=str, default=None, help="Comma-separated language subset.")
     parser.add_argument("--store", type=str, default="active_learning/label_store.sqlite")
+    parser.add_argument("--full-files", action="store_true", help="Use full-file/long-sample AL acquisition and oracle querying.")
+    parser.add_argument("--full-file-max-bytes", type=int, default=10000)
+    parser.add_argument(
+        "--sample-workers",
+        type=int,
+        default=1,
+        help="Number of CPU worker processes for long-sample assembly (full-file mode).",
+    )
+    parser.add_argument(
+        "--sample-prefetch",
+        type=int,
+        default=0,
+        help="Maximum prefetched long samples to keep queued ahead of scoring.",
+    )
     parser.add_argument("--max-samples-per-lang", type=int, default=16)
     parser.add_argument("--max-candidates-per-sample", type=int, default=3)
     parser.add_argument("--context-chars", type=int, default=250)
@@ -1231,6 +1704,10 @@ def main() -> None:
         sample_seed=args.sample_seed,
         skip_seen_hashes=not bool(args.allow_repeat_hashes),
         max_oracle_requests=None if bool(args.unlimited_oracle) else max(0, int(args.max_oracle_requests)),
+        full_files=bool(args.full_files),
+        full_file_max_bytes=int(args.full_file_max_bytes),
+        sample_workers=max(1, int(args.sample_workers)),
+        sample_prefetch=max(0, int(args.sample_prefetch)),
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

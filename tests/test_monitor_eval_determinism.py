@@ -144,6 +144,39 @@ class TestMonitorEvalDeterminism(unittest.TestCase):
         self.assertEqual(stats["windows"], 4)
         self.assertIsNotNone(stats["conf_mat"])
 
+    def test_full_file_monitor_eval_is_deterministic(self) -> None:
+        monitor_data = _monitor_data()
+        with patch("train.utils.monitor_eval._forward_logits", side_effect=_forward_logits):
+            stats_a = evaluate_monitor_set(
+                state=None,
+                monitor_data=monitor_data,
+                L=32,
+                batch_size=2,
+                rng=jax.random.PRNGKey(0),
+                limit=4,
+                eval_step_fn=_eval_step_fn,
+                deterministic=True,
+                deterministic_seed=17,
+                full_files=True,
+            )
+            stats_b = evaluate_monitor_set(
+                state=None,
+                monitor_data=monitor_data,
+                L=32,
+                batch_size=2,
+                rng=jax.random.PRNGKey(999),
+                limit=4,
+                eval_step_fn=_eval_step_fn,
+                deterministic=True,
+                deterministic_seed=17,
+                full_files=True,
+            )
+
+        self.assertEqual(stats_a["files_used"], 4)
+        self.assertEqual(stats_a["windows"], 4)
+        self.assertEqual(stats_a["loss_mean"], stats_b["loss_mean"])
+        np.testing.assert_array_equal(stats_a["conf_mat"], stats_b["conf_mat"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,9 +29,8 @@ Note that the first request takes far longer than the rest because JAX has to tr
   - `utils/config.py` centralizes the label set (`LANG_ORDER`), window size, and `DataConfig`/`TrainConfig`.
 - `evaluation/` – Benchmark datasets and metrics:
   - `obtain_eval_dataset.py` samples from the monitor set + Gemini segmentations to build curated HF datasets (`pure_fragments`, `needle_*`, `mal_injection`, `sequence_pair/triplet`, `markdown_mix`, throughput stress tests, …).
-  - `evaluation.py` loads a checkpoint, runs the full benchmark battery, and writes a Markdown report to `evaluation/report.md`.
-  - `report.md` contains the metrics of the last run evaluation setting. All run metrics are also exported as json and pushed to `comparisons`:
-- `comparisons/` – JSON snapshots for comparing different evaluation runs.
+  - `evaluation.py` loads a checkpoint, runs the full benchmark battery, and by default writes each run into its own directory under `evaluation/reports/<run_name>/` with `report.md`, `comparison_metrics.json`, and task-wise plus aggregated confusion-matrix plots.
+- `evaluation/reports/` – Per-run evaluation artifact directories.
 - `viewers/` – Small FastAPI frontends for playing with the model:
   - `interactive_viewer.py` exposes a `/api/segment` endpoint where one can provide custom inputs to the model and see its output probabilities.
   - `confusion_viewer.py`, `evaluation_viewer.py`, `dataset_viewer.py` are focused viewers for confusion matrices, eval runs, and datasets.
@@ -121,11 +120,10 @@ Given a trained checkpoint:
 ```bash
 python evaluation/evaluation.py \
   --checkpoint train/checkpoints/seg-unet1d.msgpack \
-  --data-root evaluation/data \
-  --report-path evaluation/report.md
+  --data-root evaluation/data
 ```
 
-The script runs the model over all configured tasks, aggregates metrics (including IoU coverage for needles, markdown mixes, and malicious payloads), and writes a Markdown report similar to the existing `evaluation/report.md`.
+The script runs the model over all configured tasks, aggregates metrics (including IoU coverage for needles, markdown mixes, and malicious payloads), and writes a dedicated artifact directory under `evaluation/reports/` containing the Markdown report, JSON summary, and confusion-matrix images. You can still override the destination with `--report-path`, either as a markdown file path or a directory.
 
 ### 5. Launch the interactive viewer
 

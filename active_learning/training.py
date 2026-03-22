@@ -28,17 +28,29 @@ class ActiveLearningReplay:
         seed: int,
         fallback_label: str = "other",
         exclude_source_splits: Tuple[str, ...] = DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
+        full_files: bool = False,
     ) -> "ActiveLearningReplay":
         store = LabelStore(store_path)
-        windows = store.build_training_windows(
-            window_bytes=int(window_bytes),
-            pad_byte_id=int(pad_byte_id),
-            pad_label_id=int(pad_label_id),
-            label_to_id=label_to_id,
-            max_windows=max_windows,
-            fallback_label=str(fallback_label),
-            exclude_source_splits=exclude_source_splits,
-        )
+        if full_files:
+            windows = store.build_training_sequences(
+                sequence_bytes=int(window_bytes),
+                pad_byte_id=int(pad_byte_id),
+                pad_label_id=int(pad_label_id),
+                label_to_id=label_to_id,
+                max_sequences=max_windows,
+                fallback_label=str(fallback_label),
+                exclude_source_splits=exclude_source_splits,
+            )
+        else:
+            windows = store.build_training_windows(
+                window_bytes=int(window_bytes),
+                pad_byte_id=int(pad_byte_id),
+                pad_label_id=int(pad_label_id),
+                label_to_id=label_to_id,
+                max_windows=max_windows,
+                fallback_label=str(fallback_label),
+                exclude_source_splits=exclude_source_splits,
+            )
         if not windows:
             return cls(
                 windows_x=np.empty((0, int(window_bytes)), dtype=np.int32),

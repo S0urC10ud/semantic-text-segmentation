@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import types as pytypes
 import unittest
 from pathlib import Path
@@ -219,6 +220,40 @@ class TestOracleUtils(unittest.TestCase):
             ],
         )
 
+    def test_parse_segments_payload_accepts_small_text_drift_with_fuzzy_alignment(self) -> None:
+        raw = (
+            '{"snippets":[{"snippet_id":"s1","segments":['
+            '{"label":"python","text":"helloX"},'
+            '{"label":"sql","text":"WORLD"}'
+            ']}]}'
+        )
+        parsed, failures, _ = GeminiBoundaryOracle._parse_segments_payload(
+            raw,
+            snippet_text_by_id={"s1": "helloWORLD"},
+        )
+        self.assertEqual(failures, {})
+        self.assertIn("s1", parsed)
+        self.assertEqual(
+            parsed["s1"],
+            [
+                OracleSegment(0, 5, "python", "python"),
+                OracleSegment(5, 10, "sql", "sql"),
+            ],
+        )
+
+    def test_parse_segments_payload_rejects_large_text_drift_even_with_fuzzy_alignment(self) -> None:
+        raw = (
+            '{"snippets":[{"snippet_id":"s1","segments":['
+            '{"label":"python","text":"x' + ('z' * 500) + '"}'
+            ']}]}'
+        )
+        parsed, failures, _ = GeminiBoundaryOracle._parse_segments_payload(
+            raw,
+            snippet_text_by_id={"s1": "a" * 500},
+        )
+        self.assertEqual(parsed, {})
+        self.assertEqual(failures, {"s1": "invalid_segment_text_chunks"})
+
     def test_parse_segments_payload_falls_back_to_offsets_on_text_mismatch(self) -> None:
         raw = (
             '{"snippets":[{"snippet_id":"s1","segments":['
@@ -412,6 +447,53 @@ class TestOracleUtils(unittest.TestCase):
         self.assertEqual(int(throttled), 0)
         self.assertEqual(int(oracle._client.models.calls), 1)
         sleep_mock.assert_not_called()
+
+    def test_annotate_parallel_batches_preserve_batch_order(self) -> None:
+        snippets = [
+            BoundarySnippet(
+                snippet_id=f"s{i}",
+                text=f"text-{i}",
+                global_start=0,
+                global_end=6,
+                boundary=3,
+                predicted_labels=["python"] * 6,
+                metadata={"source_lang": "python"},
+            )
+            for i in range(4)
+        ]
+
+        oracle = GeminiBoundaryOracle.__new__(GeminiBoundaryOracle)
+        oracle.batch_size = 1
+        oracle.show_progress = False
+        oracle.progress_desc = "oracle"
+        oracle.progress_leave = False
+        oracle.max_parallel_requests = 4
+        oracle.last_batches = []
+        oracle.last_snippet_sources = {}
+
+        def fake_batch(self, batch):
+            sid = str(batch[0].snippet_id)
+            if sid == "s0":
+                time.sleep(0.05)
+            return (
+                {sid: [OracleSegment(0, len(batch[0].text), "python", "python")]},
+                {sid: "model"},
+                {"snippet_ids": [sid]},
+            )
+
+        oracle._annotate_batch = pytypes.MethodType(fake_batch, oracle)
+
+        annotated = oracle.annotate(snippets)
+
+        self.assertEqual(list(annotated.keys()), ["s0", "s1", "s2", "s3"])
+        self.assertEqual(
+            [batch.get("snippet_ids") for batch in oracle.last_batches],
+            [["s0"], ["s1"], ["s2"], ["s3"]],
+        )
+        self.assertEqual(
+            oracle.last_snippet_sources,
+            {"s0": "model", "s1": "model", "s2": "model", "s3": "model"},
+        )
 
 
 if __name__ == "__main__":

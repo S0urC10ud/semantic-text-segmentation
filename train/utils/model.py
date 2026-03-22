@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import optax
+from inference.mamba_cuda import selective_scan_inference
 import utils.config as cfg
 from flax import linen as nn
 from flax import serialization
@@ -136,6 +137,7 @@ class MambaBlock1D(nn.Module):
     dropout_rate: float = 0.0
     bidirectional: bool = True
     dtype: jnp.dtype = jnp.bfloat16
+    inference_kernel: str = "default"
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool) -> jnp.ndarray:
@@ -195,54 +197,25 @@ class MambaBlock1D(nn.Module):
         A = -jnp.exp(A_log)  # (d_inner, d_state), negative for stability
         D = self.param("D", nn.initializers.ones, (d_inner,), jnp.float32)
 
-        def selective_scan(
-            x_in: jnp.ndarray,
-            dt_in: jnp.ndarray,
-            B_in: jnp.ndarray,
-            C_in: jnp.ndarray,
-        ) -> jnp.ndarray:
-            # x_in: (B, L, d_inner)
-            # dt_in: (B, L, d_inner)
-            # B_in/C_in: (B, L, d_state)
-            #
-            # We avoid a sequential per-token lax.scan (very slow on GPU at long L)
-            # by using an associative scan over affine transforms:
-            #   s_t = a_t * s_{t-1} + b_t
-            # where a_t = exp(dt_t * A), b_t = x_t * dt_t * B_t.
-            x_f32 = x_in.astype(jnp.float32)
-            dt_f32 = dt_in.astype(jnp.float32)
-            B_f32 = B_in.astype(jnp.float32)
-            C_f32 = C_in.astype(jnp.float32)
-
-            # Time-major: (L, B, ...)
-            x_tm = jnp.swapaxes(x_f32, 0, 1)   # (L,B,d_inner)
-            dt_tm = jnp.swapaxes(dt_f32, 0, 1)  # (L,B,d_inner)
-            B_tm = jnp.swapaxes(B_f32, 0, 1)   # (L,B,d_state)
-            C_tm = jnp.swapaxes(C_f32, 0, 1)   # (L,B,d_state)
-
-            a = jnp.exp(dt_tm[:, :, :, None] * A[None, None, :, :])  # (L,B,d_inner,d_state)
-            b = (
-                x_tm[:, :, :, None]
-                * (dt_tm[:, :, :, None] * B_tm[:, :, None, :])
-            )  # (L,B,d_inner,d_state)
-
-            def combine(left, right):
-                a1, b1 = left
-                a2, b2 = right
-                # Compose affine transforms: (a2,b2) ∘ (a1,b1)
-                return a2 * a1, b2 + a2 * b1
-
-            _, state_tm = jax.lax.associative_scan(combine, (a, b), axis=0)
-
-            y_tm = (
-                jnp.sum(state_tm * C_tm[:, :, None, :], axis=-1)
-                + x_tm * D[None, None, :]
-            )  # (L,B,d_inner)
-            return jnp.swapaxes(y_tm, 0, 1)  # (B,L,d_inner)
-
-        y = selective_scan(u, dt, B, C)
+        y = selective_scan_inference(
+            u,
+            dt,
+            B,
+            C,
+            A,
+            D,
+            backend=self.inference_kernel if not train else "default",
+        )
         if self.bidirectional:
-            y_rev = selective_scan(u[:, ::-1, :], dt[:, ::-1, :], B[:, ::-1, :], C[:, ::-1, :])
+            y_rev = selective_scan_inference(
+                u[:, ::-1, :],
+                dt[:, ::-1, :],
+                B[:, ::-1, :],
+                C[:, ::-1, :],
+                A,
+                D,
+                backend=self.inference_kernel if not train else "default",
+            )
             y = y + y_rev[:, ::-1, :]
 
         y = y.astype(self.dtype)
@@ -272,6 +245,8 @@ class Mamba1D(nn.Module):
     aux_offsets: Tuple[int, ...] = cfg.AUX_NEIGHBOR_OFFSETS
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
+    inference_kernel: str = "default"
+    use_remat: bool = True
 
     @nn.compact
     def __call__(
@@ -291,17 +266,34 @@ class Mamba1D(nn.Module):
         if self.dropout_rate and float(self.dropout_rate) > 0.0:
             h = nn.Dropout(rate=float(self.dropout_rate), deterministic=not train)(h)
 
-        for _ in range(int(self.n_layers)):
-            h = nn.remat(MambaBlock1D, static_argnums=(2,))(
-                d_model=int(self.d_model),
-                d_state=int(self.d_state),
-                expand=int(self.expand),
-                dt_rank=int(self.dt_rank),
-                d_conv=int(self.d_conv),
-                dropout_rate=float(self.dropout_rate),
-                bidirectional=bool(self.bidirectional),
-                dtype=self.dtype,
-            )(h, train)
+        if self.use_remat:
+            block_cls = nn.remat(MambaBlock1D, static_argnums=(2,))
+            for _ in range(int(self.n_layers)):
+                h = block_cls(
+                    d_model=int(self.d_model),
+                    d_state=int(self.d_state),
+                    expand=int(self.expand),
+                    dt_rank=int(self.dt_rank),
+                    d_conv=int(self.d_conv),
+                    dropout_rate=float(self.dropout_rate),
+                    bidirectional=bool(self.bidirectional),
+                    dtype=self.dtype,
+                    inference_kernel=str(self.inference_kernel),
+                )(h, train)
+        else:
+            for layer_idx in range(int(self.n_layers)):
+                h = MambaBlock1D(
+                    d_model=int(self.d_model),
+                    d_state=int(self.d_state),
+                    expand=int(self.expand),
+                    dt_rank=int(self.dt_rank),
+                    d_conv=int(self.d_conv),
+                    dropout_rate=float(self.dropout_rate),
+                    bidirectional=bool(self.bidirectional),
+                    dtype=self.dtype,
+                    inference_kernel=str(self.inference_kernel),
+                    name=f"CheckpointMambaBlock1D_{layer_idx}",
+                )(h, train)
 
         h = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(h)
         logits = nn.Dense(

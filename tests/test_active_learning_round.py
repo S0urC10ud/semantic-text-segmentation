@@ -15,13 +15,16 @@ if str(TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAIN_ROOT))
 
 import utils.config as cfg
+from active_learning.acquisition import CandidateSpan
 from active_learning.oracle import BoundarySnippet
 from active_learning.round import (
     _build_parser,
     _build_snippets_for_samples_batch,
+    _configure_oracle_parallel_requests,
     _iter_split_examples,
     _limit_snippets_for_oracle_requests,
     _make_snippet_id,
+    run_one_round,
 )
 
 
@@ -39,6 +42,31 @@ def _snippet(sid: str) -> BoundarySnippet:
 
 
 class TestRoundOracleRequestCap(unittest.TestCase):
+    def test_configure_oracle_parallel_requests_uses_request_cap(self) -> None:
+        class Oracle:
+            def __init__(self) -> None:
+                self.max_parallel_requests = 1
+
+        oracle = Oracle()
+        parallel = _configure_oracle_parallel_requests(
+            oracle,
+            max_oracle_requests=5,
+        )
+        self.assertEqual(parallel, 5)
+        self.assertEqual(oracle.max_parallel_requests, 5)
+
+    def test_configure_oracle_parallel_requests_defaults_to_one_when_unlimited(self) -> None:
+        class Oracle:
+            pass
+
+        oracle = Oracle()
+        parallel = _configure_oracle_parallel_requests(
+            oracle,
+            max_oracle_requests=None,
+        )
+        self.assertEqual(parallel, 1)
+        self.assertFalse(hasattr(oracle, "max_parallel_requests"))
+
     def test_make_snippet_id_is_short_and_deterministic(self) -> None:
         sid_a = _make_snippet_id("abc123", 10, 20, 15)
         sid_b = _make_snippet_id("abc123", 10, 20, 15)
@@ -173,6 +201,54 @@ class TestRoundOracleRequestCap(unittest.TestCase):
         self.assertEqual(snippet_b.predicted_labels, ["html", "html", "html", "css", "css", "css"])
         self.assertEqual((cand_b.start, cand_b.end, cand_b.boundary), (0, 6, 3))
 
+    def test_build_snippets_for_samples_batch_full_files_queries_whole_sample(self) -> None:
+        html_id = int(cfg.LANG2ID["html"])
+        css_id = int(cfg.LANG2ID["css"])
+
+        class FakePredictor:
+            def segment_texts(self, texts, min_run_chars=6, chunk=None):
+                out = []
+                for text in texts:
+                    split = max(1, len(text) // 2)
+                    labels = [html_id] * split + [css_id] * (len(text) - split)
+                    probs = []
+                    for idx in range(len(text)):
+                        if idx < split:
+                            probs.append({str(html_id): 0.99, str(css_id): 0.01})
+                        else:
+                            probs.append({str(html_id): 0.01, str(css_id): 0.99})
+                    out.append(([], labels, probs, []))
+                return out
+
+        predictor = FakePredictor()
+        samples = [("html", 11, "abcd", "hash-a", {"sampling_mode": "training_full_sequence"})]
+        results = _build_snippets_for_samples_batch(
+            samples=samples,
+            predictor=predictor,
+            max_candidates_per_sample=3,
+            context_chars=16,
+            min_score=0.0,
+            full_files=True,
+        )
+
+        sample_snippets, pred_segments = results[0]
+        self.assertEqual(
+            pred_segments,
+            [
+                {"start": 0, "end": 2, "label": "html"},
+                {"start": 2, "end": 4, "label": "css"},
+            ],
+        )
+        self.assertEqual(len(sample_snippets), 1)
+        snippet, cand = sample_snippets[0]
+        self.assertEqual(snippet.text, "abcd")
+        self.assertTrue(bool(snippet.metadata["full_file_mode"]))
+        self.assertEqual(snippet.metadata["sample_hash"], "hash-a")
+        self.assertGreaterEqual(len(snippet.metadata["trigger_ranges"]), 1)
+        self.assertEqual(snippet.global_start, 0)
+        self.assertEqual(snippet.global_end, 4)
+        self.assertEqual(cand.boundary, 2)
+
     def test_round_parser_defaults_predict_batch_size_to_twelve(self) -> None:
         args = _build_parser().parse_args(
             [
@@ -184,6 +260,72 @@ class TestRoundOracleRequestCap(unittest.TestCase):
         )
         self.assertEqual(args.predict_batch_size, 12)
         self.assertEqual(args.gemini_thinking_level, "medium")
+
+    def test_run_one_round_skips_round_when_oracle_is_unavailable(self) -> None:
+        class FakePredictor:
+            inference_batch_size = 1
+
+        class FakeStore:
+            def __init__(self, _path: str) -> None:
+                self.path = _path
+
+            def existing_sample_hashes(self):
+                return set()
+
+            def add_inference_samples_many(self, rows):
+                return len(rows)
+
+        class UnavailableOracle:
+            name = "gemini"
+            model = "gemini-3-flash-preview"
+            batch_size = 4
+
+            def annotate(self, _snippets):
+                raise RuntimeError(
+                    "Oracle failed completely. Error: 503 UNAVAILABLE. "
+                    "{'error': {'code': 503, 'message': 'This model is currently experiencing high demand.', "
+                    "'status': 'UNAVAILABLE'}}"
+                )
+
+        snippet = _snippet("s-unavailable")
+        candidate = CandidateSpan(
+            start=0,
+            end=3,
+            boundary=1,
+            score=0.9,
+            entropy_mean=0.4,
+            flip_rate=0.2,
+            left_label=int(cfg.LANG2ID["python"]),
+            right_label=int(cfg.LANG2ID["python"]),
+        )
+
+        with patch("active_learning.round._build_predictor", return_value=FakePredictor()), patch(
+            "active_learning.round.LabelStore",
+            FakeStore,
+        ), patch(
+            "active_learning.round._iter_split_examples",
+            return_value=iter([("python", 0, "abc", "hash-a", {})]),
+        ), patch(
+            "active_learning.round._build_snippets_for_samples_batch",
+            return_value=[([(snippet, candidate)], [{"start": 0, "end": 3, "label": "python"}])],
+        ):
+            summary = run_one_round(
+                ckpt_path="checkpoint.msgpack",
+                data_root="downloader/arrow_out",
+                split="train",
+                langs=["python"],
+                store_path="active_learning/label_store.sqlite",
+                oracle=UnavailableOracle(),
+                max_samples_per_lang=1,
+                max_candidates_per_sample=1,
+                predictor_kwargs={"predict_batch_size": 1},
+            )
+
+        self.assertEqual(summary["status"], "oracle_unavailable")
+        self.assertEqual(summary["stored"], 0)
+        self.assertEqual(summary["inference_samples"], 1)
+        self.assertEqual(summary["oracle_model_outputs"], 0)
+        self.assertIn("503", str(summary["oracle_error"]))
 
     def test_iter_split_examples_uses_training_window_augmentation_for_train_split(self) -> None:
         data_root = ROOT / "tmp-data-root"

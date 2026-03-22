@@ -233,6 +233,27 @@ class TestMonitorFineTuneAugmentation(unittest.TestCase):
             np.array([cs_id, cs_id, cs_id, cs_id], dtype=np.uint8),
         )
 
+    def test_build_full_sequence_uses_entire_monitor_file(self) -> None:
+        monitor_data = _monitor_data()
+        x, y = MonitorFineTuneBatcher._build_full_sequence(
+            np.random.default_rng(0),
+            8,
+            monitor_data["files"],
+            monitor_data["contents"],
+            monitor_data["segments"],
+            len(monitor_data["files"]),
+        )
+        py_id = int(cfg.LANG2ID["python"])
+        sql_id = int(cfg.LANG2ID["sql"])
+        np.testing.assert_array_equal(
+            x[:6],
+            np.frombuffer(b"aaBBBB", dtype=np.uint8).astype(np.int32),
+        )
+        np.testing.assert_array_equal(
+            y[:6],
+            np.array([py_id, py_id, sql_id, sql_id, sql_id, sql_id], dtype=np.uint8),
+        )
+
     def test_build_augmented_window_mixed_keeps_labels_aligned(self) -> None:
         data_cfg = cfg.DataConfig(window_min_bytes=12, window_max_bytes=12, min_seg_len=2)
         fragment_dsets = {

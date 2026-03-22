@@ -1053,6 +1053,14 @@ parser.add_argument(
 parser.add_argument("--model-dim", type=int, default=None, help="Model embedding dimension (auto if omitted).")
 parser.add_argument("--channels", type=str, default=None, help="Comma-separated channel sizes (auto if omitted).")
 parser.add_argument("--dtype", type=str, default=None, help="Model dtype name (auto if omitted).")
+parser.add_argument("--device", type=str, default="auto", help="Inference device (auto/cpu/gpu/cuda).")
+parser.add_argument(
+    "--inference-backend",
+    type=str,
+    default="auto",
+    choices=("auto", "fast", "legacy"),
+    help="Inference backend for viewer predictions. 'auto' prefers the shared fast backend.",
+)
 # Mamba-only knobs (ignored for unet1d); auto if omitted.
 parser.add_argument("--mamba-layers", type=int, default=None)
 parser.add_argument("--mamba-d-state", type=int, default=None)
@@ -1336,6 +1344,8 @@ try:
         chunk=args.chunk,
         other_threshold=args.other_threshold,
         inference_batch_size=args.batch_size,
+        device=args.device,
+        inference_backend=args.inference_backend,
     )
 except Exception as exc:
     load_error = str(exc)

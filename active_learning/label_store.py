@@ -349,6 +349,31 @@ class LabelStore:
         for row in rows:
             yield row
 
+    def iter_inference_rows(
+        self,
+        *,
+        limit: Optional[int] = None,
+        exclude_source_splits: Optional[Sequence[str]] = None,
+    ) -> Iterator[sqlite3.Row]:
+        query = "SELECT * FROM inference_samples"
+        params: List[object] = []
+        where_clauses: List[str] = []
+        if exclude_source_splits:
+            placeholders = ",".join("?" for _ in exclude_source_splits)
+            where_clauses.append(f"source_split NOT IN ({placeholders})")
+            params.extend([str(split) for split in exclude_source_splits])
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+        query += " ORDER BY id ASC"
+        if limit is not None and limit > 0:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with self._connect() as con:
+            cur = con.execute(query, params)
+            rows = cur.fetchall()
+        for row in rows:
+            yield row
+
     @staticmethod
     def _char_to_byte_offsets(text: str) -> List[int]:
         offsets = [0]
@@ -428,3 +453,108 @@ class LabelStore:
                     return windows
                 start += stride
         return windows
+
+    def build_training_sequences(
+        self,
+        *,
+        sequence_bytes: int,
+        pad_byte_id: int,
+        pad_label_id: int,
+        label_to_id: Dict[str, int],
+        max_sequences: Optional[int] = None,
+        fallback_label: str = "other",
+        statuses: Sequence[str] = ("ok",),
+        exclude_source_splits: Sequence[str] = DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
+    ) -> List[Tuple[np.ndarray, np.ndarray]]:
+        fallback_id = int(label_to_id.get(fallback_label, pad_label_id))
+        latest_round_by_key: Dict[Tuple[str, int], str] = {}
+        for row in self.iter_rows(
+            statuses=statuses,
+            exclude_source_splits=exclude_source_splits,
+        ):
+            key = (str(row["sample_hash"] or ""), int(row["sample_index"]))
+            if not key[0]:
+                continue
+            latest_round_by_key[key] = str(row["round_id"] or "")
+
+        grouped_rows: Dict[Tuple[str, int], List[sqlite3.Row]] = {}
+        for row in self.iter_rows(
+            statuses=statuses,
+            exclude_source_splits=exclude_source_splits,
+        ):
+            key = (str(row["sample_hash"] or ""), int(row["sample_index"]))
+            if not key[0]:
+                continue
+            if str(row["round_id"] or "") != latest_round_by_key.get(key, ""):
+                continue
+            grouped_rows.setdefault(key, []).append(row)
+
+        inference_by_key: Dict[Tuple[str, int], sqlite3.Row] = {}
+        for row in self.iter_inference_rows(exclude_source_splits=exclude_source_splits):
+            key = (str(row["sample_hash"] or ""), int(row["sample_index"]))
+            if not key[0]:
+                continue
+            inference_by_key[key] = row
+
+        sequences: List[Tuple[np.ndarray, np.ndarray]] = []
+        for key, rows in grouped_rows.items():
+            inference_row = inference_by_key.get(key)
+            if inference_row is None:
+                continue
+            sample_text = str(inference_row["sample_text"] or "")
+            if not sample_text:
+                continue
+
+            offsets = self._char_to_byte_offsets(sample_text)
+            byte_buf = np.frombuffer(sample_text.encode("utf-8", "ignore"), dtype=np.uint8)
+            if byte_buf.size <= 0 or byte_buf.size > int(sequence_bytes):
+                continue
+
+            labels = np.full((byte_buf.size,), int(pad_label_id), dtype=np.uint8)
+            covered = np.zeros((len(sample_text),), dtype=bool)
+            valid = True
+
+            for row in sorted(rows, key=lambda item: (int(item["snippet_start"]), int(item["snippet_end"]), int(item["id"]))):
+                snippet_start = max(0, int(row["snippet_start"]))
+                snippet_end = max(snippet_start, int(row["snippet_end"]))
+                if snippet_end > len(sample_text):
+                    valid = False
+                    break
+                snippet_text = str(row["snippet_text"] or "")
+                if sample_text[snippet_start:snippet_end] != snippet_text:
+                    valid = False
+                    break
+                covered[snippet_start:snippet_end] = True
+                segments = self._segment_dicts(row)
+                for seg in segments:
+                    try:
+                        local_start = int(seg.get("start", 0))
+                        local_end = int(seg.get("end", 0))
+                        label_name = str(seg.get("label", fallback_label)).strip().lower()
+                    except Exception:
+                        continue
+                    if local_end <= local_start:
+                        continue
+                    global_start = snippet_start + local_start
+                    global_end = snippet_start + local_end
+                    if global_start < snippet_start or global_end > snippet_end:
+                        valid = False
+                        break
+                    start_byte = offsets[global_start]
+                    end_byte = offsets[global_end]
+                    label_id = int(label_to_id.get(label_name, fallback_id))
+                    labels[start_byte:end_byte] = label_id
+                if not valid:
+                    break
+
+            if not valid or (covered.size > 0 and not bool(np.all(covered))):
+                continue
+
+            x = np.full((int(sequence_bytes),), int(pad_byte_id), dtype=np.int32)
+            y = np.full((int(sequence_bytes),), int(pad_label_id), dtype=np.uint8)
+            x[: byte_buf.size] = byte_buf.astype(np.int32, copy=False)
+            y[: labels.size] = labels
+            sequences.append((x, y))
+            if max_sequences is not None and max_sequences > 0 and len(sequences) >= max_sequences:
+                break
+        return sequences

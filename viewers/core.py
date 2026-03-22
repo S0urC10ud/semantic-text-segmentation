@@ -25,6 +25,14 @@ try:
 except Exception:  # pragma: no cover — orbax version mismatch on some envs
     ocp = None
 from flax import linen as nn
+from inference.backend import (
+    FastInferenceEngine,
+    FastInferenceFailure,
+    available_backends,
+    format_auto_fallback_message,
+    resolve_backend,
+)
+from inference.mamba_cuda import has_cuda_mamba_kernel, selective_scan_inference
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[@-~]")
@@ -1029,6 +1037,7 @@ class MambaBlock1D(nn.Module):
     dropout_rate: float = 0.0
     bidirectional: bool = True
     dtype: jnp.dtype = jnp.bfloat16
+    inference_kernel: str = "default"
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = False) -> jnp.ndarray:
@@ -1082,45 +1091,25 @@ class MambaBlock1D(nn.Module):
         A = -jnp.exp(A_log.astype(jnp.float32))
         D = self.param("D", nn.initializers.ones, (d_inner,), self.dtype).astype(jnp.float32)
 
-        def selective_scan(
-            x_in: jnp.ndarray,
-            dt_in: jnp.ndarray,
-            B_in: jnp.ndarray,
-            C_in: jnp.ndarray,
-        ) -> jnp.ndarray:
-            # Match training: associative scan over affine transforms (faster than lax.scan at long L).
-            x_f32 = x_in.astype(jnp.float32)
-            dt_f32 = dt_in.astype(jnp.float32)
-            B_f32 = B_in.astype(jnp.float32)
-            C_f32 = C_in.astype(jnp.float32)
-
-            x_tm = jnp.swapaxes(x_f32, 0, 1)   # (L,B,d_inner)
-            dt_tm = jnp.swapaxes(dt_f32, 0, 1)  # (L,B,d_inner)
-            B_tm = jnp.swapaxes(B_f32, 0, 1)   # (L,B,d_state)
-            C_tm = jnp.swapaxes(C_f32, 0, 1)   # (L,B,d_state)
-
-            a = jnp.exp(dt_tm[:, :, :, None] * A[None, None, :, :])  # (L,B,d_inner,d_state)
-            b = (
-                x_tm[:, :, :, None]
-                * (dt_tm[:, :, :, None] * B_tm[:, :, None, :])
-            )  # (L,B,d_inner,d_state)
-
-            def combine(left, right):
-                a1, b1 = left
-                a2, b2 = right
-                return a2 * a1, b2 + a2 * b1
-
-            _, state_tm = jax.lax.associative_scan(combine, (a, b), axis=0)
-
-            y_tm = (
-                jnp.sum(state_tm * C_tm[:, :, None, :], axis=-1)
-                + x_tm * D[None, None, :]
-            )
-            return jnp.swapaxes(y_tm, 0, 1)
-
-        y = selective_scan(u, dt, B, C)
+        y = selective_scan_inference(
+            u,
+            dt,
+            B,
+            C,
+            A,
+            D,
+            backend=self.inference_kernel if not train else "default",
+        )
         if self.bidirectional:
-            y_rev = selective_scan(u[:, ::-1, :], dt[:, ::-1, :], B[:, ::-1, :], C[:, ::-1, :])
+            y_rev = selective_scan_inference(
+                u[:, ::-1, :],
+                dt[:, ::-1, :],
+                B[:, ::-1, :],
+                C[:, ::-1, :],
+                A,
+                D,
+                backend=self.inference_kernel if not train else "default",
+            )
             y = y + y_rev[:, ::-1, :]
 
         y = y.astype(self.dtype)
@@ -1147,6 +1136,7 @@ class Mamba1D(nn.Module):
     bidirectional: bool = True
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
+    inference_kernel: str = "default"
 
     @nn.compact
     def __call__(self, tokens: jnp.ndarray, train: bool = False):
@@ -1172,6 +1162,7 @@ class Mamba1D(nn.Module):
                 dropout_rate=float(self.dropout_rate),
                 bidirectional=bool(self.bidirectional),
                 dtype=self.dtype,
+                inference_kernel=str(self.inference_kernel),
             )(h, train=train)
 
         h = nn.LayerNorm(dtype=self.dtype, param_dtype=self.dtype)(h)
@@ -1209,15 +1200,33 @@ class Predictor:
         chunk: int = DEFAULT_CHUNK_SIZE,
         other_threshold: Optional[float] = 0.2,
         inference_batch_size: int = 12,
+        device: Optional[str] = None,
+        inference_backend: str = "auto",
     ):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        backend = resolve_backend(device)
+        available = available_backends()
+        if backend is not None and backend not in available:
+            raise RuntimeError(
+                f"Requested backend '{backend}' not available. Available: {sorted(available)}"
+            )
         self.num_classes = int(num_classes)
-        self.chunk = int(chunk or DEFAULT_CHUNK_SIZE)
+        self.chunk = max(64, int(chunk or DEFAULT_CHUNK_SIZE))
         if self.chunk <= 0:
             raise ValueError("Chunk size must be positive.")
         self.dtype = getattr(jnp, dtype_str)
         self.arch = str(arch).lower().strip()
+        self.backend = backend
+        execution_backend = str(backend or jax.default_backend()).lower().strip()
+        self.inference_backend = str(inference_backend).lower().strip()
+        if self.inference_backend not in {"auto", "fast", "legacy"}:
+            raise ValueError(
+                f"Unknown inference backend '{inference_backend}'. "
+                "Expected one of: auto, fast, legacy."
+            )
+        cuda_kernel_available = False
+        self.fast_model = None
         if self.arch in {"mamba", "mamba1d", "bimamba", "ssm"}:
             self.model = Mamba1D(
                 num_classes=self.num_classes,
@@ -1246,13 +1255,63 @@ class Predictor:
         self.params = _load_params_from_any(ckpt_path, params_template_for_msgpack)
 
         # Precompile apply fn; JIT caches per-seq-length (shape-polymorphic)
-        self._apply = jax.jit(lambda tok: self.model.apply({"params": self.params}, tok, train=False))
+        if (
+            self.arch in {"mamba", "mamba1d", "bimamba", "ssm"}
+            and execution_backend == "gpu"
+            and self.inference_backend in {"auto", "fast"}
+            and has_cuda_mamba_kernel()
+        ):
+            self.fast_model = Mamba1D(
+                num_classes=self.num_classes,
+                d_model=int(self.model.d_model),
+                n_layers=int(self.model.n_layers),
+                d_state=int(self.model.d_state),
+                expand=int(self.model.expand),
+                dt_rank=int(self.model.dt_rank),
+                d_conv=int(self.model.d_conv),
+                bidirectional=bool(self.model.bidirectional),
+                dtype=self.model.dtype,
+                inference_kernel="cuda_fast",
+            )
+            cuda_kernel_available = True
+
+        def _jit_apply(module):
+            apply_fn = lambda tok: module.apply({"params": self.params}, tok, train=False)
+            if backend:
+                return jax.jit(apply_fn, backend=backend)
+            return jax.jit(apply_fn)
+
+        self._apply_legacy = _jit_apply(self.model)
+        self._apply_fast = _jit_apply(self.fast_model) if self.fast_model is not None else self._apply_legacy
+        self._apply = self._apply_legacy
         self._last_window_spans: List[Tuple[int, int]] = []
         # Optional virtual "other" bucket driven by a confidence threshold
         self.other_threshold: Optional[float] = (
             float(other_threshold) if other_threshold is not None and other_threshold > 0.0 else None
         )
         self.inference_batch_size = max(1, int(inference_batch_size))
+        self._fast_engine: Optional[FastInferenceEngine] = None
+        if self.inference_backend in {"auto", "fast"}:
+            self._fast_engine = FastInferenceEngine(
+                apply_tokens=self._apply_fast,
+                num_classes=self.num_classes,
+                pad_token_id=int(PAD_BYTE_ID),
+                chunk_size=self.chunk,
+                batch_size=self.inference_batch_size,
+                sanitize_bytes=_sanitize_model_bytes,
+                sanitize_tokens=_sanitize_model_tokens,
+                arch=self.arch,
+                inference_backend=self.inference_backend,
+                actual_backend=(backend or str(jax.default_backend())),
+                log_fn=lambda message: print(message, flush=True),
+                model_dim=int(model_dim),
+                channels=tuple(channels),
+                mamba_layers=int(mamba_layers),
+                mamba_d_state=int(mamba_d_state),
+                mamba_expand=int(mamba_expand),
+                mamba_bidirectional=bool(mamba_bidirectional),
+                cuda_kernel_available=cuda_kernel_available,
+            )
 
     @staticmethod
     def threshold_predictions(
@@ -1331,7 +1390,7 @@ class Predictor:
             spans = [(0, n)]
         return spans
 
-    def _segment_bytes_batch(
+    def _segment_bytes_batch_legacy(
         self,
         byte_arrays: Sequence[np.ndarray],
         chunk: int = None,
@@ -1340,13 +1399,16 @@ class Predictor:
     ) -> tuple[List[np.ndarray], List[Optional[np.ndarray]], List[Optional[np.ndarray]], List[List[Tuple[int, int]]]]:
         chunk_size = self._resolve_chunk_size(chunk)
         arrays = [_sanitize_model_bytes(np.asarray(arr, dtype=np.uint8)) for arr in byte_arrays]
-        
         final_probs_list: List[Optional[np.ndarray]] = []
         final_max_probs_list: List[Optional[np.ndarray]] = []
         byte_labels: List[np.ndarray] = []
 
         # Internal helper to process a set of windows and accumulate into target arrays
-        def _process_windows(win_refs, target_p_acc, target_w_acc):
+        def _process_windows(
+            win_refs: Sequence[Tuple[int, int, int, np.ndarray]],
+            target_p_acc: np.ndarray,
+            target_w_acc: np.ndarray,
+        ) -> None:
             batch_size = int(self.inference_batch_size)
             for i in range(0, len(win_refs), batch_size):
                 batch = win_refs[i : i + batch_size]
@@ -1356,12 +1418,12 @@ class Predictor:
                     length = min(int(window_bytes.shape[0]), chunk_size)
                     if length > 0:
                         tokens[j, :length] = window_bytes[:length].astype(np.int32)
-                
+
                 tokens = _sanitize_model_tokens(tokens)
-                logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
+                logits = self._apply_legacy(jnp.array(tokens, dtype=jnp.int32))
                 probs_batch = np.asarray(jax.nn.softmax(logits, axis=-1), dtype=np.float32)
                 probs_batch = probs_batch[:actual, :chunk_size]
-                
+
                 for j, (_, start, end, _) in enumerate(batch):
                     plen = int(end) - int(start)
                     if plen <= 0:
@@ -1376,45 +1438,50 @@ class Predictor:
             # If the text is huge and we don't need full probs returned, process it in super-chunks
             # to cap the size of the internal probability accumulation matrix.
             # 512KB * 35 classes * 4 bytes = ~70MB.
-            super_chunk_size = 512 * 1024 
+            super_chunk_size = 512 * 1024
             if L > super_chunk_size and not return_probs:
                 labels_out = np.zeros((L,), dtype=np.uint8)
                 max_probs_out = np.zeros((L,), dtype=np.float32) if return_max_probs else None
-                
+
                 # Overlap of 2x chunk_size ensures window weighting is stable at boundaries
                 overlap = 2 * chunk_size
-                for start in range(0, L, super_chunk_size - overlap):
+                step = max(1, super_chunk_size - overlap)
+                for start in range(0, L, step):
                     end = min(L, start + super_chunk_size)
                     sub_arr = arr[start:end]
                     sub_L = len(sub_arr)
-                    
+
                     sub_spans = self._build_window_spans(sub_L, chunk_size)
                     sub_win_refs = [(0, s, e, sub_arr[s:e]) for s, e in sub_spans]
-                    
+
                     sub_probs = np.zeros((sub_L, self.num_classes), dtype=np.float32)
                     sub_weights = np.zeros((sub_L,), dtype=np.float32)
-                    
+
                     _process_windows(sub_win_refs, sub_probs, sub_weights)
-                    
+
                     nonzero = sub_weights > 0
-                    sub_probs[nonzero] /= sub_weights[nonzero, None]
-                    
+                    if np.any(nonzero):
+                        sub_probs[nonzero] /= sub_weights[nonzero, None]
+                    zero_mask = ~nonzero
+                    if np.any(zero_mask):
+                        sub_probs[zero_mask] = 1.0 / self.num_classes
+
                     sub_labels = np.argmax(sub_probs, axis=-1).astype(np.uint8)
-                    
+
                     # Copy results back, prioritizing the middle parts of super-chunks
                     copy_start_in_sub = 0 if start == 0 else (overlap // 2)
                     copy_start_in_full = start + copy_start_in_sub
                     copy_end_in_full = L if end == L else (start + super_chunk_size - (overlap // 2))
-                    
+
                     copy_len = copy_end_in_full - copy_start_in_full
                     if copy_len > 0:
                         labels_out[copy_start_in_full:copy_end_in_full] = sub_labels[copy_start_in_sub : copy_start_in_sub + copy_len]
                         if return_max_probs:
                             max_probs_out[copy_start_in_full:copy_end_in_full] = np.max(sub_probs[copy_start_in_sub : copy_start_in_sub + copy_len], axis=-1)
-                    
+
                     if end == L:
                         break
-                
+
                 byte_labels.append(labels_out)
                 final_probs_list.append(None)
                 final_max_probs_list.append(max_probs_out)
@@ -1422,18 +1489,18 @@ class Predictor:
                 # Standard single-pass accumulation for smaller arrays or when full probs are requested
                 p_acc = np.zeros((L, self.num_classes), dtype=np.float32)
                 w_acc = np.zeros((L,), dtype=np.float32)
-                
+
                 spans = self._build_window_spans(L, chunk_size)
                 win_refs = [(0, s, e, arr[s:e]) for s, e in spans]
                 _process_windows(win_refs, p_acc, w_acc)
-                
+
                 nonzero = w_acc > 0
                 if np.any(nonzero):
                     p_acc[nonzero] /= w_acc[nonzero, None]
                     p_acc[~nonzero] = 1.0 / self.num_classes
                 else:
                     p_acc[:] = 1.0 / self.num_classes
-                
+
                 byte_labels.append(np.argmax(p_acc, axis=-1).astype(np.uint8))
                 final_max_probs_list.append(np.max(p_acc, axis=-1) if return_max_probs else None)
                 final_probs_list.append(p_acc if return_probs else None)
@@ -1441,12 +1508,88 @@ class Predictor:
         spans_by_text = [self._build_window_spans(int(arr.shape[0]), chunk_size) for arr in arrays]
         return byte_labels, final_probs_list, final_max_probs_list, spans_by_text
 
-    def _segment_bytes(self, byte_arr: np.ndarray, chunk: int = None, return_max_probs: bool = False) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    def _segment_bytes_batch(
+        self,
+        byte_arrays: Sequence[np.ndarray],
+        chunk: int = None,
+        return_probs: bool = True,
+        return_max_probs: bool = False,
+    ) -> tuple[List[np.ndarray], List[Optional[np.ndarray]], List[Optional[np.ndarray]], List[List[Tuple[int, int]]]]:
+        chunk_size = self._resolve_chunk_size(chunk)
+        if chunk_size != self.chunk:
+            raise ValueError(
+                f"Predictor initialized with chunk={self.chunk} but received chunk={chunk_size}."
+            )
+        if self.inference_backend == "legacy" or self._fast_engine is None:
+            return self._segment_bytes_batch_legacy(
+                byte_arrays,
+                chunk=chunk,
+                return_probs=return_probs,
+                return_max_probs=return_max_probs,
+            )
+        try:
+            if not return_probs and not return_max_probs:
+                byte_labels, spans_by_text = self._fast_engine.segment_bytes_batch_labels_only(byte_arrays)
+                none_probs = [None for _ in byte_labels]
+                none_max_probs = [None for _ in byte_labels]
+                return byte_labels, none_probs, none_max_probs, spans_by_text
+
+            byte_labels, byte_probs, spans_by_text = self._fast_engine.segment_bytes_batch(byte_arrays)
+            probs_out: List[Optional[np.ndarray]] = byte_probs if return_probs else [None for _ in byte_labels]
+            max_probs_out: List[Optional[np.ndarray]] = (
+                [np.max(probs, axis=-1).astype(np.float32) if probs.size > 0 else np.zeros((0,), dtype=np.float32) for probs in byte_probs]
+                if return_max_probs
+                else [None for _ in byte_labels]
+            )
+            return byte_labels, probs_out, max_probs_out, spans_by_text
+        except FastInferenceFailure as exc:
+            if self.inference_backend == "auto":
+                print(
+                    format_auto_fallback_message(
+                        from_path=exc.source_path,
+                        to_path="legacy",
+                        trigger=exc.trigger,
+                        reason=exc.reason,
+                    ),
+                    flush=True,
+                )
+                return self._segment_bytes_batch_legacy(
+                    byte_arrays,
+                    chunk=chunk,
+                    return_probs=return_probs,
+                    return_max_probs=return_max_probs,
+                )
+            raise
+        except Exception as exc:
+            if self.inference_backend == "auto":
+                print(
+                    format_auto_fallback_message(
+                        from_path="fast",
+                        to_path="legacy",
+                        trigger="runtime_error",
+                        reason=str(exc),
+                    ),
+                    flush=True,
+                )
+                return self._segment_bytes_batch_legacy(
+                    byte_arrays,
+                    chunk=chunk,
+                    return_probs=return_probs,
+                    return_max_probs=return_max_probs,
+                )
+            raise
+
+    def _segment_bytes(
+        self,
+        byte_arr: np.ndarray,
+        chunk: int = None,
+        return_max_probs: bool = False,
+    ) -> tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         byte_labels, byte_probs, max_probs, spans_by_text = self._segment_bytes_batch(
-            [byte_arr], 
-            chunk=chunk, 
-            return_probs=not return_max_probs, # If we want max_probs, we might be able to discard full probs
-            return_max_probs=return_max_probs
+            [byte_arr],
+            chunk=chunk,
+            return_probs=not return_max_probs,
+            return_max_probs=return_max_probs,
         )
         self._last_window_spans = list(spans_by_text[0]) if spans_by_text else []
         return byte_labels[0], byte_probs[0], max_probs[0]
@@ -1501,7 +1644,7 @@ class Predictor:
         windows_info = self._build_windows_info(text, spans)
         return segs, char_labels, char_probs, windows_info
 
-    def predict_logits(self, token_batch: np.ndarray) -> np.ndarray:
+    def _predict_logits_legacy(self, token_batch: np.ndarray) -> np.ndarray:
         """
         Run the model on a batch of token windows. Accepts shape (batch, <=chunk)
         (or a single 1-D window) of int32 tokens and returns logits with shape
@@ -1520,8 +1663,40 @@ class Predictor:
             padded[:, :length] = arr
             arr = padded
         arr = _sanitize_model_tokens(arr)
-        logits = self._apply(jnp.array(arr, dtype=jnp.int32))
+        logits = self._apply_legacy(jnp.array(arr, dtype=jnp.int32))
         return np.asarray(logits, dtype=np.float32)
+
+    def predict_logits(self, token_batch: np.ndarray) -> np.ndarray:
+        if self.inference_backend == "legacy" or self._fast_engine is None:
+            return self._predict_logits_legacy(token_batch)
+        try:
+            return self._fast_engine.predict_logits(token_batch)
+        except FastInferenceFailure as exc:
+            if self.inference_backend == "auto":
+                print(
+                    format_auto_fallback_message(
+                        from_path=exc.source_path,
+                        to_path="legacy",
+                        trigger=exc.trigger,
+                        reason=exc.reason,
+                    ),
+                    flush=True,
+                )
+                return self._predict_logits_legacy(token_batch)
+            raise
+        except Exception as exc:
+            if self.inference_backend == "auto":
+                print(
+                    format_auto_fallback_message(
+                        from_path="fast",
+                        to_path="legacy",
+                        trigger="runtime_error",
+                        reason=str(exc),
+                    ),
+                    flush=True,
+                )
+                return self._predict_logits_legacy(token_batch)
+            raise
 
     def _byte_labels_to_char_labels(self, text: str, byte_labels: np.ndarray, byte_probs: np.ndarray = None) -> tuple[List[int], List[Dict[str, float]]]:
         labels: List[int] = []

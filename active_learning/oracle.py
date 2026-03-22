@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+import difflib
 import json
 import os
 import re
@@ -96,6 +98,8 @@ _RATE_LIMIT_MAX_RETRIES = 8
 _MISSING_SNIPPET_RECOVERY_RETRIES = 2
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _OPENROUTER_APP_NAME_DEFAULT = "text-segmentation"
+_APPROX_TEXT_MATCH_MAX_EDIT_DISTANCE = 200
+_APPROX_TEXT_MATCH_RELATIVE_DISTANCE = 0.05
 
 
 @dataclass(frozen=True)
@@ -556,6 +560,7 @@ class GeminiBoundaryOracle:
         show_progress: bool = False,
         progress_desc: str = "oracle batches",
         progress_leave: bool = False,
+        max_parallel_requests: int = 1,
     ) -> None:
         self.model = str(model)
         self.thinking_level = self._normalize_thinking_level(thinking_level)
@@ -566,6 +571,7 @@ class GeminiBoundaryOracle:
         self.show_progress = bool(show_progress)
         self.progress_desc = str(progress_desc or "oracle batches")
         self.progress_leave = bool(progress_leave)
+        self.max_parallel_requests = max(1, int(max_parallel_requests))
         self.allowed_labels = list(ALLOWED_LABELS_BY_ID)
         self.last_batches: List[Dict[str, object]] = []
         self.last_snippet_sources: Dict[str, str] = {}
@@ -645,8 +651,7 @@ class GeminiBoundaryOracle:
         out: Dict[str, List[OracleSegment]] = {}
         self.last_batches = []
         self.last_snippet_sources = {}
-        starts = range(0, len(snippets), self.batch_size)
-        iterator = starts
+        starts = list(range(0, len(snippets), self.batch_size))
         progress_bar = None
         processed_snippets = 0
         cumulative_failed = 0
@@ -661,34 +666,77 @@ class GeminiBoundaryOracle:
         if self.show_progress and _tqdm is not None and len(snippets) > 0:
             total_batches = int((len(snippets) + self.batch_size - 1) // self.batch_size)
             progress_bar = _tqdm(
-                starts,
                 total=total_batches,
                 desc=self.progress_desc,
                 unit="batch",
                 dynamic_ncols=True,
                 leave=self.progress_leave,
             )
-            iterator = progress_bar
-        for start in iterator:
-            batch = list(snippets[start : start + self.batch_size])
-            batch_result, snippet_sources, batch_info = self._annotate_batch(batch)
-            out.update(batch_result)
-            self.last_snippet_sources.update(snippet_sources)
-            self.last_batches.append(batch_info)
-            processed_snippets += int(len(batch))
-            cumulative_failed += int(
-                sum(1 for state in snippet_sources.values() if str(state) in failed_states)
-            )
-            cumulative_skipped += int(
-                sum(1 for state in snippet_sources.values() if str(state) != "model")
-            )
-            if progress_bar is not None:
-                progress_bar.set_postfix(
-                    failed=int(cumulative_failed),
-                    skipped=int(cumulative_skipped),
-                    ok=int(max(0, processed_snippets - cumulative_skipped)),
-                    refresh=False,
+        parallel_requests = min(max(1, int(getattr(self, "max_parallel_requests", 1))), len(starts))
+        if parallel_requests <= 1 or len(starts) <= 1:
+            for start in starts:
+                batch = list(snippets[start : start + self.batch_size])
+                batch_result, snippet_sources, batch_info = self._annotate_batch(batch)
+                out.update(batch_result)
+                self.last_snippet_sources.update(snippet_sources)
+                self.last_batches.append(batch_info)
+                processed_snippets += int(len(batch))
+                cumulative_failed += int(
+                    sum(1 for state in snippet_sources.values() if str(state) in failed_states)
                 )
+                cumulative_skipped += int(
+                    sum(1 for state in snippet_sources.values() if str(state) != "model")
+                )
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(
+                        failed=int(cumulative_failed),
+                        skipped=int(cumulative_skipped),
+                        ok=int(max(0, processed_snippets - cumulative_skipped)),
+                        parallel=int(parallel_requests),
+                        refresh=False,
+                    )
+        else:
+            indexed_batches = [
+                (idx, list(snippets[start : start + self.batch_size]))
+                for idx, start in enumerate(starts)
+            ]
+            results_by_index: Dict[int, tuple[Dict[str, List[OracleSegment]], Dict[str, str], Dict[str, object], int]] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_requests) as executor:
+                future_to_index = {
+                    executor.submit(self._annotate_batch, batch): (idx, len(batch))
+                    for idx, batch in indexed_batches
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    idx, batch_len = future_to_index[future]
+                    batch_result, snippet_sources, batch_info = future.result()
+                    results_by_index[int(idx)] = (
+                        batch_result,
+                        snippet_sources,
+                        batch_info,
+                        int(batch_len),
+                    )
+                    processed_snippets += int(batch_len)
+                    cumulative_failed += int(
+                        sum(1 for state in snippet_sources.values() if str(state) in failed_states)
+                    )
+                    cumulative_skipped += int(
+                        sum(1 for state in snippet_sources.values() if str(state) != "model")
+                    )
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                        progress_bar.set_postfix(
+                            failed=int(cumulative_failed),
+                            skipped=int(cumulative_skipped),
+                            ok=int(max(0, processed_snippets - cumulative_skipped)),
+                            parallel=int(parallel_requests),
+                            refresh=False,
+                        )
+            for idx in range(len(indexed_batches)):
+                batch_result, snippet_sources, batch_info, _ = results_by_index[idx]
+                out.update(batch_result)
+                self.last_snippet_sources.update(snippet_sources)
+                self.last_batches.append(batch_info)
         if progress_bar is not None:
             progress_bar.close()
         return out
@@ -792,7 +840,13 @@ class GeminiBoundaryOracle:
         )
         if exact is not None:
             return exact
-        return GeminiBoundaryOracle._segments_from_text_chunks_relaxed_whitespace(
+        relaxed = GeminiBoundaryOracle._segments_from_text_chunks_relaxed_whitespace(
+            snippet_text,
+            segs_raw,
+        )
+        if relaxed is not None:
+            return relaxed
+        return GeminiBoundaryOracle._segments_from_text_chunks_fuzzy(
             snippet_text,
             segs_raw,
         )
@@ -922,6 +976,168 @@ class GeminiBoundaryOracle:
                 raw_label=label,
             )
         ]
+
+    @staticmethod
+    def _approx_text_match_threshold(
+        snippet_text: str,
+        reconstructed_text: str,
+    ) -> int:
+        max_len = max(len(snippet_text), len(reconstructed_text))
+        if max_len <= 0:
+            return 0
+        relative_limit = int(max_len * _APPROX_TEXT_MATCH_RELATIVE_DISTANCE)
+        return max(8, min(_APPROX_TEXT_MATCH_MAX_EDIT_DISTANCE, relative_limit))
+
+    @staticmethod
+    def _bounded_levenshtein_distance(
+        source_text: str,
+        target_text: str,
+        *,
+        max_distance: int,
+    ) -> Optional[int]:
+        a = str(source_text)
+        b = str(target_text)
+        limit = max(0, int(max_distance))
+        if a == b:
+            return 0
+        if abs(len(a) - len(b)) > limit:
+            return None
+        n = len(a)
+        m = len(b)
+        inf = limit + 1
+        previous = [inf] * (m + 1)
+        for j in range(min(m, limit) + 1):
+            previous[j] = j
+        for i in range(1, n + 1):
+            current = [inf] * (m + 1)
+            lo = max(1, i - limit)
+            hi = min(m, i + limit)
+            if lo == 1:
+                current[0] = i
+            row_best = inf
+            for j in range(lo, hi + 1):
+                substitution_cost = 0 if a[i - 1] == b[j - 1] else 1
+                current[j] = min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + substitution_cost,
+                )
+                if current[j] < row_best:
+                    row_best = current[j]
+            if row_best > limit:
+                return None
+            previous = current
+        return previous[m] if previous[m] <= limit else None
+
+    @staticmethod
+    def _map_fuzzy_boundary_to_original(
+        boundary: int,
+        *,
+        opcodes: Sequence[tuple[str, int, int, int, int]],
+        original_len: int,
+        reconstructed_len: int,
+    ) -> int:
+        boundary = max(0, min(int(reconstructed_len), int(boundary)))
+        if boundary <= 0:
+            return 0
+        if boundary >= int(reconstructed_len):
+            return int(original_len)
+        for tag, i1, i2, j1, j2 in opcodes:
+            if boundary < i1:
+                return int(j1)
+            if i1 <= boundary <= i2:
+                if tag == "equal":
+                    return int(j1 + (boundary - i1))
+                if i2 == i1:
+                    return int(j2)
+                span_a = int(i2 - i1)
+                span_b = int(j2 - j1)
+                offset = int(boundary - i1)
+                mapped = int(round(j1 + (offset * span_b) / max(1, span_a)))
+                return max(0, min(int(original_len), mapped))
+        return int(original_len)
+
+    @staticmethod
+    def _segments_from_text_chunks_fuzzy(
+        snippet_text: str,
+        segs_raw: Sequence[object],
+    ) -> Optional[List[OracleSegment]]:
+        if not isinstance(snippet_text, str):
+            return None
+        prepared: List[tuple[str, str]] = []
+        for seg in segs_raw:
+            if not isinstance(seg, dict):
+                return None
+            seg_text = seg.get("text")
+            if not isinstance(seg_text, str):
+                return None
+            if not seg_text:
+                continue
+            prepared.append((str(seg.get("label", "other")), seg_text))
+        if not prepared:
+            return []
+
+        reconstructed_text = "".join(seg_text for _, seg_text in prepared)
+        threshold = GeminiBoundaryOracle._approx_text_match_threshold(
+            snippet_text,
+            reconstructed_text,
+        )
+        if threshold <= 0:
+            return None
+        distance = GeminiBoundaryOracle._bounded_levenshtein_distance(
+            reconstructed_text,
+            snippet_text,
+            max_distance=threshold,
+        )
+        if distance is None:
+            return None
+
+        matcher = difflib.SequenceMatcher(
+            a=reconstructed_text,
+            b=snippet_text,
+            autojunk=False,
+        )
+        opcodes = matcher.get_opcodes()
+        original_len = len(snippet_text)
+        reconstructed_len = len(reconstructed_text)
+        reconstructed_boundaries = [0]
+        cursor = 0
+        for _, seg_text in prepared:
+            cursor += len(seg_text)
+            reconstructed_boundaries.append(cursor)
+        mapped_boundaries = [
+            GeminiBoundaryOracle._map_fuzzy_boundary_to_original(
+                boundary,
+                opcodes=opcodes,
+                original_len=original_len,
+                reconstructed_len=reconstructed_len,
+            )
+            for boundary in reconstructed_boundaries
+        ]
+        if mapped_boundaries:
+            mapped_boundaries[0] = 0
+            mapped_boundaries[-1] = int(original_len)
+        for idx in range(1, len(mapped_boundaries)):
+            if mapped_boundaries[idx] < mapped_boundaries[idx - 1]:
+                mapped_boundaries[idx] = mapped_boundaries[idx - 1]
+
+        out: List[OracleSegment] = []
+        for idx, (label, _) in enumerate(prepared):
+            start = int(mapped_boundaries[idx])
+            end = int(mapped_boundaries[idx + 1])
+            if end <= start:
+                continue
+            out.append(
+                OracleSegment(
+                    start=start,
+                    end=end,
+                    label=label,
+                    raw_label=label,
+                )
+            )
+        if not out:
+            return None
+        return out
 
     @staticmethod
     def _parse_segments_payload(
@@ -1386,6 +1602,8 @@ class GeminiBoundaryOracle:
             "Return valid JSON with this schema:\n"
             "{'snippets':[{'snippet_id':str,'segments':[{'label':str,'text':str}]}]}.\n"
             "Rules:\n"
+            "- Return exactly one entry for every provided snippet_id, and include every snippet_id exactly once.\n"
+            "- If you omit any snippet_id, the whole request is considered incomplete.\n"
             "- Prefer segmenting by exact text chunks: provide `text` and `label` for each segment in order.\n"
             "- `text` must be exact substring bytes from snippet text; concatenating all segment texts must equal snippet text exactly.\n"
             "- Segments must cover full snippet text exactly once (after merge), in order, without overlap.\n"
@@ -1504,16 +1722,24 @@ class GeminiBoundaryOracle:
             "  ]\n"
             "- Keep tiny foreign-code injections typed correctly when boundaries clearly indicate a switch.\n"
             "- Use predicted_segments as a strong prior unless clearly contradicted by snippet text.\n"
+            "- If `full_file_mode` is true, the input text is a full training/eval sample rather than a tiny local snippet. "
+            "In that case, return a segmentation for the entire text and treat `trigger_ranges` only as hints about where the "
+            "model seemed most uncertain.\n"
             "- Return exactly one entry for every input snippet_id; never omit any snippet_id.\n"
             "- Output JSON only.\n"
         )
         payload: List[Dict[str, object]] = []
         for snippet in snippets:
+            trigger_ranges = snippet.metadata.get("trigger_ranges")
+            if not isinstance(trigger_ranges, list):
+                trigger_ranges = []
             payload.append(
                 {
                     "snippet_id": snippet.snippet_id,
                     "source_lang": str(snippet.metadata.get("source_lang", "")),
+                    "full_file_mode": bool(snippet.metadata.get("full_file_mode", False)),
                     "boundary_index": int(snippet.boundary),
+                    "trigger_ranges": trigger_ranges,
                     "predicted_segments": [
                         {"start": int(seg.start), "end": int(seg.end), "label": str(seg.label)}
                         for seg in _segments_from_labels(snippet.predicted_labels)

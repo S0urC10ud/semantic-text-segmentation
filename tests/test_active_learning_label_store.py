@@ -286,6 +286,126 @@ class TestLabelStore(unittest.TestCase):
             )
             self.assertEqual(len(all_windows), 2)
 
+    def test_build_training_sequences_reconstructs_full_sample_and_excludes_monitor_b(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "al.sqlite"
+            store = LabelStore(db_path)
+
+            store.add_inference_samples_many(
+                [
+                    StoredInferenceSample(
+                        round_id="r1",
+                        source_split="train",
+                        source_lang="python",
+                        sample_index=0,
+                        sample_hash="hash_full",
+                        sample_text="abcdEF",
+                        char_count=6,
+                        queried_for_oracle=True,
+                        candidate_count=2,
+                        trigger_ranges=[],
+                        predicted_segments=[],
+                        metadata={"full_file_mode": True},
+                    ),
+                    StoredInferenceSample(
+                        round_id="r1",
+                        source_split="monitor_b",
+                        source_lang="python",
+                        sample_index=1,
+                        sample_hash="hash_monitor_b_full",
+                        sample_text="WXYZ",
+                        char_count=4,
+                        queried_for_oracle=True,
+                        candidate_count=1,
+                        trigger_ranges=[],
+                        predicted_segments=[],
+                        metadata={"full_file_mode": True},
+                    ),
+                ]
+            )
+
+            store.add_many(
+                [
+                    StoredRefinement(
+                        round_id="r1",
+                        source_split="train",
+                        source_lang="python",
+                        sample_index=0,
+                        sample_hash="hash_full",
+                        boundary_index=2,
+                        snippet_start=0,
+                        snippet_end=3,
+                        snippet_text="abc",
+                        oracle_name="stub",
+                        oracle_model="stub",
+                        oracle_run_id="",
+                        status="ok",
+                        acquisition_score=1.0,
+                        predicted_segments=[],
+                        refined_segments=[{"start": 0, "end": 3, "label": "python"}],
+                        metadata={"full_file_mode": True},
+                    ),
+                    StoredRefinement(
+                        round_id="r1",
+                        source_split="train",
+                        source_lang="python",
+                        sample_index=0,
+                        sample_hash="hash_full",
+                        boundary_index=4,
+                        snippet_start=3,
+                        snippet_end=6,
+                        snippet_text="dEF",
+                        oracle_name="stub",
+                        oracle_model="stub",
+                        oracle_run_id="",
+                        status="ok",
+                        acquisition_score=1.0,
+                        predicted_segments=[],
+                        refined_segments=[
+                            {"start": 0, "end": 1, "label": "python"},
+                            {"start": 1, "end": 3, "label": "sql"},
+                        ],
+                        metadata={"full_file_mode": True},
+                    ),
+                    StoredRefinement(
+                        round_id="r1",
+                        source_split="monitor_b",
+                        source_lang="python",
+                        sample_index=1,
+                        sample_hash="hash_monitor_b_full",
+                        boundary_index=2,
+                        snippet_start=0,
+                        snippet_end=4,
+                        snippet_text="WXYZ",
+                        oracle_name="stub",
+                        oracle_model="stub",
+                        oracle_run_id="",
+                        status="ok",
+                        acquisition_score=1.0,
+                        predicted_segments=[],
+                        refined_segments=[{"start": 0, "end": 4, "label": "python"}],
+                        metadata={"full_file_mode": True},
+                    ),
+                ]
+            )
+
+            sequences = store.build_training_sequences(
+                sequence_bytes=8,
+                pad_byte_id=0,
+                pad_label_id=255,
+                label_to_id={"python": 0, "sql": 1, "other": 2},
+                max_sequences=10,
+                fallback_label="other",
+            )
+
+            self.assertEqual(len(sequences), 1)
+            seq_x, seq_y = sequences[0]
+            self.assertEqual(bytes(seq_x[:6].tolist()), b"abcdEF")
+            np.testing.assert_array_equal(
+                seq_y[:6],
+                np.array([0, 0, 0, 0, 1, 1], dtype=np.uint8),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

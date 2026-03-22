@@ -4,13 +4,19 @@ Utilities for loading the preprocessed monitor set (memmap) and running fast eva
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+try:
+    from tqdm.auto import tqdm as _tqdm  # type: ignore
+except Exception:
+    _tqdm = None
 import utils.config as cfg
+from utils.full_sequence import build_monitor_file_sequence
 from utils.metrics_helper import (
     _forward_logits,
     _valid_metric_mask,
@@ -155,6 +161,7 @@ def evaluate_monitor_set(
     other_threshold: float = 0.0,
     deterministic: bool = False,
     deterministic_seed: int = 123,
+    full_files: bool = False,
 ) -> Dict[str, Any]:
     if eval_step_fn is None:
         raise ValueError("evaluate_monitor_set requires eval_step_fn=eval_step")
@@ -193,12 +200,22 @@ def evaluate_monitor_set(
             (cfg.NUM_CLASSES + 1, cfg.NUM_CLASSES + 1), dtype=np.int64
         )
     skipped = 0
+    flushed_batches = 0
 
     xb_batch: list[np.ndarray] = []
     yb_batch: list[np.ndarray] = []
+    progress_bar = None
+    if _tqdm is not None and len(indices) > 0 and sys.stderr.isatty():
+        progress_bar = _tqdm(
+            total=int(len(indices)),
+            desc="Monitor eval full-file" if bool(full_files) else "Monitor eval",
+            unit="file",
+            dynamic_ncols=True,
+            leave=True,
+        )
 
     def _flush_batch(batch_rng):
-        nonlocal xb_batch, yb_batch
+        nonlocal xb_batch, yb_batch, flushed_batches
         if not xb_batch:
             return
         xb = np.stack(xb_batch)
@@ -232,6 +249,7 @@ def evaluate_monitor_set(
             logits = _forward_logits(state, xb_jnp, logits_rng)
         losses.append(float(loss))
         accs.append(float(acc))
+        flushed_batches += 1
         logits_np = np.asarray(logits)
         preds = np.asarray(np.argmax(logits_np, axis=-1), dtype=np.int32)
         y_true = yb.astype(np.int32)
@@ -270,22 +288,53 @@ def evaluate_monitor_set(
                 )
         xb_batch = []
         yb_batch = []
+        if progress_bar is not None:
+            progress_bar.set_postfix(
+                {
+                    "batches": int(flushed_batches),
+                    "skipped": int(skipped),
+                    "loss": f"{float(losses[-1]):.4f}",
+                },
+                refresh=False,
+            )
 
-    for idx in indices:
-        window = _build_window(files, segments, contents, int(idx), L, np_rng)
-        if window is None:
-            skipped += 1
-            continue
-        xb, yb = window
-        xb_batch.append(xb)
-        yb_batch.append(yb)
-        if len(xb_batch) == batch_size:
+    try:
+        for idx in indices:
+            if full_files:
+                xb, yb, _ = build_monitor_file_sequence(
+                    files,
+                    contents,
+                    segments,
+                    int(idx),
+                    target_len=int(L),
+                    pad_byte_id=int(cfg.PAD_BYTE_ID),
+                    pad_label_id=int(cfg.PAD_ID),
+                    rng=np_rng,
+                    random_crop=False,
+                )
+                window = (sanitize_tokens(xb), yb)
+            else:
+                window = _build_window(files, segments, contents, int(idx), L, np_rng)
+            if window is None:
+                skipped += 1
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                continue
+            xb, yb = window
+            xb_batch.append(xb)
+            yb_batch.append(yb)
+            if len(xb_batch) == batch_size:
+                eval_rng, batch_rng = jax.random.split(eval_rng)
+                _flush_batch(batch_rng)
+            if progress_bar is not None:
+                progress_bar.update(1)
+
+        if xb_batch:
             eval_rng, batch_rng = jax.random.split(eval_rng)
             _flush_batch(batch_rng)
-
-    if xb_batch:
-        eval_rng, batch_rng = jax.random.split(eval_rng)
-        _flush_batch(batch_rng)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
 
     import numpy as _np
 

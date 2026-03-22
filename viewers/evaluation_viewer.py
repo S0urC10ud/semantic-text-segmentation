@@ -14,7 +14,6 @@ import argparse
 import colorsys
 import json
 import random
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -36,12 +35,11 @@ if str(TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAIN_ROOT))
 
 import utils.config as cfg  # noqa: E402
-from utils.model import (  # noqa: E402
-    UNet1D,
-    checkpoint_params_subtree,
-    merge_compatible_state,
+from viewers.core import (  # noqa: E402
+    Predictor,
+    _infer_checkpoint_architecture as _shared_infer_checkpoint_architecture,
+    _load_checkpoint_hparams as _shared_load_checkpoint_hparams,
 )
-from utils.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -70,6 +68,7 @@ DEFAULT_COLOR_BY_LABEL: Dict[str, str] = {
     "markdown": "#00cec9",
     "encoding_base64": "#fdcb6e",
     "encoding_hex": "#6c5ce7",
+    "other": "#7f8c8d",
 }
 
 DEFAULT_CHANNELS: Tuple[int, ...] = (96, 128, 192, 256)
@@ -129,9 +128,20 @@ def _build_sample_palette(labels: Sequence[str], include_unknown: bool = True) -
         r, g, b = colorsys.hls_to_rgb(hue, lig, sat)
         palette[label] = "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
 
+    if "other" in seen:
+        palette["other"] = DEFAULT_COLOR_BY_LABEL["other"]
+
     if include_unknown:
         palette["__unknown__"] = "#b2bec3"
     return palette
+
+
+def _prediction_label_from_id(label_id: int, *, num_classes: int, unknown_label: str) -> str:
+    if int(label_id) == int(num_classes):
+        return "other"
+    name = cfg.ID2LANG.get(int(label_id), unknown_label)
+    mapped = PREDICTION_LABEL_ALIASES.get(name, name)
+    return mapped if mapped else unknown_label
 
 
 def _relabel_whitespace_from_neighbors(
@@ -274,79 +284,8 @@ def _normalize_segments(segments) -> List[Dict[str, int]]:
         return normalized
     raise TypeError(f"Unsupported segments type: {type(segments)}")
 
-
-def _extract_run_id_from_checkpoint(path: Path) -> Optional[str]:
-    name = path.name.lower()
-    match = re.search(r"([a-z0-9]{8})", name)
-    if not match:
-        return None
-    return match.group(1)
-
-
 def _load_checkpoint_hparams(ckpt_path: Path) -> Dict[str, object]:
-    run_id = _extract_run_id_from_checkpoint(ckpt_path)
-    if not run_id:
-        return {}
-    wandb_root = REPO_ROOT / "train" / "wandb"
-    if not wandb_root.exists():
-        return {}
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        return {}
-    pattern = f"run-*-{run_id}"
-    for run_dir in wandb_root.glob(pattern):
-        config_path = run_dir / "files" / "config.yaml"
-        if not config_path.exists():
-            continue
-        try:
-            config_data = yaml.safe_load(config_path.read_text())
-        except Exception:
-            config_data = None
-        if not isinstance(config_data, dict):
-            config_data = {}
-        result: Dict[str, object] = {}
-        channels_val = config_data.get("channels", {}).get("value")
-        if isinstance(channels_val, (list, tuple)):
-            try:
-                result["channels"] = [int(x) for x in channels_val]
-            except (TypeError, ValueError):
-                pass
-        model_dim_val = config_data.get("model_dim", {}).get("value")
-        if isinstance(model_dim_val, (int, float)):
-            result["model_dim"] = int(model_dim_val)
-        dtype_val = config_data.get("dtype", {}).get("value")
-        if isinstance(dtype_val, str):
-            result["dtype"] = dtype_val.rsplit(".", 1)[-1]
-
-        summary_path = run_dir / "files" / "wandb-summary.json"
-        if summary_path.exists():
-            try:
-                summary_data = json.loads(summary_path.read_text())
-            except Exception:
-                summary_data = None
-            if isinstance(summary_data, dict):
-                label_names: Dict[int, str] = {}
-                prefix = "val/per_class/"
-                for key in summary_data.keys():
-                    if not key.startswith(prefix):
-                        continue
-                    remainder = key[len(prefix):]
-                    head = remainder.split("/", 1)[0]
-                    if "_" not in head:
-                        continue
-                    idx_str, label = head.split("_", 1)
-                    try:
-                        idx = int(idx_str)
-                    except ValueError:
-                        continue
-                    label_names[idx] = label
-                if label_names:
-                    ordered = [label_names[i] for i in sorted(label_names)]
-                    result["label_names"] = ordered
-        if result:
-            return result
-    return {}
+    return dict(_shared_load_checkpoint_hparams(ckpt_path))
 
 
 def _apply_label_mapping(label_names: Sequence[str]) -> None:
@@ -451,261 +390,62 @@ class SegmenterRunner:
         self,
         checkpoint_path: str,
         *,
+        arch: str = "unet1d",
         model_dim: int,
         channels: Sequence[int],
+        mamba_layers: int = 6,
+        mamba_d_state: int = 8,
+        mamba_expand: int = 1,
+        mamba_dt_rank: int = 16,
+        mamba_conv: int = 4,
+        mamba_bidirectional: bool = True,
         dtype: str,
         chunk: int = DEFAULT_CHUNK_SIZE,
         device: Optional[str],
+        inference_backend: str = "auto",
+        other_threshold: float = 0.85,
     ):
-        try:
-            backend = _resolve_backend(device)
-            available = {dev.platform for dev in jax.devices()}
-            if backend and backend not in available:
-                print(f"⚠️  Requested backend '{backend}' not available. Found: {sorted(available)}. Falling back to CPU.", flush=True)
-                backend = "cpu"
-            self.backend = backend
-            chunk_val = int(chunk or DEFAULT_CHUNK_SIZE)
-            if chunk_val <= 0:
-                raise ValueError("Chunk size must be positive.")
-            self.chunk = max(64, chunk_val)
-            self.num_classes = cfg.NUM_CLASSES
-            dt = getattr(jnp, dtype)
-
-            # Configure JAX to use 32-bit matmul precision for better numerical stability
-            jax.config.update('jax_default_matmul_precision', 'float32')
-
-            self.model = UNet1D(num_classes=self.num_classes, emb_dim=model_dim, channels=tuple(channels), dtype=dt)
-            dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
-            variables = self.model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
-            params_template = variables["params"]
-            self.params = self._load_params(checkpoint_path, params_template)
-        except Exception as e:
-            print(f"⚠️  Error initializing model: {e}. Trying with CPU backend.", flush=True)
-            self.backend = "cpu"
-            chunk_val = int(chunk or DEFAULT_CHUNK_SIZE)
-            if chunk_val <= 0:
-                raise ValueError("Chunk size must be positive.")
-            self.chunk = max(64, chunk_val)
-            self.num_classes = cfg.NUM_CLASSES
-            dt = getattr(jnp, dtype)
-
-            # Configure JAX to use 32-bit matmul precision for better numerical stability
-            jax.config.update('jax_default_matmul_precision', 'float32')
-
-            self.model = UNet1D(num_classes=self.num_classes, emb_dim=model_dim, channels=tuple(channels), dtype=dt)
-            dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
-            variables = self.model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
-            params_template = variables["params"]
-            self.params = self._load_params(checkpoint_path, params_template)
-
-        def apply_fn(tokens: jnp.ndarray):
-            return self.model.apply({"params": self.params}, tokens, train=False)
-
-        self._apply = jax.jit(apply_fn, backend=backend) if backend else jax.jit(apply_fn)
-
-    @staticmethod
-    def _looks_like_orbax(path: Path) -> bool:
-        if not path.is_dir():
-            return False
-        names = {p.name for p in path.iterdir()}
-        return bool({"manifest.ocdbt", "_CHECKPOINT_METADATA", "ocdbt.process_0", "_METADATA"} & names)
-
-    @classmethod
-    def _find_orbax_step(cls, root: Path) -> Optional[Path]:
-        if cls._looks_like_orbax(root):
-            return root
-        if not root.exists() or not root.is_dir():
-            return None
-        candidates = []
-        for entry in root.iterdir():
-            if cls._looks_like_orbax(entry):
-                name = entry.name
-                try:
-                    step = int(name.rsplit("-", 1)[-1])
-                except Exception:
-                    step = -1
-                candidates.append((step, name, entry))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        return candidates[-1][2]
-
-    @classmethod
-    def _load_params(cls, ckpt_path: str, template):
-        import flax.serialization as serialization
-        import optax
-        import orbax.checkpoint as ocp
-        from flax.training import train_state as ts
-
-        path = Path(ckpt_path).resolve()
-        if path.is_file():
-            data = path.read_bytes()
-            try:
-                return serialization.from_bytes(template, data)
-            except Exception:
-                try:
-                    tmp = serialization.from_bytes({"params": template}, data)
-                    return tmp["params"]
-                except Exception:
-                    restored = serialization.msgpack_restore(data)
-                    params, _ = merge_compatible_state(
-                        template,
-                        checkpoint_params_subtree(restored),
-                    )
-                    return params
-
-        step_dir = cls._find_orbax_step(path)
-        if step_dir is None:
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        ckptr = ocp.StandardCheckpointer()
-        step_str = step_dir.resolve().as_posix()
-        try:
-            restored = ckptr.restore(step_str)
-            params, _ = merge_compatible_state(
-                template,
-                checkpoint_params_subtree(restored),
-            )
-            return params
-        except Exception:
-            pass
-        try:
-            restored = ckptr.restore(step_str, target={"params": template}, strict=False)
-            params, _ = merge_compatible_state(
-                template,
-                checkpoint_params_subtree(restored),
-            )
-            return params
-        except Exception:
-            pass
-        dummy = ts.TrainState.create(apply_fn=lambda *a, **k: None, params=template, tx=optax.identity())
-        restored = ckptr.restore(step_str, target=dummy, strict=False)
-        params, _ = merge_compatible_state(
-            template,
-            checkpoint_params_subtree(restored),
+        jax.config.update("jax_default_matmul_precision", "float32")
+        self.predictor = Predictor(
+            ckpt_path=checkpoint_path,
+            num_classes=int(cfg.NUM_CLASSES),
+            model_dim=int(model_dim),
+            channels=tuple(int(ch) for ch in channels),
+            arch=str(arch).lower().strip(),
+            mamba_layers=int(mamba_layers),
+            mamba_d_state=int(mamba_d_state),
+            mamba_expand=int(mamba_expand),
+            mamba_dt_rank=int(mamba_dt_rank),
+            mamba_conv=int(mamba_conv),
+            mamba_bidirectional=bool(mamba_bidirectional),
+            dtype_str=str(dtype),
+            chunk=int(chunk),
+            other_threshold=float(other_threshold),
+            inference_batch_size=16,
+            device=device,
+            inference_backend=inference_backend,
         )
-        return params
-
-    def _segment_bytes(self, byte_arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        byte_arr = sanitize_bytes(byte_arr)
-        total = int(len(byte_arr))
-        if total == 0:
-            empty = np.zeros((0,), dtype=np.uint8)
-            return empty, np.zeros((0, self.num_classes), dtype=np.float32)
-
-        windows: List[np.ndarray] = []
-        spans: List[Tuple[int, int]] = []
-        stride = max(1, self.chunk // 2)
-        win = self.chunk
-        start_positions = list(range(0, max(1, total - win + 1), stride))
-        if not start_positions:
-            start_positions = [0]
-        if start_positions[-1] + win < total:
-            start_positions.append(max(0, total - win))
-        seen = set()
-        for start in start_positions:
-            if start in seen:
-                continue
-            seen.add(start)
-            end = min(total, start + win)
-            windows.append(byte_arr[start:end])
-            spans.append((start, end))
-        if not windows:
-            windows = [byte_arr]
-            spans = [(0, total)]
-
-        probs_accum = np.zeros((total, self.num_classes), dtype=np.float32)
-        weight_accum = np.zeros((total,), dtype=np.float32)
-        out = np.zeros((total,), dtype=np.uint8)
-
-        batch = 16
-        for idx in range(0, len(windows), batch):
-            batch_windows = windows[idx:idx + batch]
-            span_slice = spans[idx:idx + batch]
-            actual = len(batch_windows)
-            tokens = np.full((batch, self.chunk), cfg.PAD_BYTE_ID, dtype=np.int32)
-            for j, win_bytes in enumerate(batch_windows):
-                length = min(len(win_bytes), self.chunk)
-                tokens[j, :length] = win_bytes[:length].astype(np.int32)
-            tokens = sanitize_tokens(tokens)
-            logits = self._apply(jnp.array(tokens, dtype=jnp.int32))
-            probs = np.array(jax.nn.softmax(np.array(logits), axis=-1))[:actual, :self.chunk]
-            for j, (start, end) in enumerate(span_slice):
-                length = end - start
-                if length <= 0:
-                    continue
-                weights = _window_weights(length)
-                probs_accum[start:end] += probs[j, :length] * weights[:, None]
-                weight_accum[start:end] += weights
-
-        nonzero = weight_accum > 0
-        if np.any(nonzero):
-            probs_accum[nonzero] /= weight_accum[nonzero][:, None]
-        zero_mask = ~nonzero
-        if np.any(zero_mask):
-            probs_accum[zero_mask] = 1.0 / self.num_classes
-        out[:] = np.argmax(probs_accum, axis=-1).astype(np.uint8)
-        return out, probs_accum
+        self.backend = self.predictor.backend
+        self.chunk = self.predictor.chunk
+        self.num_classes = self.predictor.num_classes
 
     def segment_text(self, text: str, *, min_run_chars: int = 1) -> Tuple[List[int], List[int], List[np.ndarray]]:
-        byte_arr = np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8)
-        byte_labels, byte_probs = self._segment_bytes(byte_arr)
-        char_labels: List[int] = []
-        char_probs: List[np.ndarray] = []
-        bpos = 0
-        for ch in text:
-            encoded = ch.encode("utf-8", "ignore")
-            length = len(encoded)
-            if length == 0:
-                char_labels.append(cfg.PAD_ID)
-                char_probs.append(np.zeros((self.num_classes,), dtype=np.float32))
-                continue
-            seg = byte_labels[bpos:bpos + length]
-            if len(seg) == 0:
-                char_labels.append(cfg.PAD_ID)
-                char_probs.append(np.zeros((self.num_classes,), dtype=np.float32))
-            else:
-                values, counts = np.unique(seg, return_counts=True)
-                lbl = int(values[np.argmax(counts)])
-                char_labels.append(lbl)
-                avg = np.mean(byte_probs[bpos:bpos + length], axis=0) if byte_probs.size else np.zeros((self.num_classes,), dtype=np.float32)
-                char_probs.append(avg.astype(np.float32))
-            bpos += length
-
-        # Relabel whitespace characters by copying labels/probs from neighbors,
-        # so their labels are inferred rather than driven directly by logits.
-        char_labels, char_probs = _relabel_whitespace_from_neighbors(text, char_labels, char_probs)
-
-        if min_run_chars > 1 and char_labels:
-            char_labels = self._smooth_min_run(char_labels, min_run_chars)
-        return char_labels, char_labels, char_probs
-
-    @staticmethod
-    def _smooth_min_run(labels: List[int], min_run: int) -> List[int]:
-        if min_run <= 1 or not labels:
-            return labels
-        runs = []
-        start = 0
-        cur = labels[0]
-        for idx in range(1, len(labels)):
-            if labels[idx] != cur:
-                runs.append((start, idx, cur))
-                start = idx
-                cur = labels[idx]
-        runs.append((start, len(labels), cur))
-        if len(runs) <= 2:
-            return labels
-        out = labels[:]
-        for k, (s, e, lbl) in enumerate(runs):
-            if e - s >= min_run:
-                continue
-            left_lbl = runs[k - 1][2] if k - 1 >= 0 else lbl
-            right_lbl = runs[k + 1][2] if k + 1 < len(runs) else lbl
-            left_len = runs[k - 1][1] - runs[k - 1][0] if k - 1 >= 0 else 0
-            right_len = runs[k + 1][1] - runs[k + 1][0] if k + 1 < len(runs) else 0
-            new_lbl = left_lbl if left_len >= right_len else right_lbl
-            for idx in range(s, e):
-                out[idx] = new_lbl
-        return out
+        _, char_labels, char_probs, _ = self.predictor.segment_text(
+            text,
+            min_run_chars=min_run_chars,
+        )
+        vectors: List[np.ndarray] = []
+        for probs in char_probs:
+            vec = np.zeros((self.num_classes,), dtype=np.float32)
+            for key, value in probs.items():
+                try:
+                    idx = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < self.num_classes:
+                    vec[idx] = float(value)
+            vectors.append(vec)
+        return char_labels, char_labels, vectors
 
 
 # ---------------------------------------------------------------------------
@@ -793,23 +533,48 @@ class ExampleQuery(BaseModel):
 
 
 parser = argparse.ArgumentParser(description="Interactive evaluation viewer")
-parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.msgpack or Orbax dir).")
+parser.add_argument("--checkpoint", default=None, help="Path to model checkpoint (.msgpack or Orbax dir).")
 parser.add_argument("--data-root", default=str(REPO_ROOT / "evaluation" / "data"), help="Path to evaluation datasets.")
 parser.add_argument("--manifest", default=None, help="Optional manifest JSON (defaults to <data-root>/manifest.json).")
 parser.add_argument("--device", default="auto", help="Device for inference (cpu/gpu/cuda/auto).")
+parser.add_argument("--arch", type=str, default=None, choices=("unet1d", "mamba"))
 parser.add_argument("--model-dim", type=int, default=None)
 parser.add_argument("--channels", type=str, default=None)
 parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float32", "float16"])
+parser.add_argument("--mamba-layers", type=int, default=None)
+parser.add_argument("--mamba-d-state", type=int, default=None)
+parser.add_argument("--mamba-expand", type=int, default=None)
+parser.add_argument("--mamba-dt-rank", type=int, default=None)
+parser.add_argument("--mamba-conv", type=int, default=None)
+parser.add_argument("--mamba-bidirectional", action=argparse.BooleanOptionalAction, default=None)
 parser.add_argument(
     "--chunk",
     type=int,
     default=DEFAULT_CHUNK_SIZE,
     help="Sliding window size for inference (model pads/truncates to this length).",
 )
+parser.add_argument(
+    "--inference-backend",
+    type=str,
+    default="auto",
+    choices=("auto", "fast", "legacy"),
+    help="Inference backend for the viewer. 'auto' prefers the shared fast backend.",
+)
 parser.add_argument("--min-run", type=int, default=1, help="Minimum run length smoothing for predictions (chars).")
+parser.add_argument(
+    "--other-threshold",
+    type=float,
+    default=0.6,
+    help="If >0, treat characters whose max softmax is below this as a virtual 'other' class.",
+)
 parser.add_argument("--max-preview-chars", type=int, default=6000, help="Trim displayed text beyond this many characters.")
 parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8007)
+parser.add_argument(
+    "--dataset-only",
+    action="store_true",
+    help="Browse ground-truth evaluation datasets without loading a model checkpoint.",
+)
 parser.add_argument(
     "--fine-tuned",
     action="store_true",
@@ -831,34 +596,74 @@ if getattr(args, "fine_tuned", False):
         args.data_root = str(fine_tune_eval_root)
         print(f"ℹ️  Fine-tuned mode: using evaluation data root {args.data_root}", flush=True)
 
-ckpt_path = Path(args.checkpoint).resolve()
-auto_hparams = _load_checkpoint_hparams(ckpt_path)
+if args.dataset_only and args.checkpoint:
+    print("ℹ️  --dataset-only was set; ignoring the provided checkpoint.", flush=True)
 
-label_names = auto_hparams.get("label_names")
-if label_names:
-    _apply_label_mapping(label_names)  # type: ignore[arg-type]
+runner = None
+auto_hparams: Dict[str, object] = {}
+channels = tuple(DEFAULT_CHANNELS)
 
-model_dim = args.model_dim if args.model_dim is not None else auto_hparams.get("model_dim", 256)
-dtype = args.dtype if args.dtype is not None else auto_hparams.get("dtype", "bfloat16")
-if isinstance(dtype, str):
-    dtype = dtype.rsplit(".", 1)[-1]
-channels_source: Sequence[int]
-if args.channels:
-    channels_source = [int(x) for x in args.channels.split(",") if x.strip()]
+if not args.dataset_only:
+    if not args.checkpoint:
+        parser.error("Either provide --checkpoint or pass --dataset-only.")
+    ckpt_path = Path(args.checkpoint).resolve()
+    auto_hparams = _load_checkpoint_hparams(ckpt_path)
+    ckpt_inferred = _shared_infer_checkpoint_architecture(ckpt_path)
+
+    label_names = auto_hparams.get("label_names")
+    if label_names:
+        _apply_label_mapping(label_names)  # type: ignore[arg-type]
+
+    arch = args.arch if args.arch is not None else auto_hparams.get("arch", ckpt_inferred.get("arch", "unet1d"))
+    arch = str(arch).lower().strip() if arch else "unet1d"
+    model_dim = args.model_dim if args.model_dim is not None else auto_hparams.get("model_dim", ckpt_inferred.get("model_dim", 256))
+    dtype = args.dtype if args.dtype is not None else auto_hparams.get("dtype", ckpt_inferred.get("dtype", "bfloat16"))
+    if isinstance(dtype, str):
+        dtype = dtype.rsplit(".", 1)[-1]
+    channels_source: Sequence[int]
+    if arch == "unet1d" and args.channels:
+        channels_source = [int(x) for x in args.channels.split(",") if x.strip()]
+    elif arch == "unet1d":
+        channels_source = [int(x) for x in auto_hparams.get("channels", ckpt_inferred.get("channels", DEFAULT_CHANNELS))]
+    else:
+        channels_source = list(DEFAULT_CHANNELS)
+    channels = tuple(channels_source)
+
+    if arch == "mamba":
+        args.mamba_layers = args.mamba_layers if args.mamba_layers is not None else auto_hparams.get("mamba_layers", ckpt_inferred.get("mamba_layers", 6))
+        args.mamba_d_state = args.mamba_d_state if args.mamba_d_state is not None else auto_hparams.get("mamba_d_state", ckpt_inferred.get("mamba_d_state", 8))
+        args.mamba_expand = args.mamba_expand if args.mamba_expand is not None else auto_hparams.get("mamba_expand", ckpt_inferred.get("mamba_expand", 1))
+        args.mamba_dt_rank = args.mamba_dt_rank if args.mamba_dt_rank is not None else auto_hparams.get("mamba_dt_rank", ckpt_inferred.get("mamba_dt_rank", 16))
+        args.mamba_conv = args.mamba_conv if args.mamba_conv is not None else auto_hparams.get("mamba_conv", ckpt_inferred.get("mamba_conv", 4))
+        args.mamba_bidirectional = (
+            args.mamba_bidirectional
+            if args.mamba_bidirectional is not None
+            else bool(auto_hparams.get("mamba_bidirectional", ckpt_inferred.get("mamba_bidirectional", True)))
+        )
+
+    args.arch = arch
+    args.model_dim = model_dim
+    args.dtype = dtype
+    args.channels = ",".join(str(ch) for ch in channels)
+
+    if auto_hparams:
+        extra = f", classes={len(label_names)}" if label_names else ""
+        if arch == "unet1d":
+            print(
+                f"ℹ️  Using checkpoint hyperparameters: arch={arch}, model_dim={model_dim}, channels={list(channels)}, dtype={dtype}{extra}",
+                flush=True,
+            )
+        else:
+            print(
+                "ℹ️  Using checkpoint hyperparameters: "
+                f"arch={arch}, model_dim={model_dim}, dtype={dtype}, "
+                f"mamba_layers={int(args.mamba_layers)}, mamba_d_state={int(args.mamba_d_state)}, "
+                f"mamba_expand={int(args.mamba_expand)}, mamba_dt_rank={int(args.mamba_dt_rank)}, "
+                f"mamba_conv={int(args.mamba_conv)}, mamba_bidirectional={bool(args.mamba_bidirectional)}{extra}",
+                flush=True,
+            )
 else:
-    channels_source = [int(x) for x in auto_hparams.get("channels", DEFAULT_CHANNELS)]
-channels = tuple(channels_source)
-
-args.model_dim = model_dim
-args.dtype = dtype
-args.channels = ",".join(str(ch) for ch in channels)
-
-if auto_hparams:
-    extra = f", classes={len(label_names)}" if label_names else ""
-    print(
-        f"ℹ️  Using checkpoint hyperparameters: model_dim={model_dim}, channels={list(channels)}, dtype={dtype}{extra}",
-        flush=True,
-    )
+    print("ℹ️  Dataset-only mode: browsing ground-truth evaluation data without model predictions.", flush=True)
 
 data_root = Path(args.data_root).resolve()
 manifest_path = Path(args.manifest) if args.manifest else data_root / "manifest.json"
@@ -869,14 +674,24 @@ if manifest_path.exists():
     except Exception as exc:
         print(f"⚠️  Failed to read manifest {manifest_path}: {exc}", flush=True)
 
-runner = SegmenterRunner(
-    args.checkpoint,
-    model_dim=args.model_dim,
-    channels=channels,
-    dtype=args.dtype,
-    chunk=args.chunk,
-    device=args.device,
-)
+if not args.dataset_only:
+    runner = SegmenterRunner(
+        args.checkpoint,
+        arch=args.arch,
+        model_dim=args.model_dim,
+        channels=channels,
+        mamba_layers=int(getattr(args, "mamba_layers", 6) or 6),
+        mamba_d_state=int(getattr(args, "mamba_d_state", 8) or 8),
+        mamba_expand=int(getattr(args, "mamba_expand", 1) or 1),
+        mamba_dt_rank=int(getattr(args, "mamba_dt_rank", 16) or 16),
+        mamba_conv=int(getattr(args, "mamba_conv", 4) or 4),
+        mamba_bidirectional=bool(getattr(args, "mamba_bidirectional", True)),
+        dtype=args.dtype,
+        chunk=args.chunk,
+        device=args.device,
+        inference_backend=args.inference_backend,
+        other_threshold=float(args.other_threshold or 0.0),
+    )
 store = EvaluationStore(data_root, manifest_data, max_preview_chars=max(args.max_preview_chars, 256))
 
 
@@ -892,6 +707,7 @@ def index():
 def api_tasks():
     return {
         "generated_at": manifest_data.get("generated_at") if isinstance(manifest_data, dict) else None,
+        "dataset_only": bool(args.dataset_only),
         "tasks": store.list_tasks(),
     }
 
@@ -920,12 +736,20 @@ def api_sample(task: str, index: int):
     unknown_label = "__unknown__"
     truth_labels = _segments_to_labels(len(content_view), truth_segments_view, unknown_label)
 
-    pred_char_ids, _, raw_char_probs = runner.segment_text(content_view, min_run_chars=max(1, args.min_run))
-    pred_labels: List[str] = []
-    for cid in pred_char_ids:
-        name = cfg.ID2LANG.get(int(cid), unknown_label)
-        mapped = PREDICTION_LABEL_ALIASES.get(name, name)
-        pred_labels.append(mapped if mapped else unknown_label)
+    if runner is not None:
+        pred_char_ids, _, raw_char_probs = runner.segment_text(content_view, min_run_chars=max(1, args.min_run))
+        pred_labels: List[str] = []
+        for cid in pred_char_ids:
+            pred_labels.append(
+                _prediction_label_from_id(
+                    int(cid),
+                    num_classes=int(runner.num_classes),
+                    unknown_label=unknown_label,
+                )
+            )
+    else:
+        raw_char_probs = []
+        pred_labels = [unknown_label] * len(content_view)
 
     label_order: List[str] = []
     char_data: List[dict] = []
@@ -1008,8 +832,13 @@ def api_sample(task: str, index: int):
         "metrics": {
             "evaluated_chars": eval_total,
             "correct_chars": eval_correct,
-            "char_accuracy": accuracy,
+            "char_accuracy": accuracy if runner is not None else None,
             "preview_chars": len(content_view),
+        },
+        "dataset_only": runner is None,
+        "prediction_config": {
+            "other_threshold": None if runner is None else float(args.other_threshold or 0.0),
+            "other_label": None if runner is None else "other",
         },
         "comparison_spans": spans,
         "label_colors": label_colors,
@@ -1042,6 +871,7 @@ _INDEX_HTML = """<!DOCTYPE html>
     .segment.char-cell { cursor: pointer; }
     .segment.mismatch { outline: 1px solid rgba(214, 48, 49, 0.6); }
     .segment.char-cell:hover { background-color: rgba(99, 110, 114, 0.25); }
+    .empty-state { color: #636e72; font-style: italic; padding: 6px 0; }
     .pill { display: inline-block; padding: 2px 6px; border-radius: 999px; font-size: 12px; margin-right: 6px; color: #2d3436; background: #dfe6e9; }
     .task-desc { font-size: 13px; color: #636e72; margin-top: 4px; }
     .footer { margin-top: 24px; color: #636e72; font-size: 12px; }
@@ -1085,7 +915,7 @@ _INDEX_HTML = """<!DOCTYPE html>
         <div id=\"truthRow\" class=\"segments\"></div>
       </div>
       <div class=\"text-panel\">
-        <h3 class=\"row-title\">Prediction</h3>
+        <h3 class=\"row-title\" id=\"predTitle\">Prediction</h3>
         <div id=\"predRow\" class=\"segments\"></div>
       </div>
     </div>
@@ -1104,9 +934,11 @@ _INDEX_HTML = """<!DOCTYPE html>
     const metricsDiv = document.getElementById('metrics');
     const truthRow = document.getElementById('truthRow');
     const predRow = document.getElementById('predRow');
+    const predTitle = document.getElementById('predTitle');
     const footerInfo = document.getElementById('footerInfo');
 
     let taskMeta = {};
+    let datasetOnlyMode = false;
 
     function escapeHtml(str) {
       return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -1266,7 +1098,11 @@ _INDEX_HTML = """<!DOCTYPE html>
     function confidenceForLabel(entry, label) {
       if (!entry || !Array.isArray(entry.probs) || !label) return 0;
       const found = entry.probs.find((item) => item && item.label === label);
-      return found ? clamp01(found.prob) : 0;
+      if (found) return clamp01(found.prob);
+      if (label === 'other' && entry.probs.length) {
+        return clamp01(Math.max(...entry.probs.map(item => Number(item && item.prob) || 0)));
+      }
+      return 0;
     }
 
     function renderRow(container, chars, labelKey, labelColors, highlightMismatch = false) {
@@ -1306,6 +1142,12 @@ _INDEX_HTML = """<!DOCTYPE html>
     async function fetchTasks() {
       const res = await fetch('/api/tasks');
       const data = await res.json();
+      datasetOnlyMode = !!data.dataset_only;
+      if (datasetOnlyMode) {
+        predTitle.textContent = 'Prediction (disabled in dataset-only mode)';
+      } else {
+        predTitle.textContent = 'Prediction';
+      }
       taskSelect.innerHTML = '';
       data.tasks.forEach(task => {
         const opt = document.createElement('option');
@@ -1338,16 +1180,31 @@ _INDEX_HTML = """<!DOCTYPE html>
       const colors = data.label_colors || {};
       const charData = Array.isArray(data.char_data) ? data.char_data : [];
       renderRow(truthRow, charData, 'truth', colors, false);
-      renderRow(predRow, charData, 'pred', colors, true);
+      if (data.dataset_only) {
+        predRow.innerHTML = '<div class="empty-state">Model predictions are disabled in dataset-only mode.</div>';
+      } else {
+        renderRow(predRow, charData, 'pred', colors, true);
+      }
 
-      const accuracy = (data.metrics.char_accuracy * 100).toFixed(2);
       const total = taskMeta[task] ? taskMeta[task].count : data.total;
+      const pills = [
+        `<div class="pill">Task: ${task}</div>`,
+        `<div class="pill">Example: ${data.index + 1} / ${total}</div>`,
+        `<div class="pill">Preview chars: ${data.metrics.preview_chars}${data.truncated ? ' (truncated)' : ''}</div>`,
+      ];
+      if (data.dataset_only) {
+        pills.push('<div class="pill">Mode: Dataset only</div>');
+        pills.push(`<div class="pill">Labeled chars: ${data.metrics.evaluated_chars}</div>`);
+      } else {
+        const accuracy = (data.metrics.char_accuracy * 100).toFixed(2);
+        pills.push(`<div class="pill">Accuracy: ${accuracy}%</div>`);
+        pills.push(`<div class="pill">Evaluated chars: ${data.metrics.evaluated_chars}</div>`);
+        if (data.prediction_config && Number.isFinite(Number(data.prediction_config.other_threshold))) {
+          pills.push(`<div class="pill">Other threshold: ${Number(data.prediction_config.other_threshold).toFixed(2)}</div>`);
+        }
+      }
       const metricsHtml = `
-        <div class="pill">Task: ${task}</div>
-        <div class="pill">Example: ${data.index + 1} / ${total}</div>
-        <div class="pill">Accuracy: ${accuracy}%</div>
-        <div class="pill">Evaluated chars: ${data.metrics.evaluated_chars}</div>
-        <div class="pill">Preview chars: ${data.metrics.preview_chars}${data.truncated ? ' (truncated)' : ''}</div>
+        ${pills.join('')}
       `;
       const legendOrder = Array.isArray(data.label_order) && data.label_order.length ? data.label_order : Object.keys(colors);
       const legendEntries = legendOrder
@@ -1365,7 +1222,10 @@ _INDEX_HTML = """<!DOCTYPE html>
       const exampleId = data.example_id ? `Example ID: ${data.example_id}` : '';
       const sourceLangs = data.source_langs && data.source_langs.length ? `Sources: ${data.source_langs.join(', ')}` : '';
       const meta = data.metadata_json ? `Metadata: ${data.metadata_json}` : '';
-      footerInfo.textContent = [desc, exampleId, sourceLangs, meta].filter(Boolean).join(' | ');
+      const thresholdInfo = (!data.dataset_only && data.prediction_config && Number.isFinite(Number(data.prediction_config.other_threshold)))
+        ? `Other threshold: ${Number(data.prediction_config.other_threshold).toFixed(2)}`
+        : '';
+      footerInfo.textContent = [desc, exampleId, sourceLangs, thresholdInfo, meta].filter(Boolean).join(' | ');
     }
 
     loadBtn.addEventListener('click', loadSample);

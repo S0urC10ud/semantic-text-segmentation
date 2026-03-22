@@ -7,6 +7,10 @@ import time
 from pathlib import Path
 from typing import Dict, Tuple, TYPE_CHECKING
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -87,6 +91,10 @@ from utils.metrics_helper import (
 from utils.monitor_eval import load_monitor_memmaps, evaluate_monitor_set
 from utils.token_utils import sanitize_tokens
 from utils.outlier_data import OutlierBatcher
+from active_learning.persistent_control import (
+    encode_trainer_event,
+    parse_trainer_command_line,
+)
 
 if TYPE_CHECKING:
     from utils.config import DataConfig, TrainConfig
@@ -144,6 +152,21 @@ def _state_step(state, *, use_pmap: bool) -> int:
     if use_pmap:
         return int(unreplicate_state(state).step)
     return int(getattr(state, "step", 0))
+
+
+def _emit_persistent_trainer_event(event: str, **payload):
+    print(encode_trainer_event(event, **payload), flush=True)
+
+
+def _read_persistent_trainer_command() -> dict:
+    while True:
+        line = sys.stdin.readline()
+        if line == "":
+            return {"command": "shutdown", "reason": "stdin_eof"}
+        stripped = str(line).strip()
+        if not stripped:
+            continue
+        return parse_trainer_command_line(stripped)
 
 
 def resolve_ckpt_paths(path: str):
@@ -393,6 +416,17 @@ def main():
     parser.add_argument("--bucket_step", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=10)
+    parser.add_argument(
+        "--full-files",
+        action="store_true",
+        help="Use fixed-length full-file/long-sample mode instead of 1536-byte windows.",
+    )
+    parser.add_argument(
+        "--full-file-max-bytes",
+        type=int,
+        default=10000,
+        help="Target padded sequence length used when --full-files is enabled.",
+    )
     parser.add_argument("--max_minutes", type=int, default=0)
     parser.add_argument("--stop_file", type=str, default="STOP_SWEEP")
     parser.add_argument("--dont_use_train_windows", action="store_true", default=False,
@@ -518,6 +552,15 @@ def main():
         type=str,
         default="",
         help="Use a specific W&B run id without restoring optimizer/checkpoint state.",
+    )
+    parser.add_argument(
+        "--persistent-trainer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Keep the trainer process alive after startup and accept chunk commands over stdin. "
+            "Used by the active-learning meta-trainer to avoid recompiling every round."
+        ),
     )
     parser.add_argument(
         "--fine-tune",
@@ -849,6 +892,11 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
+    if bool(args.full_files):
+        full_len = max(1, int(args.full_file_max_bytes))
+        d_cfg.window_min_bytes = full_len
+        d_cfg.window_max_bytes = full_len
+        d_cfg.bucket_step = full_len
     if args.language_pair_prob is not None:
         prob = max(0.0, min(1.0, float(args.language_pair_prob)))
         d_cfg.language_pair_mode_prob = prob
@@ -902,6 +950,9 @@ def main():
         fine_tune_val_root=args.fine_tune_val_root,
         fine_tune_step=args.fine_tune_step,
     )
+    t_cfg.MODEL_WINDOW_BYTES = int(d_cfg.window_max_bytes)
+    t_cfg.full_files = bool(args.full_files)
+    t_cfg.full_file_max_bytes = int(args.full_file_max_bytes)
 
     # Prepare datasets
     print("Preparing datasets...", flush=True)
@@ -1019,6 +1070,8 @@ def main():
             "active_learning_store": args.active_learning_store,
             "active_learning_mix_prob": float(args.active_learning_mix_prob),
             "active_learning_max_windows": int(args.active_learning_max_windows),
+            "full_files": bool(args.full_files),
+            "full_file_max_bytes": int(args.full_file_max_bytes),
             "fine_tune_augment_monitor": bool(args.fine_tune_augment_monitor),
             "fine_tune_dense_bias_label": str(args.fine_tune_dense_bias_label or ""),
             "fine_tune_dense_bias_prob": float(args.fine_tune_dense_bias_prob),
@@ -1326,6 +1379,8 @@ def main():
             active_learning_limit=int(args.active_learning_max_windows),
             dense_bias_label=str(args.fine_tune_dense_bias_label or ""),
             dense_bias_prob=float(args.fine_tune_dense_bias_prob),
+            full_files=bool(args.full_files),
+            full_file_max_bytes=int(args.full_file_max_bytes),
         )
     else:
         data_fetcher = EpochPrefetchBatcher(train_dsets, d_cfg)
@@ -1350,6 +1405,7 @@ def main():
                 max_windows=int(args.active_learning_max_windows),
                 seed=int(args.seed),
                 fallback_label="other",
+                full_files=bool(args.full_files),
             )
             if replay.size > 0:
                 data_fetcher = MixedBatcher(
@@ -1358,14 +1414,15 @@ def main():
                     mix_prob=al_mix_prob,
                     seed=int(args.seed),
                 )
+                replay_unit = "sequences" if bool(args.full_files) else "windows"
                 print(
-                    f"Active-learning replay enabled: {replay.size} windows from {al_store_path} "
+                    f"Active-learning replay enabled: {replay.size} {replay_unit} from {al_store_path} "
                     f"(mix_prob={al_mix_prob:.2f}).",
                     flush=True,
                 )
             else:
                 print(
-                    f"Active-learning store '{al_store_path}' contained no usable windows; replay disabled.",
+                    f"Active-learning store '{al_store_path}' contained no usable replay samples; replay disabled.",
                     flush=True,
                 )
         except Exception as e:
@@ -1458,34 +1515,48 @@ def main():
 
         # Eval runs single-device; unreplicate if using pmap
         eval_state = unreplicate_state(state) if use_pmap else state
+        full_files_mode = bool(getattr(t_cfg, "full_files", False))
+        primary_loss = float("nan")
+        primary_acc = float("nan")
+        aggregates = None
+        per_class = None
+        conf_mat = None
 
-        val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
-            state=eval_state,
-            dsets_by_lang=dsets["val"],
-            L=d_cfg.window_max_bytes,
-            batch_size=d_cfg.batch_size,
-            batches=t_cfg.eval_batches,
-            data_cfg=d_cfg,
-            rng=eval_rng,
-            eval_step_fn=eval_step,
-        )
+        if not full_files_mode:
+            val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
+                state=eval_state,
+                dsets_by_lang=dsets["val"],
+                L=d_cfg.window_max_bytes,
+                batch_size=d_cfg.batch_size,
+                batches=t_cfg.eval_batches,
+                data_cfg=d_cfg,
+                rng=eval_rng,
+                eval_step_fn=eval_step,
+            )
 
-        per_class, aggregates = compute_metrics_from_confusion(
-            conf_mat, cfg.NUM_CLASSES, cfg.PAD_ID
-        )
+            per_class, aggregates = compute_metrics_from_confusion(
+                conf_mat, cfg.NUM_CLASSES, cfg.PAD_ID
+            )
 
-        print(f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}", flush=True)
-        val_metrics = {
-            "val/loss": val_loss,
-            "val/acc": val_acc,
-        }
-        if train_loss is not None:
-            val_metrics["val/train_gap"] = float(train_loss) - val_loss
-        if train_acc is not None:
-            val_metrics["val/acc_gap"] = float(train_acc) - val_acc
-        _wandb_safe_log(val_metrics, step=step, commit=False)
-
-        print_metrics_table(per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID)
+            print(f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}", flush=True)
+            val_metrics = {
+                "val/loss": val_loss,
+                "val/acc": val_acc,
+            }
+            if train_loss is not None:
+                val_metrics["val/train_gap"] = float(train_loss) - val_loss
+            if train_acc is not None:
+                val_metrics["val/acc_gap"] = float(train_acc) - val_acc
+            _wandb_safe_log(val_metrics, step=step, commit=False)
+            print_metrics_table(per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID)
+            primary_loss = float(val_loss)
+            primary_acc = float(val_acc)
+        else:
+            print(
+                "Full-file mode active: skipping ordinary validation and using monitor-only evaluation.",
+                flush=True,
+            )
+            _wandb_safe_log({"meta/val_skipped_full_files": 1}, step=step, commit=False)
 
         if monitor_data is not None and t_cfg.monitor_eval_every > 0:
             if bool(t_cfg.monitor_eval_deterministic):
@@ -1514,6 +1585,7 @@ def main():
                 other_threshold=t_cfg.monitor_other_threshold,
                 deterministic=bool(t_cfg.monitor_eval_deterministic),
                 deterministic_seed=int(t_cfg.monitor_eval_seed),
+                full_files=bool(full_files_mode),
             )
 
             per_class_m, aggregates_m = compute_metrics_from_confusion(
@@ -1535,13 +1607,15 @@ def main():
                 "monitor/files_used": monitor_stats["files_used"],
                 "monitor/threshold": t_cfg.monitor_other_threshold,
             }
-            monitor_gap_logs = {
-                "monitor_gap/micro_accuracy": float(aggregates_m["micro"]["acc"] - aggregates["micro"]["acc"]),
-                "monitor_gap/macro_f1": float(aggregates_m["macro"]["f1"] - aggregates["macro"]["f1"]),
-                "monitor_gap/macro_precision": float(aggregates_m["macro"]["precision"] - aggregates["macro"]["precision"]),
-                "monitor_gap/macro_recall": float(aggregates_m["macro"]["recall"] - aggregates["macro"]["recall"]),
-                "monitor_gap/weighted_f1": float(aggregates_m["weighted"]["f1"] - aggregates["weighted"]["f1"]),
-            }
+            monitor_gap_logs = {}
+            if aggregates is not None:
+                monitor_gap_logs = {
+                    "monitor_gap/micro_accuracy": float(aggregates_m["micro"]["acc"] - aggregates["micro"]["acc"]),
+                    "monitor_gap/macro_f1": float(aggregates_m["macro"]["f1"] - aggregates["macro"]["f1"]),
+                    "monitor_gap/macro_precision": float(aggregates_m["macro"]["precision"] - aggregates["macro"]["precision"]),
+                    "monitor_gap/macro_recall": float(aggregates_m["macro"]["recall"] - aggregates["macro"]["recall"]),
+                    "monitor_gap/weighted_f1": float(aggregates_m["weighted"]["f1"] - aggregates["weighted"]["f1"]),
+                }
             monitor_combined_logs = {**monitor_scalar_logs, **monitor_gap_logs}
             wandb_log_metrics(
                 step,
@@ -1577,12 +1651,17 @@ def main():
                     "monitor_thresh/windows": monitor_stats["windows"],
                     "monitor_thresh/skipped": monitor_stats["skipped"],
                     "monitor_thresh/files_used": monitor_stats["files_used"],
-                    "monitor_gap_thresh/micro_accuracy": float(aggregates_mt["micro"]["acc"] - aggregates["micro"]["acc"]),
-                    "monitor_gap_thresh/macro_f1": float(aggregates_mt["macro"]["f1"] - aggregates["macro"]["f1"]),
-                    "monitor_gap_thresh/macro_precision": float(aggregates_mt["macro"]["precision"] - aggregates["macro"]["precision"]),
-                    "monitor_gap_thresh/macro_recall": float(aggregates_mt["macro"]["recall"] - aggregates["macro"]["recall"]),
-                    "monitor_gap_thresh/weighted_f1": float(aggregates_mt["weighted"]["f1"] - aggregates["weighted"]["f1"]),
                 }
+                if aggregates is not None:
+                    thresh_logs.update(
+                        {
+                            "monitor_gap_thresh/micro_accuracy": float(aggregates_mt["micro"]["acc"] - aggregates["micro"]["acc"]),
+                            "monitor_gap_thresh/macro_f1": float(aggregates_mt["macro"]["f1"] - aggregates["macro"]["f1"]),
+                            "monitor_gap_thresh/macro_precision": float(aggregates_mt["macro"]["precision"] - aggregates["macro"]["precision"]),
+                            "monitor_gap_thresh/macro_recall": float(aggregates_mt["macro"]["recall"] - aggregates["macro"]["recall"]),
+                            "monitor_gap_thresh/weighted_f1": float(aggregates_mt["weighted"]["f1"] - aggregates["weighted"]["f1"]),
+                        }
+                    )
                 wandb_log_metrics(
                     step,
                     per_class_mt,
@@ -1595,18 +1674,24 @@ def main():
                     extra_logs=thresh_logs,
                     commit=False,
                 )
+            if full_files_mode:
+                primary_loss = float(monitor_stats["loss_mean"])
+                primary_acc = float(monitor_stats["acc_mean"])
 
-        wandb_log_metrics(
-            step,
-            per_class,
-            aggregates,
-            cfg.ID2LANG,
-            cfg.NUM_CLASSES,
-            cfg.PAD_ID,
-            conf_mat,
-            commit=commit,
-        )
-        return val_loss, val_acc
+        if per_class is not None and aggregates is not None and conf_mat is not None:
+            wandb_log_metrics(
+                step,
+                per_class,
+                aggregates,
+                cfg.ID2LANG,
+                cfg.NUM_CLASSES,
+                cfg.PAD_ID,
+                conf_mat,
+                commit=commit,
+            )
+        else:
+            _wandb_safe_log({"meta/full_file_eval": int(full_files_mode)}, step=step, commit=commit)
+        return float(primary_loss), float(primary_acc)
 
     current_step = _state_step(state, use_pmap=use_pmap)
     startup_log_step = _wandb_current_step(default=current_step)
@@ -1630,569 +1715,612 @@ def main():
             title=startup_title,
             commit=bool(current_step == 0),
         )
+    persistent_mode = bool(args.persistent_trainer)
 
-    print("Starting training...", flush=True)
-    start_time = time.time()
-    last_log_time = time.time()
-    metrics_history = {"loss": [], "acc": [], "step_time": [], "grad_norm": []}
+    def _run_training_phase(*, target_step: int, phase_label: str, phase_max_minutes: int) -> dict:
+        nonlocal state, rng
 
-    best_val = float("inf")
-    non_improve_evals = 0
-    pruned = False
-    stopped_reason = ""
-    error_reason = ""  # Track any unexpected error from the loop
-    last_heartbeat = time.time()
+        current_phase_step = _state_step(state, use_pmap=use_pmap)
+        target_step = int(target_step)
+        if target_step < current_phase_step:
+            print(
+                f"[{phase_label}] No training needed: current_step={current_phase_step} target_step={target_step}.",
+                flush=True,
+            )
+            return {
+                "status": "noop",
+                "phase_label": str(phase_label),
+                "current_step": int(current_phase_step),
+                "target_step": int(target_step),
+                "final_reason": "noop_already_at_or_beyond_target",
+                "runtime_minutes": 0.0,
+                "pruned": 0,
+                "error_message": "",
+            }
 
-    # Track min/max epochs across languages
-    min_epochs = 0
-    max_epochs = 0
-    target_logged_step = int(t_cfg.steps) + 1
+        requested_updates = max(0, int(target_step) - int(current_phase_step) + 1)
+        print(
+            f"Starting training... phase={phase_label} current_step={current_phase_step} "
+            f"target_step={target_step} updates={requested_updates} persistent={int(persistent_mode)}",
+            flush=True,
+        )
+        start_time = time.time()
+        last_log_time = time.time()
+        metrics_history = {"loss": [], "acc": [], "step_time": [], "grad_norm": []}
 
-    try:
+        best_val = float("inf")
+        non_improve_evals = 0
+        pruned = False
+        stopped_reason = ""
+        error_reason = ""
+        error_type_name = ""
+        last_heartbeat = time.time()
+
+        min_epochs = 0.0
+        max_epochs = 0.0
+        target_logged_step = int(target_step) + 1
+        first_batch_announced = False
+        first_batch_ready_announced = False
+        first_compile_started = False
+        first_compile_started_at = 0.0
+
         try:
-            # +1 to make sure the final eval and checkpoint triggers
-            for step in range(current_step, t_cfg.steps + 1):
-                # Periodic garbage collection
-                if step % 100 == 0:
-                    gc.collect()  # Regular Python garbage collection
+            try:
+                for step in range(current_phase_step, target_step + 1):
+                    if step % 100 == 0:
+                        gc.collect()
 
-                elapsed_min = (time.time() - start_time) / 60.0
-                if args.max_minutes > 0 and elapsed_min >= args.max_minutes:
-                    stopped_reason = f"time_cap_{args.max_minutes}min"
-                    print(
-                        f"Time cap reached ({args.max_minutes} min). Stopping gracefully.",
-                        flush=True,
-                    )
-                    break
-                if os.path.exists(args.stop_file):
-                    stopped_reason = "stop_file_detected"
-                    print(
-                        f"Stop file detected at '{args.stop_file}'. Stopping gracefully.",
-                        flush=True,
-                    )
-                    break
-
-                if _STOP["flag"]:
-                    stopped_reason = f"signal_{int(_STOP['flag'])}"
-                    print("Stop requested by signal. Exiting loop.", flush=True)
-                    break
-
-                step_start = time.time()
-                data_time = 0.0
-                compute_time = 0.0
-                grad_norm_value = None
-                oe_losses: list[float] = []
-                oe_batches_used = 0
-
-                rng, step_base_rng = jax.random.split(rng)
-
-                if accum_steps == 1:
-                    data_start = time.time()
-                    batch_tokens, batch_labels = data_fetcher.get()
-                    batch_tokens = sanitize_tokens(batch_tokens)
-                    data_time = time.time() - data_start
-
-                    step_base_rng, oe_decision_rng = jax.random.split(step_base_rng)
-                    use_oe = (
-                        oe_batcher is not None
-                        and float(jax.random.uniform(oe_decision_rng, ()).item()) < oe_ratio
-                    )
-                    compute_start = time.time()
-                    if use_pmap:
-                        # Shard batch across devices
-                        batch_tokens, batch_labels = shard_batch(
-                            batch_tokens, batch_labels
+                    elapsed_min = (time.time() - start_time) / 60.0
+                    if phase_max_minutes > 0 and elapsed_min >= phase_max_minutes:
+                        stopped_reason = f"time_cap_{phase_max_minutes}min"
+                        print(
+                            f"[{phase_label}] Time cap reached ({phase_max_minutes} min). Stopping gracefully.",
+                            flush=True,
                         )
-                        step_rngs = make_pmap_rngs(step_base_rng)
-                    if use_oe:
+                        break
+                    if os.path.exists(args.stop_file):
+                        stopped_reason = "stop_file_detected"
+                        print(
+                            f"[{phase_label}] Stop file detected at '{args.stop_file}'. Stopping gracefully.",
+                            flush=True,
+                        )
+                        break
+
+                    if _STOP["flag"]:
+                        stopped_reason = f"signal_{int(_STOP['flag'])}"
+                        print(f"[{phase_label}] Stop requested by signal. Exiting loop.", flush=True)
+                        break
+
+                    step_start = time.time()
+                    data_time = 0.0
+                    compute_time = 0.0
+                    grad_norm_value = None
+                    oe_losses: list[float] = []
+                    oe_batches_used = 0
+
+                    rng, step_base_rng = jax.random.split(rng)
+
+                    if accum_steps == 1:
+                        if not first_batch_announced:
+                            print(
+                                f"[{phase_label}] Preparing first training batch from the fine-tune/replay pipeline...",
+                                flush=True,
+                            )
+                            first_batch_announced = True
                         data_start = time.time()
-                        outlier_tokens = oe_batcher.get()
-                        outlier_tokens = sanitize_tokens(outlier_tokens)
-                        data_time += time.time() - data_start
-                        if use_pmap:
-                            (outlier_tokens,) = shard_batch(outlier_tokens)
-                            state, loss, acc, oe_loss = train_step_oe_fn(
-                                state,
-                                batch_tokens,
-                                batch_labels,
-                                outlier_tokens,
-                                oe_lambda,
-                                step_rngs,
+                        batch_tokens, batch_labels = data_fetcher.get()
+                        batch_tokens = sanitize_tokens(batch_tokens)
+                        data_time = time.time() - data_start
+                        if not first_batch_ready_announced:
+                            print(
+                                f"[{phase_label}] First batch ready in {data_time:.2f}s "
+                                f"(tokens_shape={tuple(batch_tokens.shape)}, labels_shape={tuple(batch_labels.shape)}).",
+                                flush=True,
                             )
-                            loss = float(loss[0])
-                            acc = float(acc[0])
-                            oe_loss = float(oe_loss[0])
-                        else:
-                            state, loss, acc, oe_loss = train_step_oe_fn(
-                                state,
-                                batch_tokens,
-                                batch_labels,
-                                outlier_tokens,
-                                oe_lambda,
-                                step_base_rng,
-                            )
-                        oe_losses.append(float(oe_loss))
-                        oe_batches_used += 1
-                        del outlier_tokens
-                    else:
-                        if use_pmap:
-                            state, loss, acc = train_step_fn(
-                                state, batch_tokens, batch_labels, step_rngs
-                            )
-                            loss = float(loss[0])
-                            acc = float(acc[0])
-                        else:
-                            state, loss, acc = train_step_fn(
-                                state, batch_tokens, batch_labels, step_base_rng
-                            )
-                    loss_value = float(loss)
-                    acc_value = float(acc)
-                    compute_time = time.time() - compute_start
-                    loss = loss_value
-                    acc = acc_value
+                            first_batch_ready_announced = True
 
-                    del batch_tokens
-                    del batch_labels
-                else:
-                    losses = []
-                    accs = []
-                    grad_accum = None
-                    micro_rng = step_base_rng
-
-                    for _ in range(accum_steps):
-                        data_start = time.time()
-                        mb_tokens, mb_labels = data_fetcher.get()
-                        mb_tokens = sanitize_tokens(mb_tokens)
-                        data_time += time.time() - data_start
-
-                        micro_rng, oe_decision_rng = jax.random.split(micro_rng)
+                        step_base_rng, oe_decision_rng = jax.random.split(step_base_rng)
                         use_oe = (
                             oe_batcher is not None
                             and float(jax.random.uniform(oe_decision_rng, ()).item()) < oe_ratio
                         )
-                        micro_rng, use_rng = jax.random.split(micro_rng)
+                        if not first_compile_started:
+                            first_compile_started = True
+                            first_compile_started_at = time.time()
+                            print(
+                                f"[{phase_label}] Launching first compiled train step "
+                                f"(this can take a while for new shapes, especially 10k full-file mode)...",
+                                flush=True,
+                            )
                         compute_start = time.time()
                         if use_pmap:
-                            mb_tokens_s, mb_labels_s = shard_batch(mb_tokens, mb_labels)
-                            use_rngs = make_pmap_rngs(use_rng)
+                            batch_tokens, batch_labels = shard_batch(
+                                batch_tokens, batch_labels
+                            )
+                            step_rngs = make_pmap_rngs(step_base_rng)
                         if use_oe:
                             data_start = time.time()
                             outlier_tokens = oe_batcher.get()
                             outlier_tokens = sanitize_tokens(outlier_tokens)
                             data_time += time.time() - data_start
                             if use_pmap:
-                                (outlier_tokens_s,) = shard_batch(outlier_tokens)
-                                grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
+                                (outlier_tokens,) = shard_batch(outlier_tokens)
+                                state, loss, acc, oe_loss = train_step_oe_fn(
                                     state,
-                                    mb_tokens_s,
-                                    mb_labels_s,
-                                    outlier_tokens_s,
-                                    oe_lambda,
-                                    use_rngs,
-                                )
-                                micro_loss = float(micro_loss[0])
-                                micro_acc = float(micro_acc[0])
-                                micro_oe_loss = float(micro_oe_loss[0])
-                            else:
-                                grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
-                                    state,
-                                    mb_tokens,
-                                    mb_labels,
+                                    batch_tokens,
+                                    batch_labels,
                                     outlier_tokens,
                                     oe_lambda,
-                                    use_rng,
+                                    step_rngs,
                                 )
-                            oe_losses.append(float(micro_oe_loss))
+                                loss = float(loss[0])
+                                acc = float(acc[0])
+                                oe_loss = float(oe_loss[0])
+                            else:
+                                state, loss, acc, oe_loss = train_step_oe_fn(
+                                    state,
+                                    batch_tokens,
+                                    batch_labels,
+                                    outlier_tokens,
+                                    oe_lambda,
+                                    step_base_rng,
+                                )
+                            oe_losses.append(float(oe_loss))
                             oe_batches_used += 1
                             del outlier_tokens
                         else:
                             if use_pmap:
-                                grads, micro_loss, micro_acc = micro_step_fn(
-                                    state, mb_tokens_s, mb_labels_s, use_rngs
+                                state, loss, acc = train_step_fn(
+                                    state, batch_tokens, batch_labels, step_rngs
                                 )
-                                micro_loss = float(micro_loss[0])
-                                micro_acc = float(micro_acc[0])
+                                loss = float(loss[0])
+                                acc = float(acc[0])
                             else:
-                                grads, micro_loss, micro_acc = micro_step_fn(
-                                    state, mb_tokens, mb_labels, use_rng
+                                state, loss, acc = train_step_fn(
+                                    state, batch_tokens, batch_labels, step_base_rng
                                 )
-                        micro_loss_value = float(micro_loss)
-                        micro_acc_value = float(micro_acc)
-                        compute_time += time.time() - compute_start
-
-                        if grad_accum is None:
-                            grad_accum = grads
-                        else:
-                            grad_accum = jtu.tree_map(
-                                lambda a, b: a + b, grad_accum, grads
-                            )
-
-                        losses.append(micro_loss_value)
-                        accs.append(micro_acc_value)
-
-                        del mb_tokens
-                        del mb_labels
-
-                    scale = jnp.asarray(accum_steps, dtype=jnp.float32)
-                    grad_accum = jtu.tree_map(lambda g: g / scale, grad_accum)
-                    if use_pmap:
-                        # Grads are already pmean-ed per device; take device 0 for norm
-                        grad_norm_value = float(grad_global_norm(
-                            jax.tree.map(lambda x: x[0], grad_accum)
-                        ))
-                        # Apply gradients on the replicated state inside pmap
-                        state = p_apply_gradients(state, grad_accum)
-                    else:
-                        grad_norm_value = float(grad_global_norm(grad_accum))
-                        state = state.apply_gradients(grads=grad_accum)
-                    apply_start = time.time()
-                    compute_time += time.time() - apply_start
-                    loss = float(sum(losses) / len(losses))
-                    acc = float(sum(accs) / len(accs))
-
-                oe_loss_value = float(sum(oe_losses) / len(oe_losses)) if oe_losses else 0.0
-                step_time = time.time() - step_start
-                logged_step = int(step) + 1
-
-                # LR best-effort
-                try:
-                    if hasattr(state.opt_state[1], "hyperparams"):
-                        step_lr = float(state.opt_state[1].hyperparams["learning_rate"])
-                    elif len(state.opt_state) > 2 and hasattr(
-                        state.opt_state[2], "count"
-                    ):
-                        step_lr = float(
-                            t_cfg.lr * min(1.0, state.opt_state[2].count / t_cfg.warmup)
-                        )
-                    else:
-                        step_lr = t_cfg.lr
-                except Exception:
-                    step_lr = t_cfg.lr
-
-                # Get current epochs from the batcher
-                epochs_by_lang = data_fetcher.get_epochs()
-                if epochs_by_lang:
-                    min_epochs = float(min(epochs_by_lang.values()))
-                    max_epochs = float(max(epochs_by_lang.values()))
-                else:
-                    min_epochs = max_epochs = 0.0
-
-                metrics = {
-                    "train/loss": float(loss),
-                    "train/acc": float(acc),
-                    "train/learning_rate": step_lr,
-                    "train/min_epochs": min_epochs,
-                    "train/max_epochs": max_epochs,
-                    "perf/data_time": data_time,
-                    "perf/compute_time": compute_time,
-                    "perf/total_step_time": step_time,
-                }
-                if oe_lambda > 0.0:
-                    metrics.update(
-                        {
-                            "oe/loss_uniform": float(oe_loss_value),
-                            "oe/active_batches": int(oe_batches_used),
-                            "oe/lambda": float(oe_lambda),
-                            "oe/ratio": float(oe_ratio),
-                        }
-                    )
-
-                if grad_norm_value is not None:
-                    rs = _compute_running_stats(
-                        metrics_history["grad_norm"], grad_norm_value
-                    )
-                    metrics.update(
-                        {
-                            "train/grad_norm": grad_norm_value,
-                            "train/grad_norm_mean": rs["mean"],
-                            "train/grad_norm_std": rs["std"],
-                            "train/grad_norm_trend": rs["trend"],
-                        }
-                    )
-
-                rs = _compute_running_stats(metrics_history["loss"], float(loss))
-                metrics.update(
-                    {
-                        "train/loss_mean": rs["mean"],
-                        "train/loss_std": rs["std"],
-                        "train/loss_trend": rs["trend"],
-                    }
-                )
-                rs = _compute_running_stats(metrics_history["acc"], float(acc))
-                metrics.update(
-                    {
-                        "train/acc_mean": rs["mean"],
-                        "train/acc_std": rs["std"],
-                        "train/acc_trend": rs["trend"],
-                    }
-                )
-                rs = _compute_running_stats(metrics_history["step_time"], step_time)
-                metrics.update(
-                    {"perf/step_time_mean": rs["mean"], "perf/step_time_std": rs["std"]}
-                )
-
-                # Determine if we should commit the logs now or wait
-                should_commit = (
-                    logged_step % t_cfg.log_every == 0
-                    and logged_step % t_cfg.eval_every != 0
-                )
-
-                _wandb_safe_log(metrics, step=logged_step, commit=should_commit)
-                last_heartbeat = time.time()
-
-                if logged_step % t_cfg.log_every == 0:
-                    elapsed = time.time() - last_log_time
-                    sps = t_cfg.log_every / elapsed if elapsed > 0 else 0
-                    print(
-                        f"Step {logged_step}/{target_logged_step} [Epochs {min_epochs:.3f}-{max_epochs:.3f}] | "
-                        f"Loss: {loss:.4f} (±{metrics['train/loss_std']:.4f}), "
-                        f"Acc: {acc:.4f} (±{metrics['train/acc_std']:.4f}), SPS: {sps:.2f}",
-                        flush=True,
-                    )
-                    last_log_time = time.time()
-
-                # Watchdog
-                if time.time() - last_heartbeat > 600:
-                    stopped_reason = "watchdog_no_progress_10min"
-                    print(
-                        "Watchdog: no progress for 10 minutes. Stopping.",
-                        flush=True,
-                    )
-                    break
-
-                if logged_step > 0 and logged_step % t_cfg.eval_every == 0:
-                    print("Evaluating...", flush=True)
-                    rng, eval_rng = jax.random.split(rng)
-
-                    # >>> NEW: eval with confusion matrix + metrics <<<
-                    # Eval runs single-device; unreplicate if using pmap
-                    eval_state = unreplicate_state(state) if use_pmap else state
-                    val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
-                        state=eval_state,
-                        dsets_by_lang=dsets["val"],
-                        L=d_cfg.window_max_bytes,
-                        batch_size=d_cfg.batch_size,
-                        batches=t_cfg.eval_batches,
-                        data_cfg=d_cfg,
-                        rng=eval_rng,
-                        eval_step_fn=eval_step,
-                    )
-
-                    # Compute per-class and aggregates
-                    per_class, aggregates = compute_metrics_from_confusion(
-                        conf_mat, cfg.NUM_CLASSES, cfg.PAD_ID
-                    )
-
-                    print(
-                        f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}",
-                        flush=True,
-                    )
-                    # Existing scalar gap logs
-                    val_metrics = {
-                        "val/loss": val_loss,
-                        "val/acc": val_acc,
-                        "val/train_gap": float(loss) - val_loss,
-                        "val/acc_gap": float(acc) - val_acc,
-                    }
-                    # Do not commit yet; eval may also log monitor metrics.
-                    _wandb_safe_log(val_metrics, step=logged_step, commit=False)
-
-                    # Print table (console) and defer W&B commit until after optional monitor eval
-                    print_metrics_table(
-                        per_class, aggregates, cfg.ID2LANG, cfg.NUM_CLASSES, cfg.PAD_ID
-                    )
-
-                    if monitor_data is not None and t_cfg.monitor_eval_every > 0:
-                        if bool(t_cfg.monitor_eval_deterministic):
+                        if first_compile_started_at > 0.0:
                             print(
-                                f"Running monitor evaluation (deterministic seed={int(t_cfg.monitor_eval_seed)})...",
+                                f"[{phase_label}] First compiled train step finished in "
+                                f"{time.time() - first_compile_started_at:.2f}s. Subsequent steps should be much faster.",
                                 flush=True,
                             )
-                        else:
-                            print("Running monitor evaluation...", flush=True)
-                        eval_rng, monitor_rng = jax.random.split(eval_rng)
-                        limit = None if t_cfg.monitor_eval_limit < 0 else int(t_cfg.monitor_eval_limit)
-                        monitor_batch_size = (
-                            int(t_cfg.monitor_eval_batch_size)
-                            if int(t_cfg.monitor_eval_batch_size) > 0
-                            else int(d_cfg.batch_size)
-                        )
-                        monitor_stats = evaluate_monitor_set(
-                            state=eval_state,
-                            monitor_data=monitor_data,
-                            L=d_cfg.window_max_bytes,
-                            batch_size=monitor_batch_size,
-                            rng=monitor_rng,
-                            limit=limit,
-                            eval_step_fn=eval_step,
-                            eval_step_with_logits_fn=eval_step_with_logits,
-                            other_threshold=t_cfg.monitor_other_threshold,
-                            deterministic=bool(t_cfg.monitor_eval_deterministic),
-                            deterministic_seed=int(t_cfg.monitor_eval_seed),
-                        )
-                        # Base monitor confusion: only trained classes.
-                        per_class_m, aggregates_m = compute_metrics_from_confusion(
-                            monitor_stats["conf_mat"], cfg.NUM_CLASSES, cfg.PAD_ID
-                        )
-                        print_metrics_table(
-                            per_class_m,
-                            aggregates_m,
-                            cfg.ID2LANG,
-                            cfg.NUM_CLASSES,
-                            cfg.PAD_ID,
-                            title="Monitor",
-                        )
-                        monitor_scalar_logs = {
-                            "monitor/loss": monitor_stats["loss_mean"],
-                            "monitor/acc": monitor_stats["acc_mean"],
-                            "monitor/windows": monitor_stats["windows"],
-                            "monitor/skipped": monitor_stats["skipped"],
-                            "monitor/files_used": monitor_stats["files_used"],
-                            "monitor/threshold": t_cfg.monitor_other_threshold,
-                        }
-                        # Gap metrics (monitor - val) for quick drift detection
-                        monitor_gap_logs = {
-                            "monitor_gap/micro_accuracy": float(aggregates_m["micro"]["acc"] - aggregates["micro"]["acc"]),
-                            "monitor_gap/macro_f1": float(aggregates_m["macro"]["f1"] - aggregates["macro"]["f1"]),
-                            "monitor_gap/macro_precision": float(aggregates_m["macro"]["precision"] - aggregates["macro"]["precision"]),
-                            "monitor_gap/macro_recall": float(aggregates_m["macro"]["recall"] - aggregates["macro"]["recall"]),
-                            "monitor_gap/weighted_f1": float(aggregates_m["weighted"]["f1"] - aggregates["weighted"]["f1"]),
-                        }
-                        monitor_combined_logs = {**monitor_scalar_logs, **monitor_gap_logs}
-                        wandb_log_metrics(
-                            logged_step,
-                            per_class_m,
-                            aggregates_m,
-                            cfg.ID2LANG,
-                            cfg.NUM_CLASSES,
-                            cfg.PAD_ID,
-                            monitor_stats["conf_mat"],
-                            prefix="monitor",
-                            extra_logs=monitor_combined_logs,
-                            commit=False,
-                        )
-                        if monitor_stats.get("conf_thresh") is not None and monitor_stats.get("acc_thresh_mean") is not None:
-                            # Thresholded confusion includes a derived "other" bucket
-                            # at index cfg.OTHER_CLASS_INDEX.
-                            num_classes_with_other = cfg.NUM_CLASSES + 1
-                            per_class_mt, aggregates_mt = compute_metrics_from_confusion(
-                                monitor_stats["conf_thresh"],
-                                num_classes_with_other,
-                                cfg.PAD_ID,
-                            )
-                            print_metrics_table(
-                                per_class_mt,
-                                aggregates_mt,
-                                cfg.ID2LANG,
-                                cfg.NUM_CLASSES,
-                                cfg.PAD_ID,
-                                title="Monitor (thresholded)",
-                            )
-                            thresh_logs = {
-                                "monitor_thresh/acc": monitor_stats.get("acc_thresh_mean", 0.0) or 0.0,
-                                "monitor_thresh/threshold": t_cfg.monitor_other_threshold,
-                                "monitor_thresh/windows": monitor_stats["windows"],
-                                "monitor_thresh/skipped": monitor_stats["skipped"],
-                                "monitor_thresh/files_used": monitor_stats["files_used"],
-                                "monitor_gap_thresh/micro_accuracy": float(aggregates_mt["micro"]["acc"] - aggregates["micro"]["acc"]),
-                                "monitor_gap_thresh/macro_f1": float(aggregates_mt["macro"]["f1"] - aggregates["macro"]["f1"]),
-                                "monitor_gap_thresh/macro_precision": float(aggregates_mt["macro"]["precision"] - aggregates["macro"]["precision"]),
-                                "monitor_gap_thresh/macro_recall": float(aggregates_mt["macro"]["recall"] - aggregates["macro"]["recall"]),
-                                "monitor_gap_thresh/weighted_f1": float(aggregates_mt["weighted"]["f1"] - aggregates["weighted"]["f1"]),
-                            }
-                            wandb_log_metrics(
-                                logged_step,
-                                per_class_mt,
-                                aggregates_mt,
-                                cfg.ID2LANG,
-                                cfg.NUM_CLASSES,
-                                cfg.PAD_ID,
-                                monitor_stats["conf_thresh"],
-                                prefix="monitor_thresh",
-                                extra_logs=thresh_logs,
-                                commit=False,
-                            )
+                            first_compile_started_at = 0.0
+                        loss_value = float(loss)
+                        acc_value = float(acc)
+                        compute_time = time.time() - compute_start
+                        loss = loss_value
+                        acc = acc_value
 
-                    # Finally, log val confusion + metrics and commit the step atomically
-                    wandb_log_metrics(
-                        logged_step,
-                        per_class,
-                        aggregates,
-                        cfg.ID2LANG,
-                        cfg.NUM_CLASSES,
-                        cfg.PAD_ID,
-                        conf_mat,
-                        commit=True,
-                    )
+                        del batch_tokens
+                        del batch_labels
+                    else:
+                        losses = []
+                        accs = []
+                        grad_accum = None
+                        micro_rng = step_base_rng
 
-                    # Save checkpoints — unreplicate if using pmap
-                    save_state = unreplicate_state(state) if use_pmap else state
-                    try:
-                        _save_training_checkpoint(
-                            save_state,
-                            t_cfg.ckpt_path,
-                            logged_step,
-                            async_manager=ckpt_async_manager,
-                        )
-                    except Exception as e:
-                        print(
-                            f"WARNING: writing checkpoint failed: {e}",
-                            flush=True,
-                        )
-
-                    # Simple pruning (unchanged)
-                    elapsed_min = (time.time() - start_time) / 60.0
-                    if elapsed_min >= args.prune_min_minutes:
-                        if (
-                            val_loss
-                            + args.prune_delta
-                            * (best_val if best_val < float("inf") else val_loss)
-                            < best_val
-                        ):
-                            best_val = val_loss
-                            non_improve_evals = 0
-                        else:
-                            non_improve_evals += 1
-                            if non_improve_evals >= args.prune_patience_evals:
-                                pruned = True
-                                stopped_reason = (
-                                    f"pruned_no_improve_{args.prune_patience_evals}"
-                                    f"evals_delta{args.prune_delta}"
-                                )
+                        for micro_idx in range(accum_steps):
+                            if not first_batch_announced:
                                 print(
-                                    f"[PRUNE] {stopped_reason}. Stopping run.",
+                                    f"[{phase_label}] Preparing first microbatch from the fine-tune/replay pipeline...",
                                     flush=True,
                                 )
-                                break
+                                first_batch_announced = True
+                            data_start = time.time()
+                            mb_tokens, mb_labels = data_fetcher.get()
+                            mb_tokens = sanitize_tokens(mb_tokens)
+                            data_time += time.time() - data_start
+                            if not first_batch_ready_announced:
+                                print(
+                                    f"[{phase_label}] First microbatch ready in {data_time:.2f}s "
+                                    f"(tokens_shape={tuple(mb_tokens.shape)}, labels_shape={tuple(mb_labels.shape)}, "
+                                    f"accum_steps={accum_steps}, micro_idx={micro_idx + 1}/{accum_steps}).",
+                                    flush=True,
+                                )
+                                first_batch_ready_announced = True
 
-        except KeyboardInterrupt:
-            stopped_reason = "keyboard_interrupt"
-            print("Interrupted. Saving checkpoint and finishing.", flush=True)
-        except Exception as e:
-            # Catch any other exception (like CUDA OOM)
-            error_reason = str(e)
+                            micro_rng, oe_decision_rng = jax.random.split(micro_rng)
+                            use_oe = (
+                                oe_batcher is not None
+                                and float(jax.random.uniform(oe_decision_rng, ()).item()) < oe_ratio
+                            )
+                            micro_rng, use_rng = jax.random.split(micro_rng)
+                            if not first_compile_started:
+                                first_compile_started = True
+                                first_compile_started_at = time.time()
+                                print(
+                                    f"[{phase_label}] Launching first compiled train step "
+                                    f"(this can take a while for new shapes, especially 10k full-file mode)...",
+                                    flush=True,
+                                )
+                            compute_start = time.time()
+                            if use_pmap:
+                                mb_tokens_s, mb_labels_s = shard_batch(mb_tokens, mb_labels)
+                                use_rngs = make_pmap_rngs(use_rng)
+                            if use_oe:
+                                data_start = time.time()
+                                outlier_tokens = oe_batcher.get()
+                                outlier_tokens = sanitize_tokens(outlier_tokens)
+                                data_time += time.time() - data_start
+                                if use_pmap:
+                                    (outlier_tokens_s,) = shard_batch(outlier_tokens)
+                                    grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
+                                        state,
+                                        mb_tokens_s,
+                                        mb_labels_s,
+                                        outlier_tokens_s,
+                                        oe_lambda,
+                                        use_rngs,
+                                    )
+                                    micro_loss = float(micro_loss[0])
+                                    micro_acc = float(micro_acc[0])
+                                    micro_oe_loss = float(micro_oe_loss[0])
+                                else:
+                                    grads, micro_loss, micro_acc, micro_oe_loss = micro_step_oe_fn(
+                                        state,
+                                        mb_tokens,
+                                        mb_labels,
+                                        outlier_tokens,
+                                        oe_lambda,
+                                        use_rng,
+                                    )
+                                oe_losses.append(float(micro_oe_loss))
+                                oe_batches_used += 1
+                                del outlier_tokens
+                            else:
+                                if use_pmap:
+                                    grads, micro_loss, micro_acc = micro_step_fn(
+                                        state, mb_tokens_s, mb_labels_s, use_rngs
+                                    )
+                                    micro_loss = float(micro_loss[0])
+                                    micro_acc = float(micro_acc[0])
+                                else:
+                                    grads, micro_loss, micro_acc = micro_step_fn(
+                                        state, mb_tokens, mb_labels, use_rng
+                                    )
+                            if first_compile_started_at > 0.0:
+                                print(
+                                    f"[{phase_label}] First compiled train step finished in "
+                                    f"{time.time() - first_compile_started_at:.2f}s. Subsequent steps should be much faster.",
+                                    flush=True,
+                                )
+                                first_compile_started_at = 0.0
+                            micro_loss_value = float(micro_loss)
+                            micro_acc_value = float(micro_acc)
+                            compute_time += time.time() - compute_start
+
+                            if grad_accum is None:
+                                grad_accum = grads
+                            else:
+                                grad_accum = jtu.tree_map(
+                                    lambda a, b: a + b, grad_accum, grads
+                                )
+
+                            losses.append(micro_loss_value)
+                            accs.append(micro_acc_value)
+
+                            del mb_tokens
+                            del mb_labels
+
+                        scale = jnp.asarray(accum_steps, dtype=jnp.float32)
+                        grad_accum = jtu.tree_map(lambda g: g / scale, grad_accum)
+                        if use_pmap:
+                            grad_norm_value = float(grad_global_norm(
+                                jax.tree.map(lambda x: x[0], grad_accum)
+                            ))
+                            state = p_apply_gradients(state, grad_accum)
+                        else:
+                            grad_norm_value = float(grad_global_norm(grad_accum))
+                            state = state.apply_gradients(grads=grad_accum)
+                        apply_start = time.time()
+                        compute_time += time.time() - apply_start
+                        loss = float(sum(losses) / len(losses))
+                        acc = float(sum(accs) / len(accs))
+
+                    oe_loss_value = float(sum(oe_losses) / len(oe_losses)) if oe_losses else 0.0
+                    step_time = time.time() - step_start
+                    logged_step = int(step) + 1
+
+                    try:
+                        if hasattr(state.opt_state[1], "hyperparams"):
+                            step_lr = float(state.opt_state[1].hyperparams["learning_rate"])
+                        elif len(state.opt_state) > 2 and hasattr(
+                            state.opt_state[2], "count"
+                        ):
+                            step_lr = float(
+                                t_cfg.lr * min(1.0, state.opt_state[2].count / t_cfg.warmup)
+                            )
+                        else:
+                            step_lr = t_cfg.lr
+                    except Exception:
+                        step_lr = t_cfg.lr
+
+                    epochs_by_lang = data_fetcher.get_epochs()
+                    if epochs_by_lang:
+                        min_epochs = float(min(epochs_by_lang.values()))
+                        max_epochs = float(max(epochs_by_lang.values()))
+                    else:
+                        min_epochs = max_epochs = 0.0
+
+                    metrics = {
+                        "train/loss": float(loss),
+                        "train/acc": float(acc),
+                        "train/learning_rate": step_lr,
+                        "train/min_epochs": min_epochs,
+                        "train/max_epochs": max_epochs,
+                        "perf/data_time": data_time,
+                        "perf/compute_time": compute_time,
+                        "perf/total_step_time": step_time,
+                    }
+                    if oe_lambda > 0.0:
+                        metrics.update(
+                            {
+                                "oe/loss_uniform": float(oe_loss_value),
+                                "oe/active_batches": int(oe_batches_used),
+                                "oe/lambda": float(oe_lambda),
+                                "oe/ratio": float(oe_ratio),
+                            }
+                        )
+
+                    if grad_norm_value is not None:
+                        rs = _compute_running_stats(
+                            metrics_history["grad_norm"], grad_norm_value
+                        )
+                        metrics.update(
+                            {
+                                "train/grad_norm": grad_norm_value,
+                                "train/grad_norm_mean": rs["mean"],
+                                "train/grad_norm_std": rs["std"],
+                                "train/grad_norm_trend": rs["trend"],
+                            }
+                        )
+
+                    rs = _compute_running_stats(metrics_history["loss"], float(loss))
+                    metrics.update(
+                        {
+                            "train/loss_mean": rs["mean"],
+                            "train/loss_std": rs["std"],
+                            "train/loss_trend": rs["trend"],
+                        }
+                    )
+                    rs = _compute_running_stats(metrics_history["acc"], float(acc))
+                    metrics.update(
+                        {
+                            "train/acc_mean": rs["mean"],
+                            "train/acc_std": rs["std"],
+                            "train/acc_trend": rs["trend"],
+                        }
+                    )
+                    rs = _compute_running_stats(metrics_history["step_time"], step_time)
+                    metrics.update(
+                        {"perf/step_time_mean": rs["mean"], "perf/step_time_std": rs["std"]}
+                    )
+
+                    should_commit = (
+                        logged_step % t_cfg.log_every == 0
+                        and logged_step % t_cfg.eval_every != 0
+                    )
+
+                    _wandb_safe_log(metrics, step=logged_step, commit=should_commit)
+                    last_heartbeat = time.time()
+
+                    if logged_step % t_cfg.log_every == 0:
+                        elapsed = time.time() - last_log_time
+                        sps = t_cfg.log_every / elapsed if elapsed > 0 else 0
+                        print(
+                            f"[{phase_label}] Step {logged_step}/{target_logged_step} [Epochs {min_epochs:.3f}-{max_epochs:.3f}] | "
+                            f"Loss: {loss:.4f} (±{metrics['train/loss_std']:.4f}), "
+                            f"Acc: {acc:.4f} (±{metrics['train/acc_std']:.4f}), SPS: {sps:.2f}",
+                            flush=True,
+                        )
+                        last_log_time = time.time()
+
+                    if time.time() - last_heartbeat > 600:
+                        stopped_reason = "watchdog_no_progress_10min"
+                        print(
+                            f"[{phase_label}] Watchdog: no progress for 10 minutes. Stopping.",
+                            flush=True,
+                        )
+                        break
+
+                    if logged_step > 0 and logged_step % t_cfg.eval_every == 0:
+                        val_loss, val_acc = run_val_and_monitor_eval(
+                            step=logged_step,
+                            title=f"Evaluating ({phase_label})",
+                            train_loss=float(loss),
+                            train_acc=float(acc),
+                            commit=True,
+                        )
+
+                        save_state = unreplicate_state(state) if use_pmap else state
+                        try:
+                            _save_training_checkpoint(
+                                save_state,
+                                t_cfg.ckpt_path,
+                                logged_step,
+                                async_manager=ckpt_async_manager,
+                            )
+                        except Exception as e:
+                            print(
+                                f"WARNING: writing checkpoint failed: {e}",
+                                flush=True,
+                            )
+
+                        elapsed_min = (time.time() - start_time) / 60.0
+                        if elapsed_min >= args.prune_min_minutes:
+                            if (
+                                val_loss
+                                + args.prune_delta
+                                * (best_val if best_val < float("inf") else val_loss)
+                                < best_val
+                            ):
+                                best_val = val_loss
+                                non_improve_evals = 0
+                            else:
+                                non_improve_evals += 1
+                                if non_improve_evals >= args.prune_patience_evals:
+                                    pruned = True
+                                    stopped_reason = (
+                                        f"pruned_no_improve_{args.prune_patience_evals}"
+                                        f"evals_delta{args.prune_delta}"
+                                    )
+                                    print(
+                                        f"[PRUNE:{phase_label}] {stopped_reason}. Stopping run.",
+                                        flush=True,
+                                    )
+                                    break
+
+            except KeyboardInterrupt:
+                stopped_reason = "keyboard_interrupt"
+                print(f"[{phase_label}] Interrupted. Saving checkpoint and finishing chunk.", flush=True)
+            except Exception as e:
+                error_reason = str(e)
+                error_type_name = type(e).__name__
+                print(
+                    f"\nFATAL ERROR in training loop ({phase_label}): {type(e).__name__}: {e}",
+                    flush=True,
+                )
+        finally:
+            if ckpt_async_manager is not None:
+                try:
+                    ckpt_async_manager.wait_previous_save()
+                except Exception:
+                    pass
+
+        final_reason = "completed"
+        if error_reason:
+            final_reason = f"error_{error_type_name or 'runtime'}"
+            current_log_step = _state_step(state, use_pmap=use_pmap)
+            _wandb_safe_log(
+                {"meta/error_message": error_reason},
+                step=current_log_step,
+                commit=False,
+            )
+        elif stopped_reason:
+            final_reason = stopped_reason
+
+        final_step = _state_step(state, use_pmap=use_pmap)
+        if final_step > 0:
+            save_state = unreplicate_state(state) if use_pmap else state
+            try:
+                _save_training_checkpoint(save_state, t_cfg.ckpt_path, final_step)
+            except Exception as e:
+                print(f"WARNING: final checkpoint save failed: {e}", flush=True)
+
+        runtime_minutes = (time.time() - start_time) / 60.0
+        _wandb_safe_log(
+            {
+                "meta/chunk_stopped_reason": final_reason,
+                "meta/chunk_phase": str(phase_label),
+                "meta/chunk_pruned": int(pruned),
+                "meta/chunk_runtime_minutes": float(runtime_minutes),
+                "meta/chunk_target_step": int(target_step),
+                "meta/persistent_trainer": int(persistent_mode),
+            },
+            step=final_step,
+        )
+        return {
+            "status": "error" if error_reason else "ok",
+            "phase_label": str(phase_label),
+            "current_step": int(final_step),
+            "target_step": int(target_step),
+            "requested_updates": int(requested_updates),
+            "completed_updates": int(max(0, final_step - current_phase_step)),
+            "final_reason": str(final_reason),
+            "runtime_minutes": float(runtime_minutes),
+            "pruned": int(pruned),
+            "error_message": str(error_reason),
+        }
+
+    process_final_reason = "completed"
+    process_error_message = ""
+    try:
+        if persistent_mode:
+            ready_step = _state_step(state, use_pmap=use_pmap)
             print(
-                f"\nFATAL ERROR in training loop: {type(e).__name__}: {e}",
+                f"Persistent trainer ready at checkpoint step {ready_step}; waiting for commands on stdin.",
                 flush=True,
             )
-            # This error will be logged in the finally block
+            _emit_persistent_trainer_event(
+                "ready",
+                current_step=int(ready_step),
+                wandb_run_id=str(getattr(getattr(wandb, "run", None), "id", "")),
+                ckpt_path=str(t_cfg.ckpt_path),
+            )
+            while True:
+                try:
+                    command = _read_persistent_trainer_command()
+                except Exception as exc:
+                    print(f"Persistent trainer command parse error: {exc}", flush=True)
+                    _emit_persistent_trainer_event("command_error", error=str(exc))
+                    continue
+
+                command_name = str(command.get("command", "")).strip().lower()
+                if command_name == "shutdown":
+                    reason = str(command.get("reason", "shutdown")).strip() or "shutdown"
+                    process_final_reason = f"shutdown_{reason}"
+                    _emit_persistent_trainer_event(
+                        "shutdown_ack",
+                        current_step=int(_state_step(state, use_pmap=use_pmap)),
+                        reason=reason,
+                    )
+                    break
+                if command_name != "train":
+                    message = f"Unsupported trainer command: {command_name}"
+                    print(message, flush=True)
+                    _emit_persistent_trainer_event("command_error", error=message)
+                    continue
+
+                try:
+                    command_target_step = int(command.get("steps"))
+                except Exception as exc:
+                    message = f"Missing/invalid 'steps' in trainer command: {exc}"
+                    print(message, flush=True)
+                    _emit_persistent_trainer_event("command_error", error=message)
+                    continue
+
+                command_phase_label = str(
+                    command.get("phase_label", f"persistent_step_{command_target_step}")
+                ).strip() or f"persistent_step_{command_target_step}"
+                command_max_minutes = int(command.get("max_minutes", args.max_minutes))
+                if "active_learning_mix_prob" in command and hasattr(data_fetcher, "mix_prob"):
+                    requested_mix_prob = float(command.get("active_learning_mix_prob", 0.0))
+                    requested_mix_prob = max(0.0, min(1.0, requested_mix_prob))
+                    old_mix_prob = float(getattr(data_fetcher, "mix_prob", requested_mix_prob))
+                    setattr(data_fetcher, "mix_prob", requested_mix_prob)
+                    print(
+                        f"[{command_phase_label}] Updated active-learning replay mix_prob "
+                        f"from {old_mix_prob:.4f} to {requested_mix_prob:.4f}.",
+                        flush=True,
+                    )
+                chunk_summary = _run_training_phase(
+                    target_step=command_target_step,
+                    phase_label=command_phase_label,
+                    phase_max_minutes=command_max_minutes,
+                )
+                event_name = "chunk_failed" if str(chunk_summary.get("status")) == "error" else "chunk_done"
+                _emit_persistent_trainer_event(event_name, **chunk_summary)
+                if str(chunk_summary.get("status")) == "error":
+                    process_final_reason = str(chunk_summary.get("final_reason", "error"))
+                    process_error_message = str(chunk_summary.get("error_message", ""))
+                    break
+                if _STOP["flag"]:
+                    process_final_reason = str(chunk_summary.get("final_reason", "signal"))
+                    break
+        else:
+            chunk_summary = _run_training_phase(
+                target_step=int(t_cfg.steps),
+                phase_label="train_main",
+                phase_max_minutes=int(args.max_minutes),
+            )
+            process_final_reason = str(chunk_summary.get("final_reason", "completed"))
+            process_error_message = str(chunk_summary.get("error_message", ""))
     finally:
         try:
             data_fetcher.close()
         except Exception:
             pass
-
-        final_reason = "completed"
-        if error_reason:
-            final_reason = f"error_{error_reason.__class__.__name__}"
-            current_step = _state_step(state, use_pmap=use_pmap)
-            _wandb_safe_log(
-                {"meta/error_message": error_reason},
-                step=current_step,
-                commit=False,
-            )
-        elif stopped_reason:
-            final_reason = stopped_reason
 
         if ckpt_async_manager is not None:
             try:
@@ -2207,11 +2335,17 @@ def main():
                 _save_training_checkpoint(save_state, t_cfg.ckpt_path, current_step)
             except Exception as e:
                 print(f"WARNING: final checkpoint save failed: {e}", flush=True)
+
+        if process_error_message:
+            _wandb_safe_log(
+                {"meta/error_message": process_error_message},
+                step=current_step,
+                commit=False,
+            )
         _wandb_safe_log(
             {
-                "meta/stopped_reason": final_reason,
-                "meta/pruned": int(pruned),
-                "meta/runtime_minutes": (time.time() - start_time) / 60.0,
+                "meta/stopped_reason": str(process_final_reason),
+                "meta/persistent_trainer": int(persistent_mode),
             },
             step=current_step,
         )
