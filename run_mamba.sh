@@ -1,0 +1,1 @@
+python train/main.py --arch mamba --model_dim 256 --mamba_layers 6 --mamba_d_state 8 --mamba_expand 1 --mamba_dt_rank 16 --mamba_conv 4 --mamba_bidirectional --batch_size 8 --accum_steps 2 --lr 3e-5 --eval_every 5000 --eval_batches 10 --steps 150000 --monitor_other_threshold 0.5

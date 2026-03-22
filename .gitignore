@@ -4,6 +4,7 @@
 
 # Byte-compiled Python files
 __pycache__/
+downloader/mon_preprocessed_before_relabeling/*
 evaluation/reports/**
 *.pyc
 scripts/
