@@ -223,6 +223,9 @@ class TestEvaluationRegionTasks(unittest.TestCase):
         self.assertEqual(int(md_stats["truth_chars"]), 4)
         self.assertEqual(int(md_stats["correct_chars"]), 4)
         self.assertEqual(int(md_stats["detected_correct"]), 1)
+        text_like_binary = metrics.extras["markdown_segments"]["text_like_binary"]
+        self.assertIn("tex", text_like_binary["positive_labels"])
+        self.assertAlmostEqual(float(text_like_binary["by_label"]["text_like"]["f1"]), 1.0)
 
         manifest = {
             "output_root": "evaluation/data",
@@ -251,6 +254,11 @@ class TestEvaluationRegionTasks(unittest.TestCase):
         )
         payload = evalmod._collect_comparison_metrics(args, [metrics], [], manifest)
         self.assertEqual(payload["tasks"]["markdown_mix"]["support_summary"]["requested_count"], 10)
+        self.assertIn("text_like_binary", payload["tasks"]["markdown_mix"])
+        self.assertAlmostEqual(
+            float(payload["tasks"]["markdown_mix"]["text_like_binary"]["by_label"]["text_like"]["precision"]),
+            1.0,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             report_path = Path(tmpdir) / "report.md"
@@ -264,6 +272,85 @@ class TestEvaluationRegionTasks(unittest.TestCase):
             report = report_path.read_text(encoding="utf-8")
             self.assertIn("Support: 7/10 requested examples.", report)
             self.assertIn("Shortfall by anchor: shell -2, python -1.", report)
+            self.assertIn("Binary text-like metrics", report)
+            self.assertIn("| text_like | 4 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |", report)
+
+    def test_restructuredtext_comparison_metrics_include_text_like_binary(self) -> None:
+        content = "RRABCDTT"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="restructuredtext_mix",
+                    content=content,
+                    segments=[
+                        {"label": "restructuredtext", "char_start": 0, "char_end": 2},
+                        {"label": "python", "char_start": 2, "char_end": 6},
+                        {"label": "text", "char_start": 6, "char_end": 8},
+                    ],
+                    metadata={
+                        "markdown_blocks": [
+                            {
+                                "role": "other",
+                                "wrapped": False,
+                                "language": "python",
+                                "char_start": 2,
+                                "char_end": 6,
+                                "truth_mode": "exact_region",
+                            }
+                        ],
+                        "inline_blocks": [],
+                    },
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[
+                int(evalmod.cfg.LANG2ID["restructuredtext"]),
+                int(evalmod.cfg.LANG2ID["restructuredtext"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["markdown"]),
+                int(evalmod.cfg.LANG2ID["markdown"]),
+            ],
+            probs=[
+                _prob_row("restructuredtext"),
+                _prob_row("restructuredtext"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("markdown"),
+                _prob_row("markdown"),
+            ],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "restructuredtext_mix",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+
+        args = SimpleNamespace(
+            checkpoint="ckpt.msgpack",
+            model_dim=256,
+            channels=[96, 128, 192, 256],
+            dtype="bfloat16",
+            sample_seed=13,
+            other_threshold=0.0,
+            chunk=1536,
+            batch_size=8,
+            max_samples=0,
+        )
+        payload = evalmod._collect_comparison_metrics(args, [metrics], [], None)
+        self.assertIn("text_like_binary", payload["tasks"]["restructuredtext_mix"])
+        self.assertAlmostEqual(
+            float(payload["tasks"]["restructuredtext_mix"]["text_like_binary"]["by_label"]["text_like"]["recall"]),
+            1.0,
+        )
 
 
 if __name__ == "__main__":

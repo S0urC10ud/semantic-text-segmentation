@@ -64,7 +64,10 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import flax.serialization as serialization  # noqa: E402
 from flax.errors import ScopeParamShapeError  # noqa: E402
-import orbax.checkpoint as ocp  # noqa: E402
+try:
+    import orbax.checkpoint as ocp  # noqa: E402
+except Exception:  # pragma: no cover - environment-dependent optional import
+    ocp = None  # type: ignore[assignment]
 
 from inference.backend import (  # noqa: E402
     FastInferenceEngine,
@@ -79,11 +82,13 @@ from utils.model import (  # noqa: E402
     checkpoint_params_subtree,
     merge_compatible_state,
 )
+from utils.metrics_helper import (  # noqa: E402
+    _valid_metric_mask,
+    accumulate_confusion,
+    compute_metrics_from_confusion,
+)
+from utils.monitor_eval import load_monitor_memmaps  # noqa: E402
 from utils.token_utils import sanitize_bytes, sanitize_tokens  # noqa: E402
-try:
-    from utils.metrics_helper import compute_metrics_from_confusion  # noqa: E402
-except Exception:  # pragma: no cover - optional when plotting/summary isn't needed
-    compute_metrics_from_confusion = None  # type: ignore[assignment]
 
 DEFAULT_CHUNK_SIZE = cfg.MODEL_WINDOW_BYTES
 
@@ -98,6 +103,16 @@ _VISIBLE_ASCII_MAX = 0x7E
 _ALLOWED_TEXT_CONTROLS = {"\n", "\t"}
 _VISUAL_WHITESPACE_CHARS: Tuple[str, ...] = (" ", "\t", "\n")
 _VISUAL_WHITESPACE_SET = frozenset(_VISUAL_WHITESPACE_CHARS)
+TEXT_LIKE_POSITIVE_LABELS: Tuple[str, ...] = (
+    "text",
+    "markdown",
+    "restructuredtext",
+    "tex",
+)
+_TEXT_LIKE_ID2LABEL: Dict[int, str] = {
+    0: "not_text_like",
+    1: "text_like",
+}
 
 
 def normalize_eval_text(text: Optional[str]) -> str:
@@ -216,6 +231,11 @@ def _load_params_from_any(ckpt_path: str, params_template):
     step_dir = _find_latest_orbax_step_dir(p)
     if step_dir is None:
         raise FileNotFoundError(f"Checkpoint path not found/unsupported: {ckpt_path}")
+    if ocp is None:
+        raise RuntimeError(
+            "Orbax checkpoint support is unavailable in this environment; "
+            f"cannot restore Orbax checkpoint at '{step_dir}'."
+        )
 
     step_dir_str = step_dir.resolve().as_posix()
     checkpointer = ocp.StandardCheckpointer()
@@ -1252,6 +1272,263 @@ def _float_or_none(value: Any) -> Optional[float]:
     return None
 
 
+def _metrics_payload_from_confusion(
+    conf_mat: np.ndarray,
+    *,
+    id2label: Mapping[int, str],
+    num_classes: int,
+    ignore_class: Optional[int] = None,
+) -> Dict[str, Any]:
+    per_class, aggregates = compute_metrics_from_confusion(
+        conf_mat,
+        int(num_classes),
+        ignore_class,
+    )
+    rows: List[Dict[str, Any]] = [
+        {
+            "label": "ALL (agg)",
+            "support": None,
+            "acc": float(aggregates["micro"]["acc"]),
+            "precision": float(aggregates["macro"]["precision"]),
+            "recall": float(aggregates["macro"]["recall"]),
+            "f1": float(aggregates["macro"]["f1"]),
+        }
+    ]
+    by_label: Dict[str, Dict[str, Any]] = {}
+    support = per_class["support"]
+    acc = per_class["acc"]
+    prec = per_class["precision"]
+    rec = per_class["recall"]
+    f1 = per_class["f1"]
+    for cid in range(int(num_classes)):
+        if ignore_class is not None and cid == int(ignore_class):
+            continue
+        if int(support[cid]) <= 0:
+            continue
+        label = str(id2label.get(cid, str(cid)))
+        row = {
+            "label": label,
+            "support": int(support[cid]),
+            "acc": float(acc[cid]),
+            "precision": float(prec[cid]),
+            "recall": float(rec[cid]),
+            "f1": float(f1[cid]),
+        }
+        rows.append(row)
+        by_label[label] = row
+    return {
+        "aggregates": {
+            "micro_acc": float(aggregates["micro"]["acc"]),
+            "macro_precision": float(aggregates["macro"]["precision"]),
+            "macro_recall": float(aggregates["macro"]["recall"]),
+            "macro_f1": float(aggregates["macro"]["f1"]),
+            "weighted_f1": float(aggregates["weighted"]["f1"]),
+        },
+        "rows": rows,
+        "by_label": by_label,
+    }
+
+
+def _render_training_style_metrics_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    lines = [
+        "| label | support | acc | prec | recall | f1 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        support = row.get("support")
+        support_str = "" if support is None else str(int(support))
+        lines.append(
+            "| {label} | {support} | {acc:.4f} | {precision:.4f} | {recall:.4f} | {f1:.4f} |".format(
+                label=str(row.get("label", "")),
+                support=support_str,
+                acc=float(row.get("acc", 0.0)),
+                precision=float(row.get("precision", 0.0)),
+                recall=float(row.get("recall", 0.0)),
+                f1=float(row.get("f1", 0.0)),
+            )
+        )
+    return "\n".join(lines)
+
+
+def _build_text_like_binary_payload(conf_mat: np.ndarray) -> Dict[str, Any]:
+    payload = _metrics_payload_from_confusion(
+        conf_mat,
+        id2label=_TEXT_LIKE_ID2LABEL,
+        num_classes=2,
+        ignore_class=None,
+    )
+    truth_negative = int(conf_mat[0, :].sum())
+    truth_positive = int(conf_mat[1, :].sum())
+    predicted_negative = int(conf_mat[:, 0].sum())
+    predicted_positive = int(conf_mat[:, 1].sum())
+    payload.update(
+        {
+            "positive_labels": list(TEXT_LIKE_POSITIVE_LABELS),
+            "counts": {
+                "tn": int(conf_mat[0, 0]),
+                "fp": int(conf_mat[0, 1]),
+                "fn": int(conf_mat[1, 0]),
+                "tp": int(conf_mat[1, 1]),
+                "truth_positive": truth_positive,
+                "truth_negative": truth_negative,
+                "predicted_positive": predicted_positive,
+                "predicted_negative": predicted_negative,
+                "total": int(conf_mat.sum()),
+            },
+        }
+    )
+    return payload
+
+
+def _append_text_like_binary_lines(lines: List[str], payload: Mapping[str, Any]) -> None:
+    rows = payload.get("rows")
+    if not isinstance(rows, Sequence) or not rows:
+        return
+    positive_labels = payload.get("positive_labels", TEXT_LIKE_POSITIVE_LABELS)
+    labels_str = ", ".join(f"`{label}`" for label in positive_labels)
+    lines.extend(
+        [
+            "",
+            f"Binary text-like metrics ({labels_str} count as positive):",
+            "",
+            _render_training_style_metrics_table(rows),
+        ]
+    )
+
+
+def _evaluate_full_monitor_b(
+    monitor_root: Path,
+    runner: "SegmenterRunner",
+) -> Dict[str, Any]:
+    monitor_data = load_monitor_memmaps(Path(monitor_root).resolve())
+    files = monitor_data["files"]
+    segments = monitor_data["segments"]
+    contents = monitor_data["contents"]
+
+    arch = str(getattr(runner, "arch", "unet1d")).lower().strip()
+    use_mamba_path = arch == "mamba"
+    inference_mode = (
+        "full_file_auto_with_stream_fallback"
+        if use_mamba_path
+        else "sliding_window_legacy"
+    )
+
+    start_time = time.perf_counter()
+    confusion = np.zeros((cfg.NUM_CLASSES, cfg.NUM_CLASSES), dtype=np.int64)
+    files_used = 0
+    skipped = 0
+    evaluated_bytes = 0
+    raw_bytes = 0
+
+    for file_idx, row in enumerate(files):
+        byte_len = int(row["byte_len"])
+        if byte_len <= 0:
+            skipped += 1
+            continue
+        byte_start = int(row["byte_start"])
+        seg_start = int(row["seg_start"])
+        seg_count = int(row["seg_count"])
+
+        file_bytes = np.asarray(
+            contents[byte_start : byte_start + byte_len],
+            dtype=np.uint8,
+        )
+        truth = np.full((byte_len,), cfg.PAD_ID, dtype=np.uint8)
+        for seg in segments[seg_start : seg_start + seg_count]:
+            start = int(seg["start"])
+            end = int(seg["end"])
+            if end <= start:
+                continue
+            truth[start:end] = int(seg["label"])
+
+        if use_mamba_path:
+            pred = runner._segment_bytes_labels_only(file_bytes)
+        else:
+            pred = runner._segment_bytes_labels_only_legacy(file_bytes)
+        pred = np.asarray(pred, dtype=np.int32).reshape(-1)
+        if int(pred.shape[0]) != byte_len:
+            raise RuntimeError(
+                f"Monitor prediction length mismatch for file {file_idx}: "
+                f"expected {byte_len}, got {int(pred.shape[0])}"
+            )
+
+        mask = _valid_metric_mask(truth, file_bytes.astype(np.int32, copy=False))
+        core_mask = mask & (truth < cfg.NUM_CLASSES)
+        if core_mask.any():
+            accumulate_confusion(
+                confusion,
+                truth[core_mask].astype(np.int32, copy=False),
+                pred[core_mask].astype(np.int32, copy=False),
+            )
+            evaluated_bytes += int(core_mask.sum())
+
+        files_used += 1
+        raw_bytes += int(byte_len)
+
+    metrics_payload = _metrics_payload_from_confusion(
+        confusion,
+        id2label=cfg.ID2LANG,
+        num_classes=cfg.NUM_CLASSES,
+        ignore_class=cfg.PAD_ID,
+    )
+    metrics_payload.update(
+        {
+            "root": str(Path(monitor_root).resolve()),
+            "arch": arch,
+            "inference_mode": inference_mode,
+            "files_total": int(len(files)),
+            "files_used": int(files_used),
+            "skipped": int(skipped),
+            "evaluated_bytes": int(evaluated_bytes),
+            "raw_bytes": int(raw_bytes),
+            "elapsed_seconds": float(time.perf_counter() - start_time),
+        }
+    )
+    return metrics_payload
+
+
+def _default_monitor_b_root() -> Path:
+    return (REPO_ROOT / "downloader" / "monitor_preprocessed_b").resolve()
+
+
+def _configure_evaluation_mode(args) -> Dict[str, Any]:
+    default_eval_root = (REPO_ROOT / "evaluation" / "data").resolve()
+    fine_tune_eval_root = (REPO_ROOT / "evaluation" / "data_b").resolve()
+    requested_root = Path(args.data_root).resolve()
+    fine_tuned_mode = not bool(getattr(args, "non_fine_tuned", False))
+    messages: List[str] = []
+
+    if bool(getattr(args, "fine_tuned", False)):
+        messages.append(
+            "⚠️  --fine-tuned is deprecated; fine-tuned evaluation is now the default."
+        )
+    if fine_tuned_mode:
+        if requested_root == default_eval_root:
+            args.data_root = str(fine_tune_eval_root)
+            messages.append(
+                f"ℹ️  Fine-tuned mode (default): using evaluation data root {args.data_root}"
+            )
+        else:
+            args.data_root = str(requested_root)
+            messages.append(
+                f"ℹ️  Fine-tuned mode (default): using custom evaluation data root {args.data_root}"
+            )
+    else:
+        args.data_root = str(requested_root)
+        messages.append(
+            "⚠️  Non-fine-tuned evaluation mode requested via --non-fine-tuned. "
+            "This is the legacy/non-default path."
+        )
+
+    setattr(args, "fine_tuned_mode", bool(fine_tuned_mode))
+    return {
+        "fine_tuned_mode": bool(fine_tuned_mode),
+        "messages": messages,
+        "default_eval_root": str(default_eval_root),
+        "fine_tune_eval_root": str(fine_tune_eval_root),
+    }
+
+
 def _region_mask_valid(
     content_len: int,
     valid_mask: np.ndarray,
@@ -1552,6 +1829,8 @@ def evaluate_task(
 
     markdown_stats: Optional[Dict[str, Any]] = None
     markdown_stats_key: Optional[str] = None
+    text_like_positive_ids: Optional[np.ndarray] = None
+    text_like_confusion: Optional[np.ndarray] = None
     if name == "markdown_mix":
         markdown_stats = {
             "threshold": MARKDOWN_IOU_THRESHOLD,
@@ -1618,6 +1897,15 @@ def evaluate_task(
         markdown_stats_key = "restructuredtext_segments"
     if markdown_stats is not None and markdown_stats_key:
         extra_payload[markdown_stats_key] = markdown_stats
+        text_like_positive_ids = np.asarray(
+            [
+                int(label_to_idx[label])
+                for label in TEXT_LIKE_POSITIVE_LABELS
+                if label in label_to_idx
+            ],
+            dtype=np.int32,
+        )
+        text_like_confusion = np.zeros((2, 2), dtype=np.int64)
 
     payload_stats: Optional[Dict[str, Any]] = None
     if name == "mal_injection":
@@ -1679,6 +1967,7 @@ def evaluate_task(
         truth = _segments_to_labels(content, normalized_segments, label_to_idx)
         segments, pred_labels, pred_probs = runner.segment_text(content, min_run_chars=min_run_chars)
         pred_idx_array = np.full((len(pred_labels),), -1, dtype=np.int32)
+        pred_text_like_flags = np.zeros((len(pred_labels),), dtype=bool)
         prob_rows: Optional[List[Optional[np.ndarray]]] = [None] * len(pred_labels) if payload_stats is not None else None
         other_idx_eval = label_to_idx.get("other")
         use_other_threshold = other_threshold is not None and float(other_threshold) > 0.0 and other_idx_eval is not None
@@ -1688,6 +1977,7 @@ def evaluate_task(
                 alias = PREDICTION_LABEL_ALIASES.get(label_name)
                 if alias and alias in label_to_idx:
                     label_name = alias
+                pred_text_like_flags[i] = label_name in TEXT_LIKE_POSITIVE_LABELS
 
             # Compute max probability for this character if available.
             max_prob = None
@@ -1722,6 +2012,7 @@ def evaluate_task(
             valid_mask = np.logical_and(valid_mask, ~ws_mask)
         truth_valid = truth[valid_mask]
         pred_valid = pred_idx_array[valid_mask]
+        pred_text_like_valid = pred_text_like_flags[valid_mask]
         prob_valid = [prob_rows[i] for i, keep in enumerate(valid_mask) if keep] if prob_rows is not None else None
         same_mask = (pred_valid == truth_valid)
 
@@ -1729,6 +2020,11 @@ def evaluate_task(
 
         valid_pred_mask = pred_valid >= 0
         np.add.at(confusion, (truth_valid[valid_pred_mask], pred_valid[valid_pred_mask]), 1)
+
+        if text_like_confusion is not None and text_like_positive_ids is not None:
+            truth_bin = np.isin(truth_valid, text_like_positive_ids).astype(np.int32, copy=False)
+            pred_bin = pred_text_like_valid.astype(np.int32, copy=False)
+            accumulate_confusion(text_like_confusion, truth_bin, pred_bin)
 
         total_chars += int(valid_mask.sum())
         for lbl_idx, lbl_name in enumerate(label_names):
@@ -2515,6 +2811,8 @@ def evaluate_task(
             )
 
     elapsed_total = time.perf_counter() - start_time
+    if markdown_stats is not None and text_like_confusion is not None:
+        markdown_stats["text_like_binary"] = _build_text_like_binary_payload(text_like_confusion)
     extra_payload["elapsed_seconds"] = elapsed_total
 
     return TaskMetrics(
@@ -3121,6 +3419,7 @@ def _collect_task_highlights(
         overall = md_stats.get("overall", {})
         inline_stats = md_stats.get("inline", {})
         text_stats_overall = md_stats.get("text", {})
+        text_like_binary = md_stats.get("text_like_binary", {})
         support_lines = _support_summary_lines(_task_support_payload(manifest, "markdown_mix"))
 
         def _wrapper_row(name: str, group: Dict[str, Any]) -> str:
@@ -3174,6 +3473,7 @@ def _collect_task_highlights(
             wrapper_table.append("")
             wrapper_table.append(text_cov_line)
 
+        _append_text_like_binary_lines(wrapper_table, text_like_binary)
         add_section("markdown_mix", wrapper_table)
 
     # reStructuredText highlight (focus on foreign code sections, not fences)
@@ -3181,6 +3481,7 @@ def _collect_task_highlights(
     if rst_metrics:
         rst_stats = rst_metrics.extras.get("restructuredtext_segments", {}) if rst_metrics.extras else {}
         text_stats_overall = rst_stats.get("text", {})
+        text_like_binary = rst_stats.get("text_like_binary", {})
         per_language = rst_stats.get("per_language", {})
         support_lines = _support_summary_lines(_task_support_payload(manifest, "restructuredtext_mix"))
 
@@ -3218,6 +3519,7 @@ def _collect_task_highlights(
                 rows.append("")
             rows.append(text_cov_line)
 
+        _append_text_like_binary_lines(rows, text_like_binary)
         if rows:
             add_section("restructuredtext_mix", rows)
 
@@ -3509,6 +3811,7 @@ def _collect_comparison_metrics(
     task_metrics: List[TaskMetrics],
     throughput_results: List[ThroughputResult],
     manifest: Optional[Mapping[str, Any]] = None,
+    monitor_b_report: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     other_summary = _aggregate_other_confusion(task_metrics)
     metrics_by_name = {m.name: m for m in task_metrics}
@@ -3674,6 +3977,15 @@ def _collect_comparison_metrics(
         if text_truth or union_chars:
             md_data["text_accuracy"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), text_truth))
             md_data["text_iou"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), union_chars))
+        text_like_binary = md_stats.get("text_like_binary", {})
+        if isinstance(text_like_binary, Mapping) and text_like_binary.get("rows"):
+            md_data["text_like_binary"] = {
+                "positive_labels": list(text_like_binary.get("positive_labels", TEXT_LIKE_POSITIVE_LABELS)),
+                "counts": dict(text_like_binary.get("counts", {})),
+                "aggregates": dict(text_like_binary.get("aggregates", {})),
+                "rows": list(text_like_binary.get("rows", [])),
+                "by_label": dict(text_like_binary.get("by_label", {})),
+            }
 
         if md_data:
             data["tasks"]["markdown_mix"] = md_data
@@ -3772,6 +4084,15 @@ def _collect_comparison_metrics(
         if text_truth or union_chars:
             rst_data["text_accuracy"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), text_truth))
             rst_data["text_iou"] = _float_or_none(_safe_ratio(text_stats.get("correct_chars", 0), union_chars))
+        text_like_binary = rst_stats.get("text_like_binary", {})
+        if isinstance(text_like_binary, Mapping) and text_like_binary.get("rows"):
+            rst_data["text_like_binary"] = {
+                "positive_labels": list(text_like_binary.get("positive_labels", TEXT_LIKE_POSITIVE_LABELS)),
+                "counts": dict(text_like_binary.get("counts", {})),
+                "aggregates": dict(text_like_binary.get("aggregates", {})),
+                "rows": list(text_like_binary.get("rows", [])),
+                "by_label": dict(text_like_binary.get("by_label", {})),
+            }
 
         if rst_data:
             data["tasks"]["restructuredtext_mix"] = rst_data
@@ -3917,6 +4238,9 @@ def _collect_comparison_metrics(
             }
         data["throughput"] = throughput_data
 
+    if monitor_b_report:
+        data["monitor_b"] = dict(monitor_b_report)
+
     return data
 
 
@@ -3934,6 +4258,7 @@ def write_report(
     args,
     task_metrics: List[TaskMetrics],
     throughput_results: List[ThroughputResult],
+    monitor_b_report: Optional[Mapping[str, Any]] = None,
 ) -> None:
     ordered_task_metrics = sorted(task_metrics, key=lambda m: _task_name_sort_key(m.name))
     non_needle_metrics = [m for m in ordered_task_metrics if _needle_bucket_key(m.name) is None]
@@ -3966,9 +4291,15 @@ def write_report(
     report_lines.append(f"- Max samples per task: {'all' if args.max_samples <= 0 else args.max_samples}")
     report_lines.append(f"- Sample seed: {args.sample_seed}")
     report_lines.append(f"- Evaluation data root: `{manifest.get('output_root')}`")
+    if getattr(args, "fine_tuned_mode", None) is not None:
+        report_lines.append(
+            f"- Evaluation mode: {'fine_tuned' if bool(getattr(args, 'fine_tuned_mode', False)) else 'non_fine_tuned'}"
+        )
     report_lines.append(f"- Generated at: {manifest.get('generated_at')}")
     report_lines.append(f"- Results directory: `{report_path.parent}`")
     report_lines.append(f"- Comparison JSON: [comparison_metrics.json]({_comparison_metrics_path(report_path).name})")
+    if monitor_b_report:
+        report_lines.append(f"- Full monitor_b root: `{monitor_b_report.get('root')}`")
     aggregated_confusion_rel = confusion_artifacts.get("all_tasks")
     if aggregated_confusion_rel:
         report_lines.append(f"- Aggregated confusion matrix: [{aggregated_confusion_rel}]({aggregated_confusion_rel})")
@@ -3980,9 +4311,30 @@ def write_report(
         report_lines.extend(highlights)
         report_lines.append("")
 
-    comparison_payload = _collect_comparison_metrics(args, ordered_task_metrics, throughput_results, manifest)
+    comparison_payload = _collect_comparison_metrics(
+        args,
+        ordered_task_metrics,
+        throughput_results,
+        manifest,
+        monitor_b_report,
+    )
     if comparison_payload:
         _write_comparison_metrics(comparison_path, comparison_payload)
+
+    if monitor_b_report:
+        report_lines.append("## Full monitor_b Evaluation")
+        report_lines.append("")
+        report_lines.append(f"- Monitor root: `{monitor_b_report.get('root')}`")
+        report_lines.append(f"- Architecture: {monitor_b_report.get('arch')}")
+        report_lines.append(f"- Inference mode: {monitor_b_report.get('inference_mode')}")
+        report_lines.append(f"- Files used: {int(monitor_b_report.get('files_used', 0))}")
+        report_lines.append(f"- Skipped: {int(monitor_b_report.get('skipped', 0))}")
+        report_lines.append(f"- Evaluated bytes: {int(monitor_b_report.get('evaluated_bytes', 0))}")
+        report_lines.append("")
+        monitor_rows = monitor_b_report.get("rows", [])
+        if isinstance(monitor_rows, Sequence) and monitor_rows:
+            report_lines.append(_render_training_style_metrics_table(monitor_rows))
+            report_lines.append("")
 
     report_lines.append("## Task Details")
     report_lines.append("")
@@ -4211,6 +4563,7 @@ def write_report(
             threshold = float(markdown_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
             wrapped_group = markdown_stats.get("overall", {}).get("wrapped", {})
             plain_group = markdown_stats.get("overall", {}).get("plain", {})
+            text_like_binary = markdown_stats.get("text_like_binary", {})
             report_lines.append("")
             report_lines.append("_Text hits column: lower is better._")
             report_lines.append("| Wrapper | Non-text cov ≥50% | Non-text region coverage | Text hits | Exact region cov ≥50% | Exact region avg coverage |")
@@ -4261,6 +4614,7 @@ def write_report(
                 )
                 report_lines.append("")
                 report_lines.append(f"Text region coverage: {text_cov}")
+            _append_text_like_binary_lines(report_lines, text_like_binary)
             report_lines.append("")
 
         if name == "restructuredtext_mix":
@@ -4268,6 +4622,7 @@ def write_report(
             threshold = float(markdown_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
             wrapped_group = markdown_stats.get("overall", {}).get("wrapped", {})
             plain_group = markdown_stats.get("overall", {}).get("plain", {})
+            text_like_binary = markdown_stats.get("text_like_binary", {})
             report_lines.append("")
             report_lines.append("_Text hits column: lower is better._")
             report_lines.append("| Wrapper | Non-text cov ≥50% | Non-text region coverage | Text hits | Exact region cov ≥50% | Exact region avg coverage |")
@@ -4318,6 +4673,7 @@ def write_report(
                 )
                 report_lines.append("")
                 report_lines.append(f"Text region coverage: {text_cov}")
+            _append_text_like_binary_lines(report_lines, text_like_binary)
             report_lines.append("")
 
         per_label_table = _render_metrics_table(metrics)
@@ -4397,8 +4753,24 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         action="store_true",
         default=False,
         help=(
-            "When set and --data-root is not overridden, evaluate against a "
-            "separate fine-tune holdout dataset root (evaluation/data_b)."
+            "Deprecated compatibility flag. Fine-tuned evaluation is now the default."
+        ),
+    )
+    parser.add_argument(
+        "--non-fine-tuned",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the legacy non-fine-tuned evaluation path: keep evaluation/data "
+            "and skip the automatic full monitor_preprocessed_b pass."
+        ),
+    )
+    parser.add_argument(
+        "--monitor-root",
+        default=str(_default_monitor_b_root()),
+        help=(
+            "Root of the full monitor_b memmap used for the automatic fine-tuned "
+            "monitor evaluation."
         ),
     )
     return parser.parse_args(argv)
@@ -4406,15 +4778,9 @@ def parse_args(argv: Optional[Sequence[str]] = None):
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    # For fine-tuned models, optionally redirect to a separate evaluation
-    # dataset root (e.g., built from monitor_preprocessed_b) unless the user
-    # has explicitly chosen a custom --data-root.
-    default_eval_root = (REPO_ROOT / "evaluation" / "data").resolve()
-    fine_tune_eval_root = (REPO_ROOT / "evaluation" / "data_b").resolve()
-    if getattr(args, "fine_tuned", False):
-        if Path(args.data_root).resolve() == default_eval_root:
-            args.data_root = str(fine_tune_eval_root)
-            print(f"ℹ️  Fine-tuned mode: using evaluation data root {args.data_root}", flush=True)
+    mode_info = _configure_evaluation_mode(args)
+    for message in mode_info.get("messages", []):
+        print(message, flush=True)
 
     data_root = Path(args.data_root).resolve()
     manifest_path = Path(args.manifest) if args.manifest else data_root / "manifest.json"
@@ -4548,6 +4914,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         task_metrics: List[TaskMetrics] = []
         throughput_results: List[ThroughputResult] = []
+        monitor_b_report: Optional[Dict[str, Any]] = None
 
         for name in sorted(accuracy_names, key=_task_name_sort_key):
             ds = prepared_datasets[name]
@@ -4571,6 +4938,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 flush=True,
             )
             task_metrics.append(metrics)
+
+        if bool(getattr(args, "fine_tuned_mode", False)):
+            monitor_root = Path(getattr(args, "monitor_root", _default_monitor_b_root())).resolve()
+            if not monitor_root.exists():
+                raise RuntimeError(
+                    f"Fine-tuned evaluation requires a full monitor_b root at {monitor_root}"
+                )
+            print(
+                f"▶️  Evaluating full monitor_b from {monitor_root}",
+                flush=True,
+            )
+            monitor_b_report = _evaluate_full_monitor_b(monitor_root, accuracy_runner)
+            print(
+                "    [monitor_b] completed in "
+                f"{float(monitor_b_report.get('elapsed_seconds', 0.0)):.1f}s "
+                f"• micro_acc={_format_float(monitor_b_report.get('aggregates', {}).get('micro_acc'))}",
+                flush=True,
+            )
 
         # Throughput datasets evaluated separately on CPU and GPU (if available)
         if throughput_names:
@@ -4670,7 +5055,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not task_metrics and not throughput_results:
             raise RuntimeError("No tasks were evaluated. Check if the evaluation data directory contains valid datasets.")
 
-        write_report(report_path, manifest=manifest, args=args, task_metrics=task_metrics, throughput_results=throughput_results)
+        write_report(
+            report_path,
+            manifest=manifest,
+            args=args,
+            task_metrics=task_metrics,
+            throughput_results=throughput_results,
+            monitor_b_report=monitor_b_report,
+        )
         total_elapsed = time.perf_counter() - overall_start
         print(
             f"✅ Evaluation complete in {total_elapsed:.1f}s. "
