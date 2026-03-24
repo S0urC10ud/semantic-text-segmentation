@@ -470,12 +470,15 @@ class TestSegmentBackedSyntheticTasks(unittest.TestCase):
                 [("yaml", "name: value\n")],
                 uid="yaml-host",
             ),
-            _mixed_monitor_doc(
-                "python",
-                [("python", "alpha12"), ("shell", "XY"), ("python", "\n")],
-                uid="python-donor",
-            ),
         ]
+        for idx in range(12):
+            docs.append(
+                _mixed_monitor_doc(
+                    "python",
+                    [("python", "alpha12"), ("shell", "XY"), ("python", "\n")],
+                    uid=f"python-donor-{idx}",
+                )
+            )
 
         task, examples, _, support = obtain_eval_dataset._build_injection_dataset_from_monitor(
             docs,
@@ -499,6 +502,75 @@ class TestSegmentBackedSyntheticTasks(unittest.TestCase):
         self.assertIn("shell", list(meta["inserted_source_labels"]))
         self.assertEqual(int(support["actual_count"]), len(examples))
         self.assertGreaterEqual(int(support["requested_count"]), int(support["actual_count"]))
+
+    def test_monitor_injection_qualifies_donors_by_visible_support_and_recovers_short_svg(self) -> None:
+        docs = _monitor_docs("python", "sql", count=4)
+        for idx in range(4):
+            docs.append(
+                _mixed_monitor_doc(
+                    "yaml",
+                    [("yaml", f"name: alpha_beta_gamma_delta_value_{idx}\n")],
+                    uid=f"yaml-donor-{idx}",
+                )
+            )
+            docs.append(
+                _mixed_monitor_doc(
+                    "svg",
+                    [("svg", f"<svg><path d=\"M{'A' * 72}{idx}\"/></svg>\n")],
+                    uid=f"svg-donor-{idx}",
+                )
+            )
+        docs.append(
+            _mixed_monitor_doc(
+                "csharp",
+                [("csharp", "using System; class X { string Name; }\n")],
+                uid="csharp-short",
+            )
+        )
+        docs.append(
+            _mixed_monitor_doc(
+                "text",
+                [("text", "This plain text block should remain excluded as a donor needle.\n")],
+                uid="text-excluded",
+            )
+        )
+
+        task, examples, _, support = obtain_eval_dataset._build_injection_dataset_from_monitor(
+            docs,
+            per_label=3,
+            bucket_name="32_63",
+            min_visible=32,
+            max_visible=63,
+            rng=random.Random(9),
+        )
+
+        self.assertEqual(task, "needle_32_63")
+
+        donor_counts = Counter()
+        for example in examples:
+            meta = json.loads(example["metadata_json"])
+            donor_counts[str(meta["donor_lang"])] += 1
+
+        self.assertIn("yaml", donor_counts)
+        self.assertIn("svg", donor_counts)
+        self.assertNotIn("text", donor_counts)
+
+        self.assertIn("yaml", support["qualified_donor_labels"])
+        self.assertIn("svg", support["qualified_donor_labels"])
+        self.assertNotIn("csharp", support["qualified_donor_labels"])
+        self.assertGreaterEqual(
+            int(support["donor_candidate_visible_support_by_donor_label"]["yaml"]),
+            100,
+        )
+        self.assertGreaterEqual(
+            int(support["donor_candidate_visible_support_by_donor_label"]["svg"]),
+            100,
+        )
+        self.assertNotIn("csharp", support["donor_candidate_visible_support_by_donor_label"])
+        self.assertGreater(
+            int(support["donor_selected_visible_support_by_donor_label"].get("svg", 0)),
+            0,
+        )
 
     def test_monitor_sequence_pair_records_exact_region_metadata(self) -> None:
         docs = [
@@ -574,6 +646,83 @@ class TestSegmentBackedSyntheticTasks(unittest.TestCase):
         self.assertEqual(str(first_block["truth_mode"]), "exact_region")
         self.assertIn("requested_count", support)
         self.assertIn("actual_by_anchor_label", support)
+
+    def test_monitor_markdown_inline_regions_are_common_and_longer(self) -> None:
+        def _inline_docs(lang: str, count: int) -> list[obtain_eval_dataset.MonitorDoc]:
+            docs: list[obtain_eval_dataset.MonitorDoc] = []
+            for idx in range(count):
+                docs.append(
+                    _mixed_monitor_doc(
+                        lang,
+                        [
+                            (
+                                lang,
+                                f"{lang}_command_{idx}_alpha beta gamma delta epsilon theta lambda omega value_{idx}\n",
+                            ),
+                            ("text", "tip\n"),
+                            (
+                                lang,
+                                f"{lang}_followup_{idx}_important token stream repeated content sample_{idx} more data here\n",
+                            ),
+                        ],
+                        uid=f"{lang}-inline-{idx}",
+                    )
+                )
+            return docs
+
+        docs = _inline_docs("python", 6) + _inline_docs("shell", 6) + _inline_docs("sql", 6)
+
+        task, examples, _, support = obtain_eval_dataset._build_markdown_dataset_from_regions(
+            docs,
+            per_label=2,
+            rng=random.Random(29),
+            task_name="markdown_mix",
+            wrapper_label="markdown",
+            markup_style="markdown",
+        )
+
+        self.assertEqual(task, "markdown_mix")
+        self.assertEqual(len(examples), 6)
+        self.assertEqual(int(support["inline_target_count"]), 6)
+        self.assertGreaterEqual(int(support["inline_actual_count"]), 6)
+
+        total_inline_blocks = 0
+        for example in examples:
+            meta = json.loads(example["metadata_json"])
+            inline_blocks = meta.get("inline_blocks", [])
+            self.assertTrue(inline_blocks)
+            total_inline_blocks += len(inline_blocks)
+            content = str(example["content"])
+            for block in inline_blocks:
+                start = int(block["char_start"])
+                end = int(block["char_end"])
+                snippet = content[start:end]
+                visible = sum(ch not in {" ", "\t", "\n"} for ch in snippet)
+                self.assertGreaterEqual(visible, obtain_eval_dataset._MARKDOWN_INLINE_MIN_VISIBLE)
+                self.assertNotIn("\n", snippet)
+                self.assertIn(str(block["wrapper"]), {"inline_backtick", "html_code"})
+
+        self.assertGreaterEqual(total_inline_blocks, 6)
+
+        rst_task, rst_examples, _, rst_support = obtain_eval_dataset._build_markdown_dataset_from_regions(
+            docs,
+            per_label=2,
+            rng=random.Random(29),
+            task_name="restructuredtext_mix",
+            wrapper_label="restructuredtext",
+            markup_style="restructuredtext",
+        )
+
+        self.assertEqual(rst_task, "restructuredtext_mix")
+        self.assertEqual(len(rst_examples), 6)
+        self.assertEqual(int(rst_support["inline_target_count"]), 6)
+        self.assertGreaterEqual(int(rst_support["inline_actual_count"]), 6)
+        for example in rst_examples:
+            meta = json.loads(example["metadata_json"])
+            inline_blocks = meta.get("inline_blocks", [])
+            self.assertTrue(inline_blocks)
+            for block in inline_blocks:
+                self.assertIn(str(block["wrapper"]), {"inline_literal", "inline_role"})
 
 
 if __name__ == "__main__":

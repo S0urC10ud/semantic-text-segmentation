@@ -291,7 +291,13 @@ _PAYLOAD_CONTROL_WRAPPERS: Tuple[Tuple[str, str], ...] = (
     ("", ";"),
 )
 _PROHIBITED_INJECTION_LANGS = {"csv", "json", "yaml", "text", "html"}
+_PROHIBITED_MONITOR_DONOR_LANGS = {"text"}
+_NEEDLE_DONOR_MIN_VISIBLE_SUPPORT = 100
+_NEEDLE_DONOR_MAX_LINE_CANDIDATES_PER_SEGMENT = 8
 _MARKDOWN_INLINE_CODE_PROB = 0.25
+_MARKDOWN_INLINE_MIN_OPPORTUNITIES = 350
+_MARKDOWN_INLINE_MIN_VISIBLE = 16
+_MARKDOWN_INLINE_MAX_VISIBLE = 192
 _PURE_FRAGMENT_HOST_MIN_RATIO = 0.95
 _PURE_FRAGMENT_WINDOW_ATTEMPTS = 24
 _MIXED_REGION_MIN_RATIO = 0.70
@@ -1283,15 +1289,37 @@ def _candidate_line_region_for_segment(
     strip_first_line_indent: bool,
     min_anchor_ratio: float = 0.0,
 ) -> Optional[MonitorRegion]:
+    candidates = _candidate_line_regions_for_segment(
+        doc,
+        seg,
+        min_visible=min_visible,
+        max_visible=max_visible,
+        strip_first_line_indent=strip_first_line_indent,
+        min_anchor_ratio=min_anchor_ratio,
+        max_regions_per_segment=1,
+    )
+    return candidates[0] if candidates else None
+
+
+def _candidate_line_regions_for_segment(
+    doc: MonitorDoc,
+    seg: Mapping[str, Any],
+    *,
+    min_visible: int,
+    max_visible: Optional[int],
+    strip_first_line_indent: bool,
+    min_anchor_ratio: float = 0.0,
+    max_regions_per_segment: int = 1,
+) -> List[MonitorRegion]:
     text = _clean_snippet_text(doc.content)
     if not text:
-        return None
+        return []
     seg_start = int(seg.get("char_start", 0))
     seg_end = int(seg.get("char_end", seg_start))
     start = _line_start_offset(text, seg_start)
     end = _line_end_offset(text, seg_end)
     anchor_label = str(seg.get("label", ""))
-    best: Optional[MonitorRegion] = None
+    candidates: List[MonitorRegion] = []
     while end <= len(text):
         region = _make_monitor_region(
             doc,
@@ -1304,13 +1332,7 @@ def _candidate_line_region_for_segment(
             visible = int(region.visible_chars)
             if visible >= int(min_visible) and (max_visible is None or visible <= int(max_visible)):
                 if region.anchor_ratio >= float(min_anchor_ratio):
-                    if best is None:
-                        best = region
-                    else:
-                        best_score = (float(best.anchor_ratio), -int(best.visible_chars))
-                        region_score = (float(region.anchor_ratio), -int(region.visible_chars))
-                        if region_score > best_score:
-                            best = region
+                    candidates.append(region)
             if max_visible is not None and visible > int(max_visible):
                 break
         if end >= len(text):
@@ -1319,10 +1341,169 @@ def _candidate_line_region_for_segment(
         if next_end <= end:
             break
         end = next_end
-    return best
+    if not candidates:
+        return []
+    candidates.sort(
+        key=lambda region: (
+            -float(region.anchor_ratio),
+            int(region.visible_chars),
+            int(region.source_char_start),
+            int(region.source_char_end),
+        )
+    )
+    if max_regions_per_segment > 0:
+        return candidates[:max_regions_per_segment]
+    return candidates
+
+
+def _is_visible_content_char(ch: str) -> bool:
+    return ch.isprintable() and not ch.isspace()
+
+
+def _candidate_clipped_region_for_segment(
+    doc: MonitorDoc,
+    seg: Mapping[str, Any],
+    *,
+    min_visible: int,
+    max_visible: Optional[int],
+    strip_first_line_indent: bool,
+    min_anchor_ratio: float = 0.0,
+) -> Optional[MonitorRegion]:
+    if max_visible is None or int(max_visible) <= 0:
+        return None
+    text = _clean_snippet_text(doc.content)
+    if not text:
+        return None
+    anchor_label = str(seg.get("label", ""))
+    if not anchor_label:
+        return None
+    seg_start = int(seg.get("char_start", 0))
+    seg_end = int(seg.get("char_end", seg_start))
+    if seg_end <= seg_start:
+        return None
+
+    seg_mid = min(max(seg_start, _segment_midpoint(seg)), max(seg_start, seg_end - 1))
+    line_start = _line_start_offset(text, seg_mid)
+    line_end = _line_end_offset(text, seg_mid)
+    if line_end <= line_start:
+        return None
+
+    left = seg_mid
+    right = min(line_end, seg_mid + 1)
+    visible = _visible_char_count(text[left:right])
+    prefer_left = True
+    while visible < int(min_visible) and (left > line_start or right < line_end):
+        expanded = False
+        if prefer_left and left > line_start:
+            left -= 1
+            if _is_visible_content_char(text[left]):
+                visible += 1
+            expanded = True
+        elif (not prefer_left) and right < line_end:
+            if _is_visible_content_char(text[right]):
+                visible += 1
+            right += 1
+            expanded = True
+        elif left > line_start:
+            left -= 1
+            if _is_visible_content_char(text[left]):
+                visible += 1
+            expanded = True
+        elif right < line_end:
+            if _is_visible_content_char(text[right]):
+                visible += 1
+            right += 1
+            expanded = True
+        if not expanded:
+            break
+        prefer_left = not prefer_left
+
+    while visible > int(max_visible) and (left < seg_mid or right > min(line_end, seg_mid + 1)):
+        shrink_right = (right - min(line_end, seg_mid + 1)) > (seg_mid - left)
+        if shrink_right and right > min(line_end, seg_mid + 1):
+            right -= 1
+            if _is_visible_content_char(text[right]):
+                visible -= 1
+        elif left < seg_mid:
+            if _is_visible_content_char(text[left]):
+                visible -= 1
+            left += 1
+        elif right > min(line_end, seg_mid + 1):
+            right -= 1
+            if _is_visible_content_char(text[right]):
+                visible -= 1
+        else:
+            break
+
+    if visible < int(min_visible) or visible > int(max_visible):
+        return None
+
+    region = _make_monitor_region(
+        doc,
+        left,
+        right,
+        anchor_label=anchor_label,
+        strip_first_line_indent=strip_first_line_indent,
+    )
+    if region is None:
+        return None
+    if int(region.visible_chars) < int(min_visible):
+        return None
+    if int(region.visible_chars) > int(max_visible):
+        return None
+    if region.anchor_ratio < float(min_anchor_ratio):
+        return None
+    return region
 
 
 def _collect_line_block_regions(
+    monitor_docs: Sequence[MonitorDoc],
+    *,
+    min_visible: int,
+    max_visible: Optional[int],
+    exclude_labels: Optional[Set[str]] = None,
+    allowed_labels: Optional[Set[str]] = None,
+    strip_first_line_indent: bool = False,
+    min_anchor_ratio: float = 0.0,
+    max_regions_per_segment: int = 1,
+) -> Dict[str, List[MonitorRegion]]:
+    pools: Dict[str, List[MonitorRegion]] = {}
+    seen: Set[Tuple[Optional[str], str, int, int]] = set()
+    excluded = set(exclude_labels or ())
+    allowed = set(allowed_labels or ()) if allowed_labels is not None else None
+    for doc in monitor_docs:
+        for seg in doc.segments:
+            label = str(seg.get("label", ""))
+            if not label or label in excluded:
+                continue
+            if allowed is not None and label not in allowed:
+                continue
+            regions = _candidate_line_regions_for_segment(
+                doc,
+                seg,
+                min_visible=min_visible,
+                max_visible=max_visible,
+                strip_first_line_indent=strip_first_line_indent,
+                min_anchor_ratio=min_anchor_ratio,
+                max_regions_per_segment=max_regions_per_segment,
+            )
+            if not regions:
+                continue
+            for region in regions:
+                key = (
+                    region.source_uid,
+                    region.anchor_label,
+                    region.source_char_start,
+                    region.source_char_end,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                pools.setdefault(region.anchor_label, []).append(region)
+    return pools
+
+
+def _collect_clipped_regions(
     monitor_docs: Sequence[MonitorDoc],
     *,
     min_visible: int,
@@ -1343,7 +1524,95 @@ def _collect_line_block_regions(
                 continue
             if allowed is not None and label not in allowed:
                 continue
-            region = _candidate_line_region_for_segment(
+            region = _candidate_clipped_region_for_segment(
+                doc,
+                seg,
+                min_visible=min_visible,
+                max_visible=max_visible,
+                strip_first_line_indent=strip_first_line_indent,
+                min_anchor_ratio=min_anchor_ratio,
+            )
+            if region is None:
+                continue
+            key = (
+                region.source_uid,
+                region.anchor_label,
+                region.source_char_start,
+                region.source_char_end,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            pools.setdefault(region.anchor_label, []).append(region)
+    return pools
+
+
+def _candidate_inline_region_for_segment(
+    doc: MonitorDoc,
+    seg: Mapping[str, Any],
+    *,
+    min_visible: int,
+    max_visible: Optional[int],
+    strip_first_line_indent: bool,
+    min_anchor_ratio: float = 0.0,
+) -> Optional[MonitorRegion]:
+    text = _clean_snippet_text(doc.content)
+    if not text:
+        return None
+    anchor_label = str(seg.get("label", ""))
+    if not anchor_label:
+        return None
+    seg_mid = _segment_midpoint(seg)
+    start = _line_start_offset(text, seg_mid)
+    end = _line_end_offset(text, seg_mid)
+    if end <= start:
+        return None
+    region = _make_monitor_region(
+        doc,
+        start,
+        end,
+        anchor_label=anchor_label,
+        strip_first_line_indent=strip_first_line_indent,
+    )
+    if region is None:
+        return None
+    region = _trim_region_trailing_newlines(region)
+    if region is None:
+        return None
+    if "\n" in region.content:
+        return None
+    visible = int(region.visible_chars)
+    if visible < int(min_visible):
+        return None
+    if max_visible is not None and visible > int(max_visible):
+        return None
+    if region.anchor_ratio < float(min_anchor_ratio):
+        return None
+    return region
+
+
+def _collect_inline_regions(
+    monitor_docs: Sequence[MonitorDoc],
+    *,
+    min_visible: int,
+    max_visible: Optional[int],
+    exclude_labels: Optional[Set[str]] = None,
+    allowed_labels: Optional[Set[str]] = None,
+    strip_first_line_indent: bool = False,
+    min_anchor_ratio: float = 0.0,
+) -> Dict[str, List[MonitorRegion]]:
+    pools: Dict[str, List[MonitorRegion]] = {}
+    seen: Set[Tuple[Optional[str], str, int, int]] = set()
+    excluded = set(exclude_labels or ())
+    allowed = set(allowed_labels or ()) if allowed_labels is not None else None
+    for doc in monitor_docs:
+        for seg in doc.segments:
+            label = str(seg.get("label", ""))
+            if not label or label in excluded:
+                continue
+            if allowed is not None and label not in allowed:
+                continue
+            region = _candidate_inline_region_for_segment(
                 doc,
                 seg,
                 min_visible=min_visible,
@@ -1410,6 +1679,58 @@ def _trim_region_trailing_newlines(region: MonitorRegion) -> Optional[MonitorReg
         source_labels=region.source_labels,
         monitor_source=region.monitor_source,
     )
+
+
+def _merge_region_pools(
+    base: Dict[str, List[MonitorRegion]],
+    extra: Mapping[str, Sequence[MonitorRegion]],
+) -> Dict[str, List[MonitorRegion]]:
+    merged = {label: list(pool) for label, pool in base.items()}
+    seen: Set[Tuple[Optional[str], str, int, int]] = set()
+    for pool in merged.values():
+        for region in pool:
+            seen.add(_region_identity(region))
+    for label, pool in extra.items():
+        target = merged.setdefault(str(label), [])
+        for region in pool:
+            region_id = _region_identity(region)
+            if region_id in seen:
+                continue
+            seen.add(region_id)
+            target.append(region)
+    return merged
+
+
+def _visible_support_by_label(pools: Mapping[str, Sequence[MonitorRegion]]) -> Dict[str, int]:
+    return {
+        str(label): int(sum(int(region.visible_chars) for region in pool))
+        for label, pool in pools.items()
+        if pool
+    }
+
+
+def _next_region(
+    pools: Mapping[str, Sequence[MonitorRegion]],
+    positions: Mapping[str, int],
+    label: str,
+) -> Optional[MonitorRegion]:
+    pool = list(pools.get(label, ()))
+    idx = int(positions.get(label, 0))
+    if idx >= len(pool):
+        return None
+    return pool[idx]
+
+
+def _pop_next_region(
+    pools: Mapping[str, Sequence[MonitorRegion]],
+    positions: Counter[str],
+    label: str,
+) -> Optional[MonitorRegion]:
+    region = _next_region(pools, positions, label)
+    if region is None:
+        return None
+    positions[str(label)] += 1
+    return region
 
 
 def _append_shifted_segments(
@@ -3281,54 +3602,90 @@ def _build_injection_dataset_from_monitor(
         monitor_docs,
         min_visible=min_visible,
         max_visible=max_visible,
-        exclude_labels=_PROHIBITED_INJECTION_LANGS,
+        exclude_labels=_PROHIBITED_MONITOR_DONOR_LANGS,
         strip_first_line_indent=True,
+        max_regions_per_segment=_NEEDLE_DONOR_MAX_LINE_CANDIDATES_PER_SEGMENT,
     )
+    donor_visible_support = _visible_support_by_label(donor_pools)
+    donor_labels_present = {
+        str(seg.get("label", ""))
+        for doc in monitor_docs
+        for seg in doc.segments
+        if str(seg.get("label", "")) and str(seg.get("label", "")) not in _PROHIBITED_MONITOR_DONOR_LANGS
+    }
+    under_floor = {
+        label
+        for label in donor_labels_present
+        if int(donor_visible_support.get(label, 0)) < int(_NEEDLE_DONOR_MIN_VISIBLE_SUPPORT)
+    }
+    if under_floor:
+        clipped_pools = _collect_clipped_regions(
+            monitor_docs,
+            min_visible=min_visible,
+            max_visible=max_visible,
+            exclude_labels=_PROHIBITED_MONITOR_DONOR_LANGS,
+            allowed_labels=under_floor,
+            strip_first_line_indent=False,
+        )
+        donor_pools = _merge_region_pools(donor_pools, clipped_pools)
+        donor_visible_support = _visible_support_by_label(donor_pools)
+        under_floor = {
+            label
+            for label in donor_labels_present
+            if int(donor_visible_support.get(label, 0)) < int(_NEEDLE_DONOR_MIN_VISIBLE_SUPPORT)
+        }
+    qualified_donor_labels = {
+        label
+        for label, visible in donor_visible_support.items()
+        if int(visible) >= int(_NEEDLE_DONOR_MIN_VISIBLE_SUPPORT)
+    }
 
     host_candidate_counts = {label: len(pool) for label, pool in host_pools.items() if pool}
     actual_counts: Counter[str] = Counter()
-    used_region_ids: Set[Tuple[Optional[str], str, int, int]] = set()
     donor_counts: Counter[str] = Counter()
+    donor_visible_selected: Counter[str] = Counter()
     pair_counts: Counter[Tuple[str, str]] = Counter()
 
     host_labels = sorted(host_pools.keys())
-    for host_lang in host_labels:
-        host_pool = list(host_pools.get(host_lang, []))
-        if not host_pool:
-            continue
-        rng.shuffle(host_pool)
-        host_limit = min(per_label, len(host_pool))
-        for idx in range(host_limit):
-            host_region = _pop_unused_region(host_pool, used_region_ids)
+    host_shuffled = {label: list(pool) for label, pool in host_pools.items()}
+    donor_shuffled = {label: list(pool) for label, pool in donor_pools.items()}
+    for pool in host_shuffled.values():
+        rng.shuffle(pool)
+    for pool in donor_shuffled.values():
+        rng.shuffle(pool)
+    host_positions: Counter[str] = Counter()
+    donor_positions: Counter[str] = Counter()
+    next_index = 0
+
+    progress = True
+    while progress:
+        progress = False
+        for host_lang in host_labels:
+            if int(actual_counts.get(host_lang, 0)) >= int(per_label):
+                continue
+            host_region = _pop_next_region(host_shuffled, host_positions, host_lang)
             if host_region is None:
-                break
+                continue
             donor_labels = [
                 label
-                for label, donor_pool in donor_pools.items()
-                if label != host_lang and donor_pool
+                for label in sorted(qualified_donor_labels)
+                if label != host_lang and _next_region(donor_shuffled, donor_positions, label) is not None
             ]
             if not donor_labels:
-                break
-            donor_labels.sort(
-                key=lambda label: (
-                    int(donor_counts.get(label, 0)),
+                continue
+            donor_lang = _balanced_min_choice(
+                donor_labels,
+                rng,
+                lambda label: (
+                    int(donor_visible_selected.get(label, 0)),
                     int(pair_counts.get((host_lang, label), 0)),
+                    int(donor_counts.get(label, 0)),
                     label,
-                )
+                ),
             )
-            donor_region: Optional[MonitorRegion] = None
-            donor_lang: Optional[str] = None
-            for candidate_label in donor_labels:
-                candidate_pool = list(donor_pools.get(candidate_label, []))
-                rng.shuffle(candidate_pool)
-                region = _pop_unused_region(candidate_pool, used_region_ids)
-                if region is None:
-                    continue
-                donor_region = region
-                donor_lang = candidate_label
-                break
+            donor_region = _pop_next_region(donor_shuffled, donor_positions, str(donor_lang)) if donor_lang is not None else None
             if donor_region is None or donor_lang is None:
-                break
+                continue
 
             insertion = _inject_snippet_text(host_region.content, donor_region.content, rng)
             context_label = _context_label_at_insertion(
@@ -3380,19 +3737,39 @@ def _build_injection_dataset_from_monitor(
                 "injection_visible_chars": int(donor_region.visible_chars),
                 "size_bucket": bucket_name,
             }
-            examples.append(_make_record(task, host_lang, idx, new_content, new_segments, langs, meta))
+            examples.append(_make_record(task, host_lang, next_index, new_content, new_segments, langs, meta))
+            next_index += 1
             actual_counts[host_lang] += 1
-            donor_counts[donor_lang] += 1
+            donor_counts[str(donor_lang)] += 1
+            donor_visible_selected[str(donor_lang)] += int(donor_region.visible_chars)
             pair_counts[(host_lang, donor_lang)] += 1
+            progress = True
 
     support = _task_support_summary(
         requested_per_anchor_label=per_label,
         candidate_counts=host_candidate_counts,
         actual_counts=actual_counts,
     )
-    support["donor_candidate_regions_by_anchor_label"] = {
-        label: len(pool) for label, pool in donor_pools.items() if pool
+    donor_candidate_counts = {label: len(pool) for label, pool in donor_pools.items() if pool}
+    donor_candidate_visible = {label: int(donor_visible_support.get(label, 0)) for label in donor_candidate_counts}
+    donor_support_shortfall = {
+        label: max(0, int(_NEEDLE_DONOR_MIN_VISIBLE_SUPPORT) - int(donor_candidate_visible.get(label, 0)))
+        for label in donor_candidate_counts
     }
+    support["donor_floor_visible_chars"] = int(_NEEDLE_DONOR_MIN_VISIBLE_SUPPORT)
+    support["qualified_donor_labels"] = sorted(qualified_donor_labels)
+    support["donor_candidate_regions_by_donor_label"] = donor_candidate_counts
+    support["donor_candidate_regions_by_anchor_label"] = donor_candidate_counts
+    support["donor_candidate_visible_support_by_donor_label"] = donor_candidate_visible
+    support["donor_selected_visible_support_by_donor_label"] = {
+        label: int(donor_visible_selected.get(label, 0))
+        for label in donor_candidate_counts
+    }
+    support["donor_actual_by_donor_label"] = {
+        label: int(donor_counts.get(label, 0))
+        for label in donor_candidate_counts
+    }
+    support["donor_support_shortfall_by_donor_label"] = donor_support_shortfall
     return task, examples, desc, support
 
 
@@ -3657,7 +4034,7 @@ def _build_markdown_dataset_from_regions(
 
     block_host_budget = 540
     block_other_budget = 360
-    inline_budget = 160
+    inline_budget = _MARKDOWN_INLINE_MAX_VISIBLE
 
     host_pools = _collect_anchor_window_regions(
         monitor_docs,
@@ -3671,9 +4048,9 @@ def _build_markdown_dataset_from_regions(
         min_anchor_ratio=_MIXED_REGION_MIN_RATIO,
         exclude_labels={wrapper_label, "text"},
     )
-    inline_pools = _collect_line_block_regions(
+    inline_pools = _collect_inline_regions(
         monitor_docs,
-        min_visible=4,
+        min_visible=_MARKDOWN_INLINE_MIN_VISIBLE,
         max_visible=inline_budget,
         exclude_labels={wrapper_label, "text"},
         strip_first_line_indent=True,
@@ -3693,9 +4070,25 @@ def _build_markdown_dataset_from_regions(
     host_shuffled = {label: list(pool) for label, pool in host_pools.items()}
     other_shuffled = {label: list(pool) for label, pool in other_pools.items()}
     inline_shuffled = {label: list(pool) for label, pool in inline_pools.items()}
-    for pools in (host_shuffled, other_shuffled, inline_shuffled):
+    for pools in (host_shuffled, other_shuffled):
         for pool in pools.values():
             rng.shuffle(pool)
+    for pool in inline_shuffled.values():
+        rng.shuffle(pool)
+        pool.sort(
+            key=lambda region: (
+                -int(region.visible_chars),
+                str(region.source_uid or ""),
+                int(region.source_char_start),
+            )
+        )
+
+    total_requested_examples = len(labels) * max(0, int(per_label))
+    target_inline_examples = min(
+        total_requested_examples,
+        max(0, int(_MARKDOWN_INLINE_MIN_OPPORTUNITIES)),
+    )
+    actual_inline_examples = 0
 
     def append_text_part(parts: List[str], segments: List[dict], cursor: int, text: str) -> int:
         if not text:
@@ -3726,7 +4119,7 @@ def _build_markdown_dataset_from_regions(
 
     def build_inline_markup(region: MonitorRegion) -> Optional[Tuple[List[str], List[str], str, bool, Optional[str]]]:
         if markup_style == "markdown":
-            wrapper_modes = ["inline_backtick", "inline_fence", "html_code"]
+            wrapper_modes = ["inline_backtick", "html_code"]
         else:
             wrapper_modes = ["inline_literal", "inline_role"]
         ordered_modes = list(wrapper_modes)
@@ -3739,14 +4132,51 @@ def _build_markdown_dataset_from_regions(
         for mode in ordered_modes:
             if mode == "inline_backtick" and body:
                 return ["`"], ["`"], mode, True, None
-            if mode == "inline_fence" and body:
-                return [f"```{lang_token}\n"], ["```\n"], mode, False, lang_token
             if mode == "html_code" and body:
                 return [f"<code class=\"language-{lang_token}\">"], ["</code>"], mode, True, None
             if mode == "inline_literal" and body:
                 return ["``"], ["``"], mode, True, None
             if mode == "inline_role" and body:
                 return [":code:`"], ["`"], mode, True, None
+        return None
+
+    def should_insert_inline() -> bool:
+        if target_inline_examples <= 0:
+            return False
+        if actual_inline_examples >= target_inline_examples:
+            return False
+        examples_built = len(examples)
+        remaining_examples_including_current = max(0, total_requested_examples - examples_built)
+        remaining_inline_needed = max(0, target_inline_examples - actual_inline_examples)
+        if remaining_inline_needed >= remaining_examples_including_current:
+            return True
+        return bool(labels) and rng.random() < 0.5
+
+    def select_inline_region() -> Optional[Tuple[str, MonitorRegion, Tuple[List[str], List[str], str, bool, Optional[str]]]]:
+        candidate_labels = [lbl for lbl in labels if inline_shuffled.get(lbl)]
+        exhausted: Set[str] = set()
+        while candidate_labels:
+            inline_lang = _balanced_min_choice(
+                candidate_labels,
+                rng,
+                lambda label: (
+                    int(inline_lang_counts.get(str(label), 0)),
+                    int(other_lang_counts.get(str(label), 0)),
+                    str(label),
+                ),
+            )
+            if inline_lang is None:
+                return None
+            inline_lang = str(inline_lang)
+            inline_region = _pop_unused_region(inline_shuffled.get(inline_lang, []), used_code_ids)
+            if inline_region is None:
+                exhausted.add(inline_lang)
+                candidate_labels = [lbl for lbl in candidate_labels if str(lbl) not in exhausted]
+                continue
+            inline_markup = build_inline_markup(inline_region)
+            if inline_markup is None:
+                continue
+            return inline_lang, inline_region, inline_markup
         return None
 
     def build_block_markup(display_token: str, *, wrapped: bool) -> Tuple[List[str], List[str], bool]:
@@ -3866,61 +4296,47 @@ def _build_markdown_dataset_from_regions(
                     if between:
                         cursor = append_text_part(parts, segments, cursor, between + joiner)
 
-            if labels and rng.random() < _MARKDOWN_INLINE_CODE_PROB:
-                alt_pool = [lbl for lbl in labels if inline_shuffled.get(lbl)]
-                if alt_pool:
-                    inline_lang = _balanced_min_choice(
-                        alt_pool,
-                        rng,
-                        lambda label: (
-                            int(inline_lang_counts.get(str(label), 0)),
-                            int(other_lang_counts.get(str(label), 0)),
-                            str(label),
-                        ),
+            if should_insert_inline() or (actual_inline_examples < target_inline_examples and rng.random() < _MARKDOWN_INLINE_CODE_PROB):
+                selected_inline = select_inline_region()
+                if selected_inline is not None:
+                    inline_lang, inline_region, inline_markup = selected_inline
+                    pre_markup, post_markup, wrapper_type, spacer_after, display_label = inline_markup
+                    paragraph = sample_text(240)
+                    prefix_text = paragraph[: len(paragraph) // 2]
+                    suffix_text = paragraph[len(paragraph) // 2 :]
+                    if prefix_text:
+                        cursor = append_text_part(parts, segments, cursor, prefix_text)
+                    if prefix_text and not prefix_text.endswith((" ", "\t", "\n")):
+                        cursor = append_text_part(parts, segments, cursor, " ")
+                    for chunk in pre_markup:
+                        cursor = append_text_part(parts, segments, cursor, chunk)
+                    cursor, inline_start, inline_end = append_region(parts, segments, cursor, inline_region)
+                    inline_blocks.append(
+                        {
+                            "language": inline_region.anchor_label,
+                            "anchor_label": inline_region.anchor_label,
+                            "anchor_ratio": float(inline_region.anchor_ratio),
+                            "wrapper": wrapper_type,
+                            "display_label": display_label,
+                            "char_start": inline_start,
+                            "char_end": inline_end,
+                            "context_role": "inline_text",
+                            "source_uid": inline_region.source_uid,
+                            "source_char_start": int(inline_region.source_char_start),
+                            "source_char_end": int(inline_region.source_char_end),
+                            "truth_mode": "exact_region",
+                        }
                     )
-                    if inline_lang is not None:
-                        inline_region = _pop_unused_region(inline_shuffled.get(str(inline_lang), []), used_code_ids)
-                        if inline_region is not None:
-                            inline_region = _trim_region_trailing_newlines(inline_region)
-                        if inline_region is not None:
-                            inline_markup = build_inline_markup(inline_region)
-                            if inline_markup is not None:
-                                pre_markup, post_markup, wrapper_type, spacer_after, display_label = inline_markup
-                                paragraph = sample_text(180)
-                                prefix_text = paragraph[: len(paragraph) // 2]
-                                suffix_text = paragraph[len(paragraph) // 2 :]
-                                if prefix_text:
-                                    cursor = append_text_part(parts, segments, cursor, prefix_text)
-                                if prefix_text and not prefix_text.endswith((" ", "\t", "\n")):
-                                    cursor = append_text_part(parts, segments, cursor, " ")
-                                for chunk in pre_markup:
-                                    cursor = append_text_part(parts, segments, cursor, chunk)
-                                cursor, inline_start, inline_end = append_region(parts, segments, cursor, inline_region)
-                                inline_blocks.append(
-                                    {
-                                        "language": inline_region.anchor_label,
-                                        "anchor_label": inline_region.anchor_label,
-                                        "anchor_ratio": float(inline_region.anchor_ratio),
-                                        "wrapper": wrapper_type,
-                                        "display_label": display_label,
-                                        "char_start": inline_start,
-                                        "char_end": inline_end,
-                                        "context_role": "inline_text",
-                                        "source_uid": inline_region.source_uid,
-                                        "source_char_start": int(inline_region.source_char_start),
-                                        "source_char_end": int(inline_region.source_char_end),
-                                        "truth_mode": "exact_region",
-                                    }
-                                )
-                                inline_lang_counts[str(inline_lang)] += 1
-                                inline_wrapper_counts[wrapper_type] += 1
-                                for chunk in post_markup:
-                                    cursor = append_text_part(parts, segments, cursor, chunk)
-                                trailing = suffix_text
-                                if spacer_after and trailing and not trailing[0].isspace():
-                                    cursor = append_text_part(parts, segments, cursor, " ")
-                                if trailing:
-                                    cursor = append_text_part(parts, segments, cursor, trailing)
+                    inline_lang_counts[str(inline_lang)] += 1
+                    inline_wrapper_counts[wrapper_type] += 1
+                    actual_inline_examples += 1
+                    for chunk in post_markup:
+                        cursor = append_text_part(parts, segments, cursor, chunk)
+                    trailing = suffix_text
+                    if spacer_after and trailing and not trailing[0].isspace():
+                        cursor = append_text_part(parts, segments, cursor, " ")
+                    if trailing:
+                        cursor = append_text_part(parts, segments, cursor, trailing)
 
             outro = sample_text(200)
             if outro and rng.random() < 0.65:
@@ -3966,6 +4382,10 @@ def _build_markdown_dataset_from_regions(
     support["inline_candidate_regions_by_anchor_label"] = {
         label: len(pool) for label, pool in inline_pools.items() if pool
     }
+    support["inline_target_count"] = int(target_inline_examples)
+    support["inline_actual_count"] = int(actual_inline_examples)
+    support["inline_min_visible"] = int(_MARKDOWN_INLINE_MIN_VISIBLE)
+    support["inline_max_visible"] = int(_MARKDOWN_INLINE_MAX_VISIBLE)
     return task, examples, desc, support
 
 

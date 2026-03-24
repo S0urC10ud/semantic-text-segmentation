@@ -105,6 +105,101 @@ class TestEvaluationRegionTasks(unittest.TestCase):
         self.assertEqual(int(needle_stats["by_lang"]["python"]["truth_chars"]), 4)
         self.assertEqual(int(needle_stats["any_detection"]["correct_chars"]), 4)
 
+    def test_needle_report_and_comparison_payload_expose_donor_support_weighting(self) -> None:
+        content = "HHABCD"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="needle_4_15",
+                    content=content,
+                    segments=[
+                        {"label": "sql", "char_start": 0, "char_end": 2},
+                        {"label": "python", "char_start": 2, "char_end": 4},
+                        {"label": "shell", "char_start": 4, "char_end": 6},
+                    ],
+                    metadata={
+                        "host_lang": "sql",
+                        "donor_lang": "python",
+                        "inserted_char_start": 2,
+                        "inserted_char_end": 6,
+                    },
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[
+                int(evalmod.cfg.LANG2ID["sql"]),
+                int(evalmod.cfg.LANG2ID["sql"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+            ],
+            probs=[_prob_row("sql"), _prob_row("sql"), _prob_row("python"), _prob_row("python"), _prob_row("shell"), _prob_row("shell")],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "needle_4_15",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+        manifest = {
+            "output_root": "evaluation/data",
+            "generated_at": "2026-03-22T00:00:00",
+            "tasks": [
+                {
+                    "task": "needle_4_15",
+                    "requested_count": 1,
+                    "requested_per_anchor_label": 1,
+                    "actual_count": 1,
+                    "actual_by_anchor_label": {"sql": 1},
+                    "candidate_regions_by_anchor_label": {"sql": 1},
+                    "shortfall_by_anchor_label": {"sql": 0},
+                    "donor_floor_visible_chars": 100,
+                    "qualified_donor_labels": ["python"],
+                    "donor_candidate_visible_support_by_donor_label": {"python": 128},
+                    "donor_selected_visible_support_by_donor_label": {"python": 4},
+                    "donor_support_shortfall_by_donor_label": {"python": 0},
+                }
+            ],
+        }
+        args = SimpleNamespace(
+            checkpoint="ckpt.msgpack",
+            model_dim=256,
+            channels=[96, 128, 192, 256],
+            dtype="bfloat16",
+            sample_seed=13,
+            other_threshold=0.0,
+            chunk=1536,
+            batch_size=8,
+            max_samples=0,
+        )
+
+        payload = evalmod._collect_comparison_metrics(args, [metrics], [], manifest)
+        needle_payload = payload["tasks"]["needle"]["needle_4_15"]
+        self.assertEqual(
+            needle_payload["coverage_weighting"],
+            {"mode": "micro", "unit": "inserted_chars"},
+        )
+        self.assertIn("per_donor_language", needle_payload)
+        self.assertIn("python", needle_payload["per_donor_language"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "report.md"
+            evalmod.write_report(
+                report_path,
+                manifest=manifest,
+                args=args,
+                task_metrics=[metrics],
+                throughput_results=[],
+            )
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("support-weighted over inserted-region chars", report)
+            self.assertIn("Label support below counts all evaluated non-whitespace characters", report)
+            self.assertIn("| Donor label | Samples | Selected visible chars | Qualified |", report)
+
     def test_sequence_regions_ignore_same_label_outside_region(self) -> None:
         content = "AABBP"
         dataset = hfds.Dataset.from_list(

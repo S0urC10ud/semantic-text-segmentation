@@ -3285,6 +3285,13 @@ def _task_support_payload(manifest: Optional[Mapping[str, Any]], task_name: str)
         "candidate_regions_by_anchor_label",
         "shortfall_by_anchor_label",
         "donor_candidate_regions_by_anchor_label",
+        "donor_candidate_regions_by_donor_label",
+        "donor_candidate_visible_support_by_donor_label",
+        "donor_selected_visible_support_by_donor_label",
+        "donor_actual_by_donor_label",
+        "donor_support_shortfall_by_donor_label",
+        "donor_floor_visible_chars",
+        "qualified_donor_labels",
         "other_candidate_regions_by_anchor_label",
         "inline_candidate_regions_by_anchor_label",
     )
@@ -3308,6 +3315,25 @@ def _support_summary_lines(support: Mapping[str, Any]) -> List[str]:
         if nonzero:
             joined = ", ".join(f"{label} -{value}" for label, value in nonzero[:6])
             lines.append(f"Shortfall by anchor: {joined}.")
+    donor_floor = int(support.get("donor_floor_visible_chars", 0) or 0)
+    if donor_floor > 0:
+        lines.append(
+            f"Needle donor floor: {donor_floor} visible chars; aggregate coverage is support-weighted over inserted-region chars."
+        )
+        qualified = support.get("qualified_donor_labels")
+        if isinstance(qualified, Sequence) and not isinstance(qualified, (str, bytes, bytearray)):
+            lines.append(f"Qualified donor labels: {len(list(qualified))}.")
+        donor_shortfall = support.get("donor_support_shortfall_by_donor_label")
+        if isinstance(donor_shortfall, Mapping):
+            nonzero_shortfall = [
+                (str(label), int(value))
+                for label, value in donor_shortfall.items()
+                if int(value) > 0
+            ]
+            nonzero_shortfall.sort(key=lambda item: (-item[1], item[0]))
+            if nonzero_shortfall:
+                joined = ", ".join(f"{label} -{value}" for label, value in nonzero_shortfall[:6])
+                lines.append(f"Donor support shortfall: {joined}.")
     return lines
 
 
@@ -4187,6 +4213,10 @@ def _collect_comparison_metrics(
                 "coverage": _float_or_none(any_cov),
                 "support": any_count,
             },
+            "coverage_weighting": {
+                "mode": "micro",
+                "unit": "inserted_chars",
+            },
             "top_misclassifications": top_conf,
         }
         by_lang = stats.get("by_lang", {}) if isinstance(stats, dict) else {}
@@ -4204,6 +4234,7 @@ def _collect_comparison_metrics(
                     "support": count,
                 }
             if per_anchor:
+                entry_payload["per_donor_language"] = per_anchor
                 entry_payload["per_anchor_language"] = per_anchor
         needle_entries[metrics.name] = entry_payload
     if needle_entries:
@@ -4352,7 +4383,8 @@ def write_report(
         report_lines.append(f"- Overall accuracy: {metrics.overall_accuracy():.4f}")
         report_lines.append(f"- High confusions: {_summarize_confusions(metrics)}")
         name = metrics.name
-        for support_line in _support_summary_lines(_task_support_payload(manifest, name)):
+        support_payload = _task_support_payload(manifest, name)
+        for support_line in _support_summary_lines(support_payload):
             report_lines.append(f"- {support_line}")
         per_label_acc = metrics.per_label_accuracy()
 
@@ -4480,6 +4512,8 @@ def write_report(
 
         if _needle_bucket_key(name) is not None:
             report_lines.append("")
+            report_lines.append("_Label support below counts all evaluated non-whitespace characters in the task window, not just inserted needle support._")
+            report_lines.append("")
             report_lines.append(_render_metrics_table(metrics))
             report_lines.append("")
 
@@ -4523,9 +4557,12 @@ def write_report(
             by_lang = stats.get("by_lang", {})
             any_by_lang = stats.get("any_by_lang", {})
             if isinstance(by_lang, Mapping) and by_lang:
+                donor_floor = int(support_payload.get("donor_floor_visible_chars", 0) or 0)
+                donor_candidate_visible = support_payload.get("donor_candidate_visible_support_by_donor_label", {})
+                donor_selected_visible = support_payload.get("donor_selected_visible_support_by_donor_label", {})
                 report_lines.append("")
-                report_lines.append("| Anchor label | Any non-wrapper ≥50% | Any non-wrapper coverage | Exact region ≥50% | Exact region coverage |")
-                report_lines.append("| --- | --- | ---: | --- | ---: |")
+                report_lines.append("| Donor label | Samples | Selected visible chars | Qualified | Any non-wrapper ≥50% | Any non-wrapper coverage | Exact region ≥50% | Exact region coverage |")
+                report_lines.append("| --- | ---: | ---: | --- | --- | ---: | --- | ---: |")
                 for lang, entry in sorted(by_lang.items()):
                     any_entry = any_by_lang.get(lang, {}) if isinstance(any_by_lang, Mapping) else {}
                     lang_total = int(entry.get("count", 0))
@@ -4534,8 +4571,16 @@ def write_report(
                     any_total_lang = int(any_entry.get("count", 0))
                     any_cov_lang = _format_pct(_safe_ratio(any_entry.get("correct_chars", 0), any_entry.get("truth_chars", 0)))
                     exact_cov_lang = _format_pct(_safe_ratio(entry.get("correct_chars", 0), entry.get("truth_chars", 0)))
+                    candidate_visible = 0
+                    if isinstance(donor_candidate_visible, Mapping):
+                        candidate_visible = int(donor_candidate_visible.get(lang, 0))
+                    selected_visible = int(entry.get("truth_chars", 0))
+                    if isinstance(donor_selected_visible, Mapping):
+                        selected_visible = int(donor_selected_visible.get(lang, selected_visible))
+                    qualified = "yes" if donor_floor <= 0 or candidate_visible >= donor_floor else "no"
                     report_lines.append(
-                        f"| {lang} | {_format_hits(int(any_entry.get('detected', 0)), any_total_lang)} | {any_cov_lang} | "
+                        f"| {lang} | {lang_total} | {selected_visible} | {qualified} | "
+                        f"{_format_hits(int(any_entry.get('detected', 0)), any_total_lang)} | {any_cov_lang} | "
                         f"{_format_hits(int(entry.get('detected', 0)), lang_total)} | {exact_cov_lang} |"
                     )
             report_lines.append("")
