@@ -1473,6 +1473,7 @@ def _evaluate_full_monitor_b(
     )
     metrics_payload.update(
         {
+            "_confusion_matrix": confusion.tolist(),
             "root": str(Path(monitor_root).resolve()),
             "arch": arch,
             "inference_mode": inference_mode,
@@ -3803,7 +3804,43 @@ def _write_confusion_matrix_plot(
     fig.clear()
 
 
-def _write_confusion_artifacts(report_path: Path, task_metrics: Sequence[TaskMetrics]) -> Dict[str, str]:
+def _monitor_b_confusion_payload(
+    monitor_b_report: Optional[Mapping[str, Any]],
+) -> Optional[Tuple[np.ndarray, List[str]]]:
+    if not monitor_b_report:
+        return None
+    raw_confusion = monitor_b_report.get("_confusion_matrix")
+    if raw_confusion is None:
+        return None
+    confusion = np.asarray(raw_confusion, dtype=np.int64)
+    if confusion.ndim != 2 or confusion.shape[0] != confusion.shape[1] or confusion.size == 0:
+        return None
+
+    keep_indices: List[int] = []
+    label_names: List[str] = []
+    for idx in range(int(confusion.shape[0])):
+        if idx == int(cfg.PAD_ID):
+            continue
+        if int(confusion[idx, :].sum()) <= 0 and int(confusion[:, idx].sum()) <= 0:
+            continue
+        keep_indices.append(idx)
+        label_names.append(str(cfg.ID2LANG.get(idx, str(idx))))
+
+    if not keep_indices or not label_names:
+        return None
+
+    keep = np.asarray(keep_indices, dtype=np.int64)
+    reduced = confusion[np.ix_(keep, keep)]
+    if reduced.size == 0 or int(reduced.sum()) <= 0:
+        return None
+    return reduced, label_names
+
+
+def _write_confusion_artifacts(
+    report_path: Path,
+    task_metrics: Sequence[TaskMetrics],
+    monitor_b_report: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
     artifacts: Dict[str, str] = {}
     confusion_dir = _confusion_artifacts_dir(report_path)
     confusion_dir.mkdir(parents=True, exist_ok=True)
@@ -3828,6 +3865,18 @@ def _write_confusion_artifacts(report_path: Path, task_metrics: Sequence[TaskMet
             title="All tasks confusion matrix",
         )
         artifacts["all_tasks"] = output_path.relative_to(report_path.parent).as_posix()
+
+    monitor_payload = _monitor_b_confusion_payload(monitor_b_report)
+    if monitor_payload is not None:
+        monitor_confusion, monitor_labels = monitor_payload
+        output_path = confusion_dir / _confusion_image_name("monitor_b")
+        _write_confusion_matrix_plot(
+            monitor_confusion,
+            monitor_labels,
+            output_path,
+            title="Full monitor_b confusion matrix",
+        )
+        artifacts["monitor_b"] = output_path.relative_to(report_path.parent).as_posix()
 
     return artifacts
 
@@ -4270,7 +4319,11 @@ def _collect_comparison_metrics(
         data["throughput"] = throughput_data
 
     if monitor_b_report:
-        data["monitor_b"] = dict(monitor_b_report)
+        data["monitor_b"] = {
+            key: value
+            for key, value in dict(monitor_b_report).items()
+            if not str(key).startswith("_")
+        }
 
     return data
 
@@ -4300,7 +4353,11 @@ def write_report(
     report_path = Path(report_path).resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
     comparison_path = _comparison_metrics_path(report_path)
-    confusion_artifacts = _write_confusion_artifacts(report_path, ordered_task_metrics)
+    confusion_artifacts = _write_confusion_artifacts(
+        report_path,
+        ordered_task_metrics,
+        monitor_b_report=monitor_b_report,
+    )
 
     def _format_channels(value) -> str:
         if isinstance(value, str):
@@ -4331,6 +4388,9 @@ def write_report(
     report_lines.append(f"- Comparison JSON: [comparison_metrics.json]({_comparison_metrics_path(report_path).name})")
     if monitor_b_report:
         report_lines.append(f"- Full monitor_b root: `{monitor_b_report.get('root')}`")
+    monitor_confusion_rel = confusion_artifacts.get("monitor_b")
+    if monitor_confusion_rel:
+        report_lines.append(f"- Full monitor_b confusion matrix: [{monitor_confusion_rel}]({monitor_confusion_rel})")
     aggregated_confusion_rel = confusion_artifacts.get("all_tasks")
     if aggregated_confusion_rel:
         report_lines.append(f"- Aggregated confusion matrix: [{aggregated_confusion_rel}]({aggregated_confusion_rel})")
@@ -4361,6 +4421,8 @@ def write_report(
         report_lines.append(f"- Files used: {int(monitor_b_report.get('files_used', 0))}")
         report_lines.append(f"- Skipped: {int(monitor_b_report.get('skipped', 0))}")
         report_lines.append(f"- Evaluated bytes: {int(monitor_b_report.get('evaluated_bytes', 0))}")
+        if monitor_confusion_rel:
+            report_lines.append(f"- Confusion matrix: [{monitor_confusion_rel}]({monitor_confusion_rel})")
         report_lines.append("")
         monitor_rows = monitor_b_report.get("rows", [])
         if isinstance(monitor_rows, Sequence) and monitor_rows:

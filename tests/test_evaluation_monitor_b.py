@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -163,6 +165,53 @@ class TestEvaluationMonitorB(unittest.TestCase):
         self.assertEqual(runner.calls, ["normal", "normal"])
         self.assertEqual(payload["inference_mode"], "full_file_auto_with_stream_fallback")
         self.assertAlmostEqual(float(payload["aggregates"]["micro_acc"]), 1.0)
+
+    def test_write_report_emits_monitor_b_confusion_artifact(self) -> None:
+        runner = _FakeUnetMonitorRunner()
+        with mock.patch.object(evalmod, "load_monitor_memmaps", return_value=_monitor_data()):
+            payload = evalmod._evaluate_full_monitor_b(Path("/tmp/monitor_b"), runner)
+
+        args = SimpleNamespace(
+            checkpoint="ckpt.msgpack",
+            model_dim=256,
+            channels=[96, 128, 192, 256],
+            dtype="bfloat16",
+            chunk=1536,
+            batch_size=128,
+            max_samples=0,
+            sample_seed=13,
+            other_threshold=0.0,
+            fine_tuned_mode=True,
+        )
+        manifest = {"output_root": "evaluation/data_b", "generated_at": "2026-03-24T00:00:00"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "report.md"
+            evalmod.write_report(
+                report_path,
+                manifest=manifest,
+                args=args,
+                task_metrics=[],
+                throughput_results=[],
+                monitor_b_report=payload,
+            )
+
+            report = report_path.read_text(encoding="utf-8")
+            comparison = json.loads((report_path.parent / "comparison_metrics.json").read_text(encoding="utf-8"))
+            monitor_confusion_path = report_path.parent / "confusion_matrices" / "monitor_b.png"
+
+            self.assertIn(
+                "- Full monitor_b confusion matrix: [confusion_matrices/monitor_b.png](confusion_matrices/monitor_b.png)",
+                report,
+            )
+            self.assertIn(
+                "- Confusion matrix: [confusion_matrices/monitor_b.png](confusion_matrices/monitor_b.png)",
+                report,
+            )
+            self.assertTrue(monitor_confusion_path.exists())
+            self.assertGreater(monitor_confusion_path.stat().st_size, 0)
+            self.assertIn("monitor_b", comparison)
+            self.assertNotIn("_confusion_matrix", comparison["monitor_b"])
 
 
 if __name__ == "__main__":

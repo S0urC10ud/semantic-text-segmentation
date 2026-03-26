@@ -312,6 +312,62 @@ def _compute_train_target_step(current_step: int, additional_updates: int) -> in
     return max(0, int(current_step) + updates - 1)
 
 
+def _build_train_cmd(
+    *,
+    python_executable: str,
+    data_root: str,
+    ckpt_path: str,
+    current_train_step: int,
+    train_max_minutes: int,
+    al_store: str,
+    active_learning_mix_prob: float,
+    al_max_windows: int,
+    full_files: bool,
+    full_file_max_bytes: int,
+    persistent_trainer_enabled: bool,
+    shared_wandb_run_id: str,
+    shared_schedule_final_step: int,
+    train_extra_args: str,
+) -> list[str]:
+    should_continue_shared_run = bool(shared_wandb_run_id) and int(current_train_step) > 0
+    mix_prob = float(max(0.0, min(1.0, float(active_learning_mix_prob))))
+    train_cmd = [
+        str(python_executable),
+        "train/main.py",
+        "--data_root",
+        str(data_root),
+        "--ckpt_path",
+        str(ckpt_path),
+        "--steps",
+        str(max(0, int(current_train_step) - 1)),
+        "--max_minutes",
+        str(int(train_max_minutes)),
+        "--fine-tune",
+        "--fine_tune_ckpt_path",
+        str(ckpt_path),
+        "--active_learning_store",
+        str(al_store),
+        "--active_learning_mix_prob",
+        str(mix_prob),
+        "--active_learning_max_windows",
+        str(int(al_max_windows)),
+        "--full-files" if bool(full_files) else "",
+        "--full-file-max-bytes",
+        str(int(full_file_max_bytes)),
+        "--persistent-trainer" if bool(persistent_trainer_enabled) else "",
+    ]
+    train_cmd = [part for part in train_cmd if part != ""]
+    if shared_wandb_run_id:
+        train_cmd.extend(["--schedule_steps", str(int(shared_schedule_final_step))])
+    if should_continue_shared_run:
+        train_cmd.extend(["--continue", str(shared_wandb_run_id)])
+    elif shared_wandb_run_id:
+        train_cmd.extend(["--wandb-run-id", str(shared_wandb_run_id)])
+    if str(train_extra_args or "").strip():
+        train_cmd.extend(shlex.split(str(train_extra_args)))
+    return train_cmd
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train -> active-learning -> train loop using the default training script."
@@ -529,48 +585,6 @@ def main() -> None:
         )
     trainer_session: PersistentTrainerSession | None = None
 
-    def _build_train_cmd(*, current_train_step: int) -> list[str]:
-        should_continue_shared_run = bool(shared_wandb_run_id) and current_train_step > 0
-        train_cmd = [
-            args.python,
-            "train/main.py",
-            "--data_root",
-            args.data_root,
-            "--ckpt_path",
-            ckpt_path,
-            "--steps",
-            str(max(0, int(current_train_step) - 1)),
-            "--max_minutes",
-            str(args.train_max_minutes),
-            "--fine-tune",
-            "--fine_tune_ckpt_path",
-            ckpt_path,
-            "--active_learning_store",
-            args.al_store,
-            "--active_learning_mix_prob",
-            "0.0",
-            "--active_learning_max_windows",
-            str(args.al_max_windows),
-            "--full-files" if bool(args.full_files) else "",
-            "--full-file-max-bytes",
-            str(int(args.full_file_max_bytes)),
-            "--persistent-trainer" if persistent_trainer_enabled else "",
-        ]
-        train_cmd = [part for part in train_cmd if part != ""]
-        if shared_wandb_run_id:
-            train_cmd.extend(["--schedule_steps", str(shared_schedule_final_step)])
-        if should_continue_shared_run:
-            train_cmd.extend(["--continue", shared_wandb_run_id])
-        elif shared_wandb_run_id:
-            train_cmd.extend(["--wandb-run-id", shared_wandb_run_id])
-            print(
-                f"Starting fresh shared W&B run {shared_wandb_run_id} from params at {ckpt_path}.",
-                flush=True,
-            )
-        if args.train_extra_args.strip():
-            train_cmd.extend(shlex.split(args.train_extra_args))
-        return train_cmd
-
     try:
         for round_idx in range(1, max(1, int(args.rounds)) + 1):
             current_train_step = _latest_train_checkpoint_step(ckpt_path)
@@ -720,8 +734,29 @@ def main() -> None:
             train_target_step = _compute_train_target_step(current_train_step, int(args.train_steps))
             if persistent_trainer_enabled:
                 if trainer_session is None:
+                    initial_train_cmd = _build_train_cmd(
+                        python_executable=args.python,
+                        data_root=args.data_root,
+                        ckpt_path=ckpt_path,
+                        current_train_step=current_train_step,
+                        train_max_minutes=args.train_max_minutes,
+                        al_store=args.al_store,
+                        active_learning_mix_prob=float(scheduled_mix_prob),
+                        al_max_windows=args.al_max_windows,
+                        full_files=bool(args.full_files),
+                        full_file_max_bytes=int(args.full_file_max_bytes),
+                        persistent_trainer_enabled=bool(persistent_trainer_enabled),
+                        shared_wandb_run_id=shared_wandb_run_id,
+                        shared_schedule_final_step=int(shared_schedule_final_step),
+                        train_extra_args=args.train_extra_args,
+                    )
+                    if shared_wandb_run_id and current_train_step <= 0:
+                        print(
+                            f"Starting fresh shared W&B run {shared_wandb_run_id} from params at {ckpt_path}.",
+                            flush=True,
+                        )
                     trainer_session = PersistentTrainerSession(
-                        _build_train_cmd(current_train_step=current_train_step)
+                        initial_train_cmd
                     )
                     ready_event = trainer_session.start()
                     print(
@@ -750,8 +785,27 @@ def main() -> None:
                         f"{train_event.get('error_message', '')}"
                     )
             else:
-                train_cmd = _build_train_cmd(current_train_step=current_train_step)
-                train_cmd[train_cmd.index("--active_learning_mix_prob") + 1] = str(scheduled_mix_prob)
+                train_cmd = _build_train_cmd(
+                    python_executable=args.python,
+                    data_root=args.data_root,
+                    ckpt_path=ckpt_path,
+                    current_train_step=current_train_step,
+                    train_max_minutes=args.train_max_minutes,
+                    al_store=args.al_store,
+                    active_learning_mix_prob=float(scheduled_mix_prob),
+                    al_max_windows=args.al_max_windows,
+                    full_files=bool(args.full_files),
+                    full_file_max_bytes=int(args.full_file_max_bytes),
+                    persistent_trainer_enabled=bool(persistent_trainer_enabled),
+                    shared_wandb_run_id=shared_wandb_run_id,
+                    shared_schedule_final_step=int(shared_schedule_final_step),
+                    train_extra_args=args.train_extra_args,
+                )
+                if shared_wandb_run_id and current_train_step <= 0:
+                    print(
+                        f"Starting fresh shared W&B run {shared_wandb_run_id} from params at {ckpt_path}.",
+                        flush=True,
+                    )
                 train_cmd[train_cmd.index("--steps") + 1] = str(train_target_step)
                 _run(train_cmd)
     finally:
