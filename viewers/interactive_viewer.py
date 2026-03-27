@@ -17,6 +17,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")  # Bypass Apple Silicon MPS 1D gro
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -25,6 +26,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+TRAIN_ROOT = REPO_ROOT / "train"
+if str(TRAIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(TRAIN_ROOT))
 
 try:
     from .core import (
