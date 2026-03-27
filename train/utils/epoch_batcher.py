@@ -450,6 +450,7 @@ class EpochPrefetchBatcher:
         ctx = mp.get_context("spawn")
         self.q = ctx.Queue(maxsize=max(2, data_cfg.prefetch_batches))
         self.stop_flag = ctx.Event()
+        self._phase_nonce = ctx.Value("q", 0)
         self.buckets = data_cfg.buckets()
         self.threads: List[mp.Process] = []
 
@@ -467,7 +468,11 @@ class EpochPrefetchBatcher:
             self._token_targets[lang_id] = max_len * length
 
         for wid in range(max(1, data_cfg.num_workers)):
-            t = ctx.Process(target=self._worker_entry, args=(self.cfg, wid, self.q, self.stop_flag, self.buckets), daemon=True)
+            t = ctx.Process(
+                target=self._worker_entry,
+                args=(self.cfg, wid, self.q, self.stop_flag, self.buckets, self._phase_nonce),
+                daemon=True,
+            )
             t.start()
             self.threads.append(t)
 
@@ -498,7 +503,7 @@ class EpochPrefetchBatcher:
                 self._lang_token_counts[lid] += cnt
 
     @staticmethod
-    def _worker_entry(cfg_obj, wid, q, stop_flag, buckets):
+    def _worker_entry(cfg_obj, wid, q, stop_flag, buckets, phase_nonce):
         import sys
         from pathlib import Path
         repo_root = str(Path(__file__).resolve().parents[2])
@@ -517,12 +522,29 @@ class EpochPrefetchBatcher:
         )
         dsets_by_lang = dsets["train"]
 
-        random.seed(cfg_obj.seed ^ wid ^ int(time.time()))
         hold = max(1, cfg_obj.bucket_hold_steps)
-        L = random.choice(buckets)
+        L = buckets[0] if buckets else max(1, int(cfg_obj.window_max_bytes))
         k = 0
+        seen_phase_nonce = None
+
+        def _reset_phase(force: bool = False) -> None:
+            nonlocal L, k, seen_phase_nonce
+
+            current_phase_nonce = int(getattr(phase_nonce, "value", 0))
+            if not force and current_phase_nonce == seen_phase_nonce:
+                return
+            phase_seed = (
+                int(cfg_obj.seed) ^ int(wid) ^ ((current_phase_nonce + 1) * 0x9E3779B1)
+            )
+            random.seed(phase_seed & 0xFFFFFFFFFFFFFFFF)
+            L = random.choice(buckets)
+            k = 0
+            seen_phase_nonce = current_phase_nonce
+
+        _reset_phase(force=True)
 
         while not stop_flag.is_set():
+            _reset_phase()
             if k % hold == 0:
                 L = random.choice(buckets)
             k += 1
@@ -557,13 +579,32 @@ class EpochPrefetchBatcher:
             except queue.Empty:
                 self._check_workers_alive("while waiting for batch")
 
-    def close(self):
-        self.stop_flag.set()
-        while not self.q.empty():
+    def _drain_queue(self) -> int:
+        drained = 0
+        while True:
             try:
                 self.q.get_nowait()
+                drained += 1
             except queue.Empty:
                 break
+        return drained
+
+    def reset_phase(
+        self,
+        *,
+        seed: int,
+        phase_nonce: int = 0,
+        refresh_active_learning: bool = False,
+    ) -> int:
+        del seed, refresh_active_learning
+        with self._phase_nonce.get_lock():
+            next_nonce = max(int(self._phase_nonce.value) + 1, int(phase_nonce) + 1)
+            self._phase_nonce.value = next_nonce
+        return self._drain_queue()
+
+    def close(self):
+        self.stop_flag.set()
+        self._drain_queue()
         for t in self.threads:
             t.join(timeout=2.0)
             if t.is_alive():
@@ -626,6 +667,8 @@ class MonitorFineTuneBatcher:
         ctx = mp.get_context("spawn")
         self.q = ctx.Queue(maxsize=max(2, data_cfg.prefetch_batches))
         self.stop_flag = ctx.Event()
+        self._phase_nonce = ctx.Value("q", 0)
+        self._al_refresh_nonce = ctx.Value("q", 0)
         self.threads: List[mp.Process] = []
 
         self.total_files = int(len(monitor_data["files"]))
@@ -684,6 +727,8 @@ class MonitorFineTuneBatcher:
                     self.dense_bias_prob,
                     self.full_files,
                     self.full_file_max_bytes,
+                    self._phase_nonce,
+                    self._al_refresh_nonce,
                 ),
                 daemon=True,
             )
@@ -939,6 +984,8 @@ class MonitorFineTuneBatcher:
         dense_bias_prob,
         full_files,
         full_file_max_bytes,
+        phase_nonce,
+        al_refresh_nonce,
     ):
         import sys
         repo_root = str(Path(__file__).resolve().parents[2])
@@ -960,12 +1007,7 @@ class MonitorFineTuneBatcher:
         segments = monitor_data["segments"]
         contents = monitor_data["contents"]
         fragment_dsets: Dict[int, hfds.Dataset] = {}
-        if augment:
-            fragment_dsets = _build_augmented_fragment_datasets(
-                monitor_data,
-                active_learning_store=active_learning_store,
-                active_learning_limit=active_learning_limit,
-            )
+        seen_refresh_nonce = None
 
         preferred_file_indices: Optional[np.ndarray] = None
         bias_prob = float(max(0.0, min(1.0, dense_bias_prob)))
@@ -974,7 +1016,6 @@ class MonitorFineTuneBatcher:
             if int(matches.size) > 0:
                 preferred_file_indices = matches.astype(np.int64, copy=False)
 
-        rng = np.random.default_rng(cfg_obj.seed ^ wid ^ int(time.time()))
         full_files = bool(full_files)
         target_sequence_len = max(1, int(full_file_max_bytes)) if full_files else int(cfg_obj.window_max_bytes)
         buckets = cfg_obj.buckets() if augment and not full_files else [target_sequence_len]
@@ -984,8 +1025,44 @@ class MonitorFineTuneBatcher:
         hold = max(1, int(getattr(cfg_obj, "bucket_hold_steps", 1))) if augment else 1
         window_len = int(buckets[0])
         step_idx = 0
+        rng = np.random.default_rng(int(cfg_obj.seed) ^ int(wid))
+        seen_phase_nonce = None
+
+        def _refresh_fragment_dsets(force: bool = False) -> None:
+            nonlocal fragment_dsets, seen_refresh_nonce
+
+            if not augment:
+                return
+            current_refresh_nonce = int(getattr(al_refresh_nonce, "value", 0))
+            if not force and current_refresh_nonce == seen_refresh_nonce:
+                return
+            fragment_dsets = _build_augmented_fragment_datasets(
+                monitor_data,
+                active_learning_store=active_learning_store,
+                active_learning_limit=active_learning_limit,
+            )
+            seen_refresh_nonce = current_refresh_nonce
+
+        def _reset_phase(force: bool = False) -> None:
+            nonlocal rng, step_idx, window_len, seen_phase_nonce
+
+            current_phase_nonce = int(getattr(phase_nonce, "value", 0))
+            if not force and current_phase_nonce == seen_phase_nonce:
+                return
+            phase_seed = (
+                int(cfg_obj.seed) ^ int(wid) ^ ((current_phase_nonce + 1) * 0x9E3779B1)
+            )
+            rng = np.random.default_rng(phase_seed & 0xFFFFFFFFFFFFFFFF)
+            step_idx = 0
+            window_len = int(buckets[0])
+            seen_phase_nonce = current_phase_nonce
+
+        _refresh_fragment_dsets(force=True)
+        _reset_phase(force=True)
 
         while not stop_flag.is_set():
+            _refresh_fragment_dsets()
+            _reset_phase()
             if step_idx % hold == 0:
                 bucket_idx = int(rng.integers(0, len(buckets))) if len(buckets) > 1 else 0
                 window_len = int(buckets[bucket_idx])
@@ -1087,13 +1164,35 @@ class MonitorFineTuneBatcher:
                 # Queue was empty for `timeout` seconds — check if workers died
                 self._check_workers_alive("while waiting for batch")
 
-    def close(self):
-        self.stop_flag.set()
-        while not self.q.empty():
+    def _drain_queue(self) -> int:
+        drained = 0
+        while True:
             try:
                 self.q.get_nowait()
+                drained += 1
             except queue.Empty:
                 break
+        return drained
+
+    def reset_phase(
+        self,
+        *,
+        seed: int,
+        phase_nonce: int = 0,
+        refresh_active_learning: bool = False,
+    ) -> int:
+        del seed
+        with self._phase_nonce.get_lock():
+            next_nonce = max(int(self._phase_nonce.value) + 1, int(phase_nonce) + 1)
+            self._phase_nonce.value = next_nonce
+        if self.augment and refresh_active_learning:
+            with self._al_refresh_nonce.get_lock():
+                self._al_refresh_nonce.value = int(self._al_refresh_nonce.value) + 1
+        return self._drain_queue()
+
+    def close(self):
+        self.stop_flag.set()
+        self._drain_queue()
         for t in self.threads:
             t.join(timeout=2.0)
             if t.is_alive():

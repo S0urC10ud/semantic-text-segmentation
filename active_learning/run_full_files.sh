@@ -1,7 +1,7 @@
 REPO_DIR="$PWD"
 SOURCE_RUN_ID="sfullfiles4"
 CHILD_RUN_ID="${CHILD_RUN_ID:-sfullfiles4}"
-PARENT_RUN_ID="${PARENT_RUN_ID:-ofullfiles4}" # make sure they are not equal!
+PARENT_RUN_ID="${PARENT_RUN_ID:-qfullfiles4}" # make sure they are not equal!
 
 "$REPO_DIR/.venv/bin/python" -m active_learning.meta_trainer \
   --rounds 300 \

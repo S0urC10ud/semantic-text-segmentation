@@ -9,6 +9,12 @@ import numpy as np
 from .label_store import LabelStore, DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS
 
 
+def _phase_seed(seed: int, phase_nonce: int = 0, *, salt: int = 0) -> int:
+    value = int(seed) ^ int(salt)
+    value ^= (int(phase_nonce) + 1) * 0x9E3779B1
+    return value & 0xFFFFFFFFFFFFFFFF
+
+
 @dataclass
 class ActiveLearningReplay:
     windows_x: np.ndarray
@@ -69,6 +75,41 @@ class ActiveLearningReplay:
     def size(self) -> int:
         return int(self.windows_x.shape[0])
 
+    def reset_rng(self, seed: int, *, phase_nonce: int = 0) -> None:
+        self.rng = np.random.default_rng(_phase_seed(seed, phase_nonce))
+
+    def reload_from_store(
+        self,
+        *,
+        store_path: str | Path,
+        window_bytes: int,
+        pad_byte_id: int,
+        pad_label_id: int,
+        label_to_id: Dict[str, int],
+        max_windows: Optional[int],
+        seed: int,
+        fallback_label: str = "other",
+        exclude_source_splits: Tuple[str, ...] = DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
+        full_files: bool = False,
+        phase_nonce: int = 0,
+    ) -> int:
+        refreshed = type(self).from_store(
+            store_path=store_path,
+            window_bytes=window_bytes,
+            pad_byte_id=pad_byte_id,
+            pad_label_id=pad_label_id,
+            label_to_id=label_to_id,
+            max_windows=max_windows,
+            seed=_phase_seed(seed, phase_nonce),
+            fallback_label=fallback_label,
+            exclude_source_splits=exclude_source_splits,
+            full_files=full_files,
+        )
+        self.windows_x = refreshed.windows_x
+        self.windows_y = refreshed.windows_y
+        self.rng = refreshed.rng
+        return self.size
+
     def sample(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
         if self.size <= 0 or n <= 0:
             return (
@@ -96,6 +137,67 @@ class MixedBatcher:
         self.rng = np.random.default_rng(int(seed) ^ 0xA11CE)
         self.total_batches = 0
         self.total_replay_rows = 0
+
+    def reset_rng(self, seed: int, *, phase_nonce: int = 0) -> None:
+        phase_seed = _phase_seed(seed, phase_nonce, salt=0xA11CE)
+        self.rng = np.random.default_rng(phase_seed)
+        self.replay.reset_rng(seed, phase_nonce=phase_nonce)
+
+    def refresh_replay_from_store(
+        self,
+        *,
+        store_path: str | Path,
+        window_bytes: int,
+        pad_byte_id: int,
+        pad_label_id: int,
+        label_to_id: Dict[str, int],
+        max_windows: Optional[int],
+        seed: int,
+        fallback_label: str = "other",
+        exclude_source_splits: Tuple[str, ...] = DEFAULT_EXCLUDED_TRAINING_SOURCE_SPLITS,
+        full_files: bool = False,
+        phase_nonce: int = 0,
+        mix_prob: Optional[float] = None,
+    ) -> int:
+        if mix_prob is not None:
+            self.mix_prob = float(max(0.0, min(1.0, mix_prob)))
+        size = self.replay.reload_from_store(
+            store_path=store_path,
+            window_bytes=window_bytes,
+            pad_byte_id=pad_byte_id,
+            pad_label_id=pad_label_id,
+            label_to_id=label_to_id,
+            max_windows=max_windows,
+            seed=seed,
+            fallback_label=fallback_label,
+            exclude_source_splits=exclude_source_splits,
+            full_files=full_files,
+            phase_nonce=phase_nonce,
+        )
+        self.reset_rng(seed, phase_nonce=phase_nonce)
+        return size
+
+    def reset_phase(
+        self,
+        *,
+        seed: int,
+        phase_nonce: int = 0,
+        refresh_active_learning: bool = False,
+    ) -> int:
+        drained = 0
+        if hasattr(self.base, "reset_phase"):
+            drained = int(
+                self.base.reset_phase(
+                    seed=seed,
+                    phase_nonce=phase_nonce,
+                    refresh_active_learning=refresh_active_learning,
+                )
+                or 0
+            )
+        self.reset_rng(seed, phase_nonce=phase_nonce)
+        self.total_batches = 0
+        self.total_replay_rows = 0
+        return drained
 
     def get(self):
         xb, yb = self.base.get()

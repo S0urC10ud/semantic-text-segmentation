@@ -1396,26 +1396,70 @@ def main():
         *,
         mix_prob: float,
         phase_label: str = "",
+        phase_nonce: int = 0,
     ):
         requested_mix_prob = float(max(0.0, min(1.0, mix_prob)))
         if not al_store_path:
-            return fetcher
-        if hasattr(fetcher, "replay") and hasattr(fetcher, "mix_prob"):
-            old_mix_prob = float(getattr(fetcher, "mix_prob", requested_mix_prob))
-            setattr(fetcher, "mix_prob", requested_mix_prob)
-            if phase_label and abs(old_mix_prob - requested_mix_prob) > 1e-12:
-                print(
-                    f"[{phase_label}] Updated active-learning replay mix_prob "
-                    f"from {old_mix_prob:.4f} to {requested_mix_prob:.4f}.",
-                    flush=True,
-                )
             return fetcher
 
         try:
             if str(repo_root) not in sys.path:
                 sys.path.insert(0, str(repo_root))
             from active_learning.training import ActiveLearningReplay, MixedBatcher
+        except Exception as e:
+            print(
+                f"⚠️  Active-learning replay disabled (load failure): {e}",
+                flush=True,
+            )
+            return fetcher
 
+        replay_unit = "sequences" if bool(args.full_files) else "windows"
+        prefix = f"[{phase_label}] " if phase_label else ""
+
+        if hasattr(fetcher, "refresh_replay_from_store") and hasattr(fetcher, "replay"):
+            old_mix_prob = float(getattr(fetcher, "mix_prob", requested_mix_prob))
+            if requested_mix_prob <= 0.0:
+                setattr(fetcher, "mix_prob", 0.0)
+                if phase_label and abs(old_mix_prob) > 1e-12:
+                    print(
+                        f"{prefix}Active-learning replay mix_prob updated from {old_mix_prob:.4f} to 0.0000.",
+                        flush=True,
+                    )
+                return fetcher
+            old_size = int(getattr(getattr(fetcher, "replay", None), "size", 0))
+            try:
+                replay_size = int(
+                    fetcher.refresh_replay_from_store(
+                        store_path=al_store_path,
+                        window_bytes=int(d_cfg.window_max_bytes),
+                        pad_byte_id=int(cfg.PAD_BYTE_ID),
+                        pad_label_id=int(cfg.PAD_ID),
+                        label_to_id=al_label_to_id,
+                        max_windows=int(args.active_learning_max_windows),
+                        seed=int(args.seed),
+                        fallback_label="other",
+                        full_files=bool(args.full_files),
+                        phase_nonce=int(phase_nonce),
+                        mix_prob=requested_mix_prob,
+                    )
+                )
+            except Exception as e:
+                print(
+                    f"⚠️  Active-learning replay refresh skipped; continuing with previous snapshot: {e}",
+                    flush=True,
+                )
+                return fetcher
+            print(
+                f"{prefix}Active-learning replay refreshed: {replay_size} {replay_unit} from {al_store_path} "
+                f"(mix_prob={requested_mix_prob:.2f}, previous_size={old_size}, previous_mix_prob={old_mix_prob:.4f}).",
+                flush=True,
+            )
+            return fetcher
+
+        if requested_mix_prob <= 0.0:
+            return fetcher
+
+        try:
             replay = ActiveLearningReplay.from_store(
                 store_path=al_store_path,
                 window_bytes=int(d_cfg.window_max_bytes),
@@ -1448,8 +1492,6 @@ def main():
             mix_prob=requested_mix_prob,
             seed=int(args.seed),
         )
-        replay_unit = "sequences" if bool(args.full_files) else "windows"
-        prefix = f"[{phase_label}] " if phase_label else ""
         print(
             f"{prefix}Active-learning replay enabled: {replay.size} {replay_unit} from {al_store_path} "
             f"(mix_prob={requested_mix_prob:.2f}).",
@@ -1460,6 +1502,7 @@ def main():
     data_fetcher = _maybe_enable_active_learning_replay(
         data_fetcher,
         mix_prob=al_mix_prob,
+        phase_nonce=int(_state_step(state, use_pmap=use_pmap)),
     )
 
     oe_lambda = float(max(0.0, getattr(t_cfg, "oe_lambda", 0.0)))
@@ -1747,6 +1790,42 @@ def main():
             commit=bool(current_step == 0),
         )
     persistent_mode = bool(args.persistent_trainer)
+
+    def _phase_restart_rng(current_step: int):
+        phase_rng = jax.random.PRNGKey(t_cfg.rng_seed)
+        phase_rng, _ = jax.random.split(phase_rng)
+        if bool(args.eval_on_start) or int(current_step) == 0:
+            phase_rng, _ = jax.random.split(phase_rng)
+        return phase_rng
+
+    def _reset_phase_runtime_state(*, phase_label: str) -> None:
+        nonlocal rng
+
+        current_phase_step = int(_state_step(state, use_pmap=use_pmap))
+        rng = _phase_restart_rng(current_phase_step)
+
+        drained = 0
+        if hasattr(data_fetcher, "reset_phase"):
+            drained = int(
+                data_fetcher.reset_phase(
+                    seed=int(args.seed),
+                    phase_nonce=current_phase_step,
+                    refresh_active_learning=bool(
+                        al_store_path and bool(args.fine_tune_augment_monitor)
+                    ),
+                )
+                or 0
+            )
+        if drained > 0:
+            print(
+                f"[{phase_label}] Cleared {drained} prefetched batch(es) before starting the next persistent phase.",
+                flush=True,
+            )
+        if oe_batcher is not None and hasattr(oe_batcher, "reset_phase"):
+            oe_batcher.reset_phase(
+                seed=int(args.seed),
+                phase_nonce=current_phase_step,
+            )
 
     def _run_training_phase(*, target_step: int, phase_label: str, phase_max_minutes: int) -> dict:
         nonlocal state, rng
@@ -2315,12 +2394,15 @@ def main():
                     command.get("phase_label", f"persistent_step_{command_target_step}")
                 ).strip() or f"persistent_step_{command_target_step}"
                 command_max_minutes = int(command.get("max_minutes", args.max_minutes))
+                current_phase_step = int(_state_step(state, use_pmap=use_pmap))
                 if "active_learning_mix_prob" in command:
                     data_fetcher = _maybe_enable_active_learning_replay(
                         data_fetcher,
                         mix_prob=float(command.get("active_learning_mix_prob", 0.0)),
                         phase_label=command_phase_label,
+                        phase_nonce=current_phase_step,
                     )
+                _reset_phase_runtime_state(phase_label=command_phase_label)
                 chunk_summary = _run_training_phase(
                     target_step=command_target_step,
                     phase_label=command_phase_label,
@@ -2336,6 +2418,7 @@ def main():
                     process_final_reason = str(chunk_summary.get("final_reason", "signal"))
                     break
         else:
+            _reset_phase_runtime_state(phase_label="train_main")
             chunk_summary = _run_training_phase(
                 target_step=int(t_cfg.steps),
                 phase_label="train_main",

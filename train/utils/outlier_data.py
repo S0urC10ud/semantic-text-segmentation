@@ -114,6 +114,18 @@ class OutlierBatcher:
             "batch_size": int(self.batch_size),
         }
 
+    def reset_phase(
+        self,
+        *,
+        seed: int,
+        phase_nonce: int = 0,
+        refresh_active_learning: bool = False,
+    ) -> int:
+        del refresh_active_learning
+        phase_seed = (int(seed) ^ 0x0E5EED ^ ((int(phase_nonce) + 1) * 0x9E3779B1))
+        self.rng = np.random.default_rng(phase_seed & 0xFFFFFFFFFFFFFFFF)
+        return 0
+
     def _sample_random(self) -> np.ndarray:
         min_len = max(8, self.window_bytes // 8)
         length = int(self.rng.integers(min_len, self.window_bytes + 1))
