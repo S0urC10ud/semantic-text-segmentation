@@ -109,6 +109,9 @@ TEXT_LIKE_POSITIVE_LABELS: Tuple[str, ...] = (
     "restructuredtext",
     "tex",
 )
+REPORT_ONLY_TRUTH_LABEL_EXCLUSIONS: Dict[str, Tuple[str, ...]] = {
+    "markdown_mix": ("markdown", "text"),
+}
 _TEXT_LIKE_ID2LABEL: Dict[int, str] = {
     0: "not_text_like",
     1: "text_like",
@@ -1697,6 +1700,10 @@ def _top_confusions(
     return result
 
 
+def _report_truth_label_exclusions(task_name: str) -> Tuple[str, ...]:
+    return REPORT_ONLY_TRUTH_LABEL_EXCLUSIONS.get(task_name, ())
+
+
 @dataclass
 class TaskMetrics:
     name: str
@@ -3129,13 +3136,62 @@ def _format_bytes_per_sec(value: float) -> str:
     return f"{value:.2f} {units[idx]}"
 
 
-def _render_metrics_table(metrics: TaskMetrics) -> str:
-    rows = []
+def _report_metric_rows(
+    metrics: TaskMetrics,
+    *,
+    exclude_truth_labels: Optional[Sequence[str]] = None,
+) -> List[Tuple[str, int, int, float]]:
+    exclude_set = set(exclude_truth_labels or ())
+    rows: List[Tuple[str, int, int, float]] = []
     for label in metrics.label_names:
-        support = metrics.per_label_counts.get(label, 0)
-        correct = metrics.per_label_correct.get(label, 0)
+        if label in exclude_set:
+            continue
+        support = int(metrics.per_label_counts.get(label, 0))
+        correct = int(metrics.per_label_correct.get(label, 0))
         acc = (correct / support) if support else float("nan")
-        rows.append((label, support, acc))
+        rows.append((label, support, correct, acc))
+    return rows
+
+
+def _report_total_chars(
+    metrics: TaskMetrics,
+    *,
+    exclude_truth_labels: Optional[Sequence[str]] = None,
+) -> int:
+    return sum(
+        support
+        for _, support, _, _ in _report_metric_rows(
+            metrics,
+            exclude_truth_labels=exclude_truth_labels,
+        )
+    )
+
+
+def _report_overall_accuracy(
+    metrics: TaskMetrics,
+    *,
+    exclude_truth_labels: Optional[Sequence[str]] = None,
+) -> float:
+    rows = _report_metric_rows(metrics, exclude_truth_labels=exclude_truth_labels)
+    total = sum(support for _, support, _, _ in rows)
+    if total <= 0:
+        return 0.0
+    correct = sum(correct for _, _, correct, _ in rows)
+    return float(correct / total)
+
+
+def _render_metrics_table(
+    metrics: TaskMetrics,
+    *,
+    exclude_truth_labels: Optional[Sequence[str]] = None,
+) -> str:
+    rows = [
+        (label, support, acc)
+        for label, support, _, acc in _report_metric_rows(
+            metrics,
+            exclude_truth_labels=exclude_truth_labels,
+        )
+    ]
     def sort_key(row):
         label, support, acc = row
         if math.isnan(acc):
@@ -3174,10 +3230,14 @@ def _summarize_confusions(
     limit: int = 5,
     min_rate: float = 0.05,
     min_count: int = 5,
+    exclude_true_labels: Optional[Sequence[str]] = None,
 ) -> str:
     entries: List[Tuple[int, float, str, str]] = []
     confusion = metrics.confusion
+    exclude_true_set = set(exclude_true_labels or [])
     for true_idx, true_label in enumerate(metrics.label_names):
+        if true_label in exclude_true_set:
+            continue
         row_total = int(confusion[true_idx].sum())
         if row_total <= 0:
             continue
@@ -4437,13 +4497,25 @@ def write_report(
         report_lines.append(metrics.description)
         report_lines.append("")
         extras = metrics.extras or {}
+        report_truth_exclusions = _report_truth_label_exclusions(metrics.name)
+        if report_truth_exclusions:
+            report_total_chars = _report_total_chars(metrics, exclude_truth_labels=report_truth_exclusions)
+            report_overall_accuracy = _report_overall_accuracy(
+                metrics,
+                exclude_truth_labels=report_truth_exclusions,
+            )
+        else:
+            report_total_chars = metrics.total_chars
+            report_overall_accuracy = metrics.overall_accuracy()
         confusion_rel = confusion_artifacts.get(metrics.name)
         if confusion_rel:
             report_lines.append(f"- Confusion matrix: [{confusion_rel}]({confusion_rel})")
         report_lines.append(f"- Samples: {metrics.samples}")
-        report_lines.append(f"- Characters evaluated: {metrics.total_chars}")
-        report_lines.append(f"- Overall accuracy: {metrics.overall_accuracy():.4f}")
-        report_lines.append(f"- High confusions: {_summarize_confusions(metrics)}")
+        report_lines.append(f"- Characters evaluated: {report_total_chars}")
+        report_lines.append(f"- Overall accuracy: {report_overall_accuracy:.4f}")
+        report_lines.append(
+            f"- High confusions: {_summarize_confusions(metrics, exclude_true_labels=report_truth_exclusions)}"
+        )
         name = metrics.name
         support_payload = _task_support_payload(manifest, name)
         for support_line in _support_summary_lines(support_payload):
@@ -4783,7 +4855,10 @@ def write_report(
             _append_text_like_binary_lines(report_lines, text_like_binary)
             report_lines.append("")
 
-        per_label_table = _render_metrics_table(metrics)
+        per_label_table = _render_metrics_table(
+            metrics,
+            exclude_truth_labels=report_truth_exclusions,
+        )
         report_lines.append(per_label_table)
         report_lines.append("")
 

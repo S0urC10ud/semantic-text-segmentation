@@ -365,10 +365,114 @@ class TestEvaluationRegionTasks(unittest.TestCase):
                 throughput_results=[],
             )
             report = report_path.read_text(encoding="utf-8")
+            report_section = report.split("### markdown_mix", 1)[1]
             self.assertIn("Support: 7/10 requested examples.", report)
             self.assertIn("Shortfall by anchor: shell -2, python -1.", report)
             self.assertIn("Binary text-like metrics", report)
             self.assertIn("| text_like | 4 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |", report)
+            self.assertIn("- Characters evaluated: 4", report_section)
+            self.assertIn("- Overall accuracy: 1.0000", report_section)
+            self.assertNotIn("| markdown |", report_section)
+            self.assertNotIn("| text |", report_section)
+
+    def test_markdown_report_filters_truth_labels_but_keeps_prediction_targets_in_confusions(self) -> None:
+        content = "MMPPSSTT"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="markdown_mix",
+                    content=content,
+                    segments=[
+                        {"label": "markdown", "char_start": 0, "char_end": 2},
+                        {"label": "python", "char_start": 2, "char_end": 4},
+                        {"label": "shell", "char_start": 4, "char_end": 6},
+                        {"label": "text", "char_start": 6, "char_end": 8},
+                    ],
+                    metadata={
+                        "markdown_blocks": [
+                            {
+                                "role": "other",
+                                "wrapped": False,
+                                "language": "python",
+                                "char_start": 2,
+                                "char_end": 6,
+                                "truth_mode": "exact_region",
+                            }
+                        ],
+                        "inline_blocks": [],
+                    },
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["markdown"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["text"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+            ],
+            probs=[
+                _prob_row("shell"),
+                _prob_row("shell"),
+                _prob_row("markdown"),
+                _prob_row("python"),
+                _prob_row("text"),
+                _prob_row("shell"),
+                _prob_row("python"),
+                _prob_row("python"),
+            ],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "markdown_mix",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+
+        args = SimpleNamespace(
+            checkpoint="ckpt.msgpack",
+            model_dim=256,
+            channels=[96, 128, 192, 256],
+            dtype="bfloat16",
+            sample_seed=13,
+            other_threshold=0.0,
+            chunk=1536,
+            batch_size=8,
+            max_samples=0,
+        )
+        manifest = {
+            "output_root": "evaluation/data",
+            "generated_at": "2026-03-22T00:00:00",
+            "tasks": [],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "report.md"
+            evalmod.write_report(
+                report_path,
+                manifest=manifest,
+                args=args,
+                task_metrics=[metrics],
+                throughput_results=[],
+            )
+            report = report_path.read_text(encoding="utf-8")
+            report_section = report.split("### markdown_mix", 1)[1]
+            self.assertIn("- Characters evaluated: 4", report_section)
+            self.assertIn("- Overall accuracy: 0.5000", report_section)
+            self.assertIn(
+                "- High confusions: python->markdown 1 (50.0%), shell->text 1 (50.0%)",
+                report_section,
+            )
+            self.assertIn("| python | 2 | 0.5000 |", report_section)
+            self.assertIn("| shell | 2 | 0.5000 |", report_section)
+            self.assertNotIn("| markdown |", report_section)
+            self.assertNotIn("| text |", report_section)
 
     def test_restructuredtext_comparison_metrics_include_text_like_binary(self) -> None:
         content = "RRABCDTT"
