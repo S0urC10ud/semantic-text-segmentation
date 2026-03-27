@@ -72,6 +72,7 @@ except Exception:  # pragma: no cover - environment-dependent optional import
 from inference.backend import (  # noqa: E402
     FastInferenceEngine,
     FastInferenceFailure,
+    build_window_spans,
     format_auto_fallback_message,
 )
 from inference.mamba_cuda import has_cuda_mamba_kernel  # noqa: E402
@@ -598,6 +599,7 @@ class SegmenterRunner:
         device: Optional[str] = None,
         batch_size: int = 16,
         inference_backend: str = "auto",
+        full_memory_budget_bytes: Optional[int] = None,
     ):
         backend = _resolve_backend(device)
         available = _available_backends()
@@ -754,6 +756,7 @@ class SegmenterRunner:
                 mamba_expand=int(mamba_expand),
                 mamba_bidirectional=bool(mamba_bidirectional),
                 cuda_kernel_available=cuda_kernel_available,
+                full_memory_budget_bytes=full_memory_budget_bytes,
             )
 
     # ------------------------------------------------------------------
@@ -933,6 +936,59 @@ class SegmenterRunner:
                 )
                 return self._segment_bytes_labels_only_legacy(byte_arr)
             raise
+
+    def segment_byte_arrays_batch_labels_only(
+        self,
+        byte_arrays: Sequence[np.ndarray],
+    ) -> Tuple[List[np.ndarray], List[List[Tuple[int, int]]]]:
+        arrays = [sanitize_bytes(np.asarray(arr, dtype=np.uint8)) for arr in byte_arrays]
+        if not arrays:
+            return [], []
+        if self.inference_backend == "legacy" or self._fast_engine is None:
+            labels = [self._segment_bytes_labels_only_legacy(arr) for arr in arrays]
+            spans = [build_window_spans(int(arr.shape[0]), self.chunk) for arr in arrays]
+            return labels, spans
+        try:
+            return self._fast_engine.segment_bytes_batch_labels_only(arrays)
+        except FastInferenceFailure as exc:
+            if self.inference_backend == "auto":
+                print(
+                    format_auto_fallback_message(
+                        from_path=exc.source_path,
+                        to_path="legacy",
+                        trigger=exc.trigger,
+                        reason=exc.reason,
+                    ),
+                    flush=True,
+                )
+                labels = [self._segment_bytes_labels_only_legacy(arr) for arr in arrays]
+                spans = [build_window_spans(int(arr.shape[0]), self.chunk) for arr in arrays]
+                return labels, spans
+            raise
+        except Exception as exc:
+            if self.inference_backend == "auto":
+                print(
+                    format_auto_fallback_message(
+                        from_path="fast",
+                        to_path="legacy",
+                        trigger="runtime_error",
+                        reason=str(exc),
+                    ),
+                    flush=True,
+                )
+                labels = [self._segment_bytes_labels_only_legacy(arr) for arr in arrays]
+                spans = [build_window_spans(int(arr.shape[0]), self.chunk) for arr in arrays]
+                return labels, spans
+            raise
+
+    def clear_fast_execution_history(self) -> None:
+        if self._fast_engine is not None:
+            self._fast_engine.execution_history.clear()
+
+    def get_fast_execution_history(self) -> List[Any]:
+        if self._fast_engine is None:
+            return []
+        return list(self._fast_engine.execution_history)
 
     def segment_text(self, text: str, *, min_run_chars: int = 1) -> Tuple[List[Tuple[int, int, int]], List[int], List[np.ndarray]]:
         text = normalize_eval_text(text)
