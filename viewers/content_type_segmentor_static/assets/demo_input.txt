@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Content Type Segmentor Demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --accent: #0b5ed7;
+      --surface: #ffffff;
+      --text: #111827;
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: system-ui, sans-serif;
+      color: var(--text);
+      background: linear-gradient(180deg, #f8fbff 0%, #eef5ff 100%);
+    }
+
+    .card {
+      border: 1px solid rgba(11, 94, 215, 0.14);
+      border-radius: 18px;
+      padding: 20px;
+      background: var(--surface);
+      box-shadow: 0 18px 42px rgba(15, 23, 42, 0.08);
+    }
+
+    .hero {
+      display: grid;
+      gap: 12px;
+    }
+
+    .cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: none;
+      border-radius: 999px;
+      padding: 10px 14px;
+      color: white;
+      background: var(--accent);
+    }
+  </style>
+  <script type="application/json" id="segment-config">
+    {
+      "demo": "content-type-segmentor",
+      "host": "browser-only",
+      "labels": ["html", "css", "javascript_typescript", "json", "text"]
+    }
+  </script>
+</head>
+<body>
+  <section class="card hero">
+    <h1>Client-side segmentation demo</h1>
+    <p>
+      This page mixes HTML, CSS, JavaScript, and JSON so the public demo shows multiple content
+      types in one pass.
+    </p>
+    <button class="cta" onclick="console.log('segment demo ready')">Launch Demo</button>
+  </section>
+
+  <script>
+    const config = JSON.parse(document.getElementById('segment-config').textContent);
+    const payload = {
+      model: 'sfullfiles4',
+      loadedAt: new Date().toISOString(),
+      config,
+    };
+
+    async function announce(){
+      const response = await fetch('/healthz');
+      const info = await response.json();
+      console.log('browser demo', payload, info);
+    }
+
+    announce();
+  </script>
+</body>
+</html>
