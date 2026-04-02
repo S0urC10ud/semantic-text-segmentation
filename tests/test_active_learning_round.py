@@ -42,6 +42,20 @@ def _snippet(sid: str) -> BoundarySnippet:
 
 
 class TestRoundOracleRequestCap(unittest.TestCase):
+    def test_configure_oracle_parallel_requests_prefers_explicit_setting(self) -> None:
+        class Oracle:
+            def __init__(self) -> None:
+                self.max_parallel_requests = 1
+
+        oracle = Oracle()
+        parallel = _configure_oracle_parallel_requests(
+            oracle,
+            max_oracle_requests=80,
+            gemini_parallel_requests=16,
+        )
+        self.assertEqual(parallel, 16)
+        self.assertEqual(oracle.max_parallel_requests, 16)
+
     def test_configure_oracle_parallel_requests_uses_request_cap(self) -> None:
         class Oracle:
             def __init__(self) -> None:
@@ -66,6 +80,18 @@ class TestRoundOracleRequestCap(unittest.TestCase):
         )
         self.assertEqual(parallel, 1)
         self.assertFalse(hasattr(oracle, "max_parallel_requests"))
+
+    def test_parser_accepts_gemini_parallel_requests(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "--ckpt",
+                "dummy.msgpack",
+                "--gemini-parallel-requests",
+                "16",
+            ]
+        )
+        self.assertEqual(args.gemini_parallel_requests, 16)
 
     def test_make_snippet_id_is_short_and_deterministic(self) -> None:
         sid_a = _make_snippet_id("abc123", 10, 20, 15)

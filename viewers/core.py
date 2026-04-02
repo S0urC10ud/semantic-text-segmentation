@@ -29,6 +29,7 @@ from inference.backend import (
     FastInferenceEngine,
     FastInferenceFailure,
     available_backends,
+    build_window_spans as backend_build_window_spans,
     format_auto_fallback_message,
     resolve_backend,
 )
@@ -1366,29 +1367,7 @@ class Predictor:
 
     @staticmethod
     def _build_window_spans(length: int, chunk_size: int) -> List[Tuple[int, int]]:
-        n = int(length)
-        if n <= 0:
-            return []
-        win = max(64, int(chunk_size))
-        stride = max(1, win // 2)
-        start_positions = list(range(0, max(1, n - win + 1), stride))
-        if not start_positions:
-            start_positions = [0]
-        last_start = start_positions[-1]
-        tail_start = max(0, n - win)
-        if last_start + win < n and tail_start not in start_positions:
-            start_positions.append(tail_start)
-        spans: List[Tuple[int, int]] = []
-        seen = set()
-        for start in start_positions:
-            if start in seen:
-                continue
-            seen.add(start)
-            end = min(start + win, n)
-            spans.append((int(start), int(end)))
-        if not spans:
-            spans = [(0, n)]
-        return spans
+        return backend_build_window_spans(length, chunk_size)
 
     def _segment_bytes_batch_legacy(
         self,

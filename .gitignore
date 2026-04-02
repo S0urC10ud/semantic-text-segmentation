@@ -9,6 +9,11 @@ downloader/mon_preprocessed_before_relabeling/*
 evaluation/reports/**
 *.pyc
 scripts/
+!scripts/
+evaluation/old_reports/**
+scripts/*
+!scripts/analyze_active_learning_confusion.py
+!scripts/run_tune_tau_sfullfiles3_monitor_b.sh
 *.sqlite
 downloader/mon_preprocessed_before_relabeling/*
 comparisons/

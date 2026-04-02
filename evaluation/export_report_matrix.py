@@ -101,6 +101,10 @@ def _markdown_binary_f1(payload: Mapping[str, Any]) -> float:
     )
 
 
+def _markdown_boundary_metric(payload: Mapping[str, Any], metric_name: str) -> float:
+    return _required_float(payload, "tasks", "markdown_mix", "boundary_region", "aggregates", metric_name)
+
+
 def _pure_fragments_total(payload: Mapping[str, Any], rate_key: str) -> tuple[float, float]:
     per_language = _required_mapping(payload, "tasks", "pure_fragments", "per_language")
     support_total = 0.0
@@ -127,6 +131,10 @@ def _sequence_coverage(payload: Mapping[str, Any], task_name: str, segment_name:
     return _required_float(payload, "tasks", task_name, "segments", segment_name, "coverage")
 
 
+def _sequence_boundary_metric(payload: Mapping[str, Any], task_name: str, metric_name: str) -> float:
+    return _required_float(payload, "tasks", task_name, "boundary_region", "aggregates", metric_name)
+
+
 def _needle_entry(payload: Mapping[str, Any], bucket: str, variant: str) -> Mapping[str, Any]:
     return _required_mapping(payload, "tasks", "needle", bucket, variant)
 
@@ -141,8 +149,34 @@ def _needle_support(payload: Mapping[str, Any], bucket: str, variant: str) -> fl
     return _required_float(_needle_entry(payload, bucket, variant), "support")
 
 
+def _needle_boundary_metric(payload: Mapping[str, Any], bucket: str, metric_name: str) -> float:
+    return _required_float(payload, "tasks", "needle", bucket, "boundary_region", "aggregates", metric_name)
+
+
 def _monitor_metric(payload: Mapping[str, Any], metric_name: str) -> float:
     return _required_float(payload, "monitor_b", "aggregates", metric_name)
+
+
+def _monitor_boundary_metric(payload: Mapping[str, Any], metric_name: str) -> float:
+    return _required_float(payload, "monitor_b", "boundary_region", "aggregates", metric_name)
+
+
+_NEEDLE_BOUNDARY_BUCKETS: tuple[str, ...] = (
+    "needle_64_plus",
+    "needle_32_63",
+    "needle_16_31",
+    "needle_4_15",
+)
+_NEEDLE_BOUNDARY_METRICS: tuple[tuple[str, str], ...] = (
+    ("acc", "micro_acc"),
+    ("precision", "macro_precision"),
+    ("recall", "macro_recall"),
+    ("f1", "macro_f1"),
+)
+_SEQUENCE_BOUNDARY_TASKS: tuple[str, ...] = (
+    "sequence_pair",
+    "sequence_triplet",
+)
 
 
 METRIC_SPECS: tuple[MetricSpec, ...] = (
@@ -181,6 +215,17 @@ METRIC_SPECS: tuple[MetricSpec, ...] = (
         _markdown_binary_f1,
         lambda payload: 1.0,
     ),
+    *tuple(
+        MetricSpec(
+            f"markdown_mix.boundary_pm4.{public_name}",
+            lambda payload, aggregate_name=aggregate_name: _markdown_boundary_metric(
+                payload,
+                aggregate_name,
+            ),
+            lambda payload: 1.0,
+        )
+        for public_name, aggregate_name in _NEEDLE_BOUNDARY_METRICS
+    ),
     MetricSpec(
         "pure_fragments.no_misclassified_host_label_bytes",
         lambda payload: _pure_fragments_hits(payload, "fully_pure_rate"),
@@ -216,6 +261,19 @@ METRIC_SPECS: tuple[MetricSpec, ...] = (
         lambda payload: _sequence_coverage(payload, "sequence_triplet", "third"),
         lambda payload: 1.0,
     ),
+    *tuple(
+        MetricSpec(
+            f"{task_name}.boundary_pm4.{public_name}",
+            lambda payload, task_name=task_name, aggregate_name=aggregate_name: _sequence_boundary_metric(
+                payload,
+                task_name,
+                aggregate_name,
+            ),
+            lambda payload: 1.0,
+        )
+        for task_name in _SEQUENCE_BOUNDARY_TASKS
+        for public_name, aggregate_name in _NEEDLE_BOUNDARY_METRICS
+    ),
     MetricSpec(
         "needle_64_plus.any_non_wrapper.coverage_ge_50_samples",
         lambda payload: _needle_hits(payload, "needle_64_plus", "any"),
@@ -236,6 +294,19 @@ METRIC_SPECS: tuple[MetricSpec, ...] = (
         lambda payload: _needle_hits(payload, "needle_32_63", "donor"),
         lambda payload: _needle_support(payload, "needle_32_63", "donor"),
     ),
+    *tuple(
+        MetricSpec(
+            f"{bucket}.boundary_pm4.{public_name}",
+            lambda payload, bucket=bucket, aggregate_name=aggregate_name: _needle_boundary_metric(
+                payload,
+                bucket,
+                aggregate_name,
+            ),
+            lambda payload: 1.0,
+        )
+        for bucket in _NEEDLE_BOUNDARY_BUCKETS
+        for public_name, aggregate_name in _NEEDLE_BOUNDARY_METRICS
+    ),
     MetricSpec(
         "monitor_b.acc",
         lambda payload: _monitor_metric(payload, "micro_acc"),
@@ -255,6 +326,17 @@ METRIC_SPECS: tuple[MetricSpec, ...] = (
         "monitor_b.f1",
         lambda payload: _monitor_metric(payload, "macro_f1"),
         lambda payload: 1.0,
+    ),
+    *tuple(
+        MetricSpec(
+            f"monitor_b.boundary_pm4.{public_name}",
+            lambda payload, aggregate_name=aggregate_name: _monitor_boundary_metric(
+                payload,
+                aggregate_name,
+            ),
+            lambda payload: 1.0,
+        )
+        for public_name, aggregate_name in _NEEDLE_BOUNDARY_METRICS
     ),
 )
 

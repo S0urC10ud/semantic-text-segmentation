@@ -983,9 +983,12 @@ def _configure_oracle_parallel_requests(
     oracle: object,
     *,
     max_oracle_requests: Optional[int],
+    gemini_parallel_requests: Optional[int] = None,
 ) -> int:
     parallel_requests = 1
-    if max_oracle_requests is not None:
+    if gemini_parallel_requests is not None:
+        parallel_requests = max(1, int(gemini_parallel_requests))
+    elif max_oracle_requests is not None:
         parallel_requests = max(1, int(max_oracle_requests))
     if hasattr(oracle, "max_parallel_requests"):
         setattr(oracle, "max_parallel_requests", int(parallel_requests))
@@ -1036,6 +1039,7 @@ def run_one_round(
     sample_seed: Optional[int] = None,
     skip_seen_hashes: bool = True,
     max_oracle_requests: Optional[int] = 3,
+    gemini_parallel_requests: Optional[int] = None,
     full_files: bool = False,
     full_file_max_bytes: int = 10000,
     sample_workers: int = 1,
@@ -1288,6 +1292,7 @@ def run_one_round(
     parallel_requests = _configure_oracle_parallel_requests(
         oracle,
         max_oracle_requests=max_oracle_requests,
+        gemini_parallel_requests=gemini_parallel_requests,
     )
     oracle_batch_size = max(1, int(getattr(oracle, "batch_size", 1)))
     estimated_request_batches = int(
@@ -1608,6 +1613,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="medium",
     )
     parser.add_argument("--gemini-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--gemini-parallel-requests",
+        type=int,
+        default=None,
+        help=(
+            "Concurrent Gemini oracle requests to dispatch. "
+            "Defaults to --max-oracle-requests for backward compatibility."
+        ),
+    )
     parser.add_argument("--gemini-rate-limit-sleep-seconds", type=float, default=65.0)
     parser.add_argument("--gemini-rate-limit-max-retries", type=int, default=8)
     parser.add_argument("--gemini-missing-snippet-retries", type=int, default=2)
@@ -1665,6 +1679,11 @@ def main() -> None:
             thinking_level=args.gemini_thinking_level,
             api_key=args.api_key,
             batch_size=args.gemini_batch_size,
+            max_parallel_requests=(
+                max(1, int(args.gemini_parallel_requests))
+                if args.gemini_parallel_requests is not None
+                else 1
+            ),
             proxy=args.proxy,
             rate_limit_sleep_seconds=args.gemini_rate_limit_sleep_seconds,
             rate_limit_max_retries=args.gemini_rate_limit_max_retries,
@@ -1704,6 +1723,7 @@ def main() -> None:
         sample_seed=args.sample_seed,
         skip_seen_hashes=not bool(args.allow_repeat_hashes),
         max_oracle_requests=None if bool(args.unlimited_oracle) else max(0, int(args.max_oracle_requests)),
+        gemini_parallel_requests=args.gemini_parallel_requests,
         full_files=bool(args.full_files),
         full_file_max_bytes=int(args.full_file_max_bytes),
         sample_workers=max(1, int(args.sample_workers)),

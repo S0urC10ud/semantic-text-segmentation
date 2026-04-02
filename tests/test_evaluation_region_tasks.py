@@ -57,6 +57,174 @@ def _record(
 
 
 class TestEvaluationRegionTasks(unittest.TestCase):
+    def test_text_relabels_to_markup_with_sufficient_evidence(self) -> None:
+        content = "MMMMMMMMMMTTTT"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="postprocess_text_markup",
+                    content=content,
+                    segments=[
+                        {"label": "markdown", "char_start": 0, "char_end": 10},
+                        {"label": "text", "char_start": 10, "char_end": 14},
+                    ],
+                    metadata={},
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[int(evalmod.cfg.LANG2ID["markdown"])] * len(content),
+            probs=[_prob_row("markdown") for _ in content],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "postprocess_text_markup",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+
+        self.assertAlmostEqual(metrics.overall_accuracy(), 1.0)
+        self.assertEqual(int(metrics.per_label_counts.get("text", 0)), 0)
+        self.assertEqual(int(metrics.per_label_counts.get("markdown", 0)), len(content))
+
+    def test_text_relabels_to_markup_with_more_evidence(self) -> None:
+        content = "MMMMMMMMMMRRRRRRRRRRRRTTTT"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="postprocess_text_dominant_markup",
+                    content=content,
+                    segments=[
+                        {"label": "markdown", "char_start": 0, "char_end": 10},
+                        {"label": "restructuredtext", "char_start": 10, "char_end": 22},
+                        {"label": "text", "char_start": 22, "char_end": 26},
+                    ],
+                    metadata={},
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=(
+                [int(evalmod.cfg.LANG2ID["markdown"])] * 10
+                + [int(evalmod.cfg.LANG2ID["restructuredtext"])] * 16
+            ),
+            probs=(
+                [_prob_row("markdown") for _ in range(10)]
+                + [_prob_row("restructuredtext") for _ in range(16)]
+            ),
+        )
+
+        metrics = evalmod.evaluate_task(
+            "postprocess_text_dominant_markup",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+
+        self.assertAlmostEqual(metrics.overall_accuracy(), 1.0)
+        self.assertEqual(int(metrics.per_label_counts.get("text", 0)), 0)
+        self.assertEqual(int(metrics.per_label_counts.get("restructuredtext", 0)), 16)
+
+    def test_text_relabel_requires_ten_tokens_of_host_evidence(self) -> None:
+        content = "MMMMMMMMMTTTT"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="postprocess_text_threshold",
+                    content=content,
+                    segments=[
+                        {"label": "markdown", "char_start": 0, "char_end": 9},
+                        {"label": "text", "char_start": 9, "char_end": 13},
+                    ],
+                    metadata={},
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[int(evalmod.cfg.LANG2ID["markdown"])] * len(content),
+            probs=[_prob_row("markdown") for _ in content],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "postprocess_text_threshold",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+
+        self.assertAlmostEqual(metrics.overall_accuracy(), 9.0 / 13.0)
+        self.assertEqual(int(metrics.per_label_counts.get("text", 0)), 4)
+
+    def test_json_relabels_to_javascript_typescript_with_wrapping_evidence(self) -> None:
+        content = "JJJJJJJJJJQQQQJJJJJJJJJJ"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="postprocess_json_js",
+                    content=content,
+                    segments=[
+                        {"label": "javascript_typescript", "char_start": 0, "char_end": 10},
+                        {"label": "json", "char_start": 10, "char_end": 14},
+                        {"label": "javascript_typescript", "char_start": 14, "char_end": 24},
+                    ],
+                    metadata={},
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[int(evalmod.cfg.LANG2ID["javascript_typescript"])] * len(content),
+            probs=[_prob_row("javascript_typescript") for _ in content],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "postprocess_json_js",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+
+        self.assertAlmostEqual(metrics.overall_accuracy(), 1.0)
+        self.assertEqual(int(metrics.per_label_counts.get("json", 0)), 0)
+        self.assertEqual(int(metrics.per_label_counts.get("javascript_typescript", 0)), len(content))
+
+    def test_xml_relabels_to_svg_with_wrapping_evidence(self) -> None:
+        content = "SSSSSSSSSSXXXXSSSSSSSSSS"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="postprocess_xml_svg",
+                    content=content,
+                    segments=[
+                        {"label": "svg", "char_start": 0, "char_end": 10},
+                        {"label": "xml", "char_start": 10, "char_end": 14},
+                        {"label": "svg", "char_start": 14, "char_end": 24},
+                    ],
+                    metadata={},
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[int(evalmod.cfg.LANG2ID["svg"])] * len(content),
+            probs=[_prob_row("svg") for _ in content],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "postprocess_xml_svg",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+
+        self.assertAlmostEqual(metrics.overall_accuracy(), 1.0)
+        self.assertEqual(int(metrics.per_label_counts.get("xml", 0)), 0)
+        self.assertEqual(int(metrics.per_label_counts.get("svg", 0)), len(content))
+
     def test_needle_exact_region_uses_inserted_span_not_donor_label_mask(self) -> None:
         content = "HHABCD"
         dataset = hfds.Dataset.from_list(
@@ -200,6 +368,91 @@ class TestEvaluationRegionTasks(unittest.TestCase):
             self.assertIn("Label support below counts all evaluated non-whitespace characters", report)
             self.assertIn("| Donor label | Samples | Selected visible chars | Qualified |", report)
 
+    def test_needle_boundary_region_metrics_flow_to_json_and_report(self) -> None:
+        content = "HHHHHHHHPPPPHHHHHHHH"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="needle_4_15",
+                    content=content,
+                    segments=[
+                        {"label": "sql", "char_start": 0, "char_end": 8},
+                        {"label": "python", "char_start": 8, "char_end": 12},
+                        {"label": "sql", "char_start": 12, "char_end": 20},
+                    ],
+                    metadata={
+                        "host_lang": "sql",
+                        "donor_lang": "python",
+                        "inserted_char_start": 8,
+                        "inserted_char_end": 12,
+                    },
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=(
+                [int(evalmod.cfg.LANG2ID["sql"])] * 10
+                + [int(evalmod.cfg.LANG2ID["python"])] * 2
+                + [int(evalmod.cfg.LANG2ID["sql"])] * 2
+                + [int(evalmod.cfg.LANG2ID["python"])]
+                + [int(evalmod.cfg.LANG2ID["sql"])] * 5
+            ),
+            probs=(
+                [_prob_row("sql") for _ in range(10)]
+                + [_prob_row("python") for _ in range(2)]
+                + [_prob_row("sql") for _ in range(2)]
+                + [_prob_row("python")]
+                + [_prob_row("sql") for _ in range(5)]
+            ),
+        )
+
+        metrics = evalmod.evaluate_task(
+            "needle_4_15",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+        args = SimpleNamespace(
+            checkpoint="ckpt.msgpack",
+            model_dim=256,
+            channels=[96, 128, 192, 256],
+            dtype="bfloat16",
+            sample_seed=13,
+            other_threshold=0.0,
+            chunk=1536,
+            batch_size=8,
+            max_samples=0,
+        )
+        manifest = {
+            "output_root": "evaluation/data",
+            "generated_at": "2026-03-22T00:00:00",
+            "tasks": [],
+        }
+
+        payload = evalmod._collect_comparison_metrics(args, [metrics], [], manifest)
+        boundary_payload = payload["tasks"]["needle"]["needle_4_15"]["boundary_region"]
+        self.assertEqual(int(boundary_payload["window_radius_tokens"]), 4)
+        self.assertEqual(int(boundary_payload["support_chars"]), 12)
+        self.assertEqual(int(boundary_payload["samples"]), 1)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["micro_acc"]), 0.75)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_precision"]), 13.0 / 18.0)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_recall"]), 11.0 / 16.0)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_f1"]), 83.0 / 119.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "report.md"
+            evalmod.write_report(
+                report_path,
+                manifest=manifest,
+                args=args,
+                task_metrics=[metrics],
+                throughput_results=[],
+            )
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Boundary-region label metrics (`±4` tokens around inserted start/end):", report)
+            self.assertIn("| ALL (agg) |  | 0.7500 | 0.7222 | 0.6875 | 0.6975 |", report)
+
     def test_sequence_regions_ignore_same_label_outside_region(self) -> None:
         content = "AABBP"
         dataset = hfds.Dataset.from_list(
@@ -253,6 +506,107 @@ class TestEvaluationRegionTasks(unittest.TestCase):
         self.assertEqual(int(seq_stats["first"]["correct"]), 2)
         self.assertEqual(int(seq_stats["second"]["total"]), 2)
         self.assertEqual(int(seq_stats["second"]["correct"]), 2)
+
+    def test_sequence_pair_boundary_region_metrics_flow_to_json_and_report(self) -> None:
+        content = "PPPPPPSSSSSS"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="sequence_pair",
+                    content=content,
+                    segments=[
+                        {"label": "python", "char_start": 0, "char_end": 6},
+                        {"label": "shell", "char_start": 6, "char_end": 12},
+                    ],
+                    metadata={
+                        "first_lang": "python",
+                        "second_lang": "shell",
+                        "sequence_regions": {
+                            "first": {"char_start": 0, "char_end": 6},
+                            "second": {"char_start": 6, "char_end": 12},
+                        },
+                    },
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+            ],
+            probs=[
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("shell"),
+                _prob_row("python"),
+                _prob_row("shell"),
+                _prob_row("shell"),
+                _prob_row("shell"),
+                _prob_row("shell"),
+                _prob_row("shell"),
+            ],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "sequence_pair",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+        args = SimpleNamespace(
+            checkpoint="ckpt.msgpack",
+            model_dim=256,
+            channels=[96, 128, 192, 256],
+            dtype="bfloat16",
+            sample_seed=13,
+            other_threshold=0.0,
+            chunk=1536,
+            batch_size=8,
+            max_samples=0,
+        )
+        manifest = {
+            "output_root": "evaluation/data",
+            "generated_at": "2026-03-22T00:00:00",
+            "tasks": [],
+        }
+
+        payload = evalmod._collect_comparison_metrics(args, [metrics], [], manifest)
+        boundary_payload = payload["tasks"]["sequence_pair"]["boundary_region"]
+        self.assertEqual(int(boundary_payload["window_radius_tokens"]), 4)
+        self.assertEqual(int(boundary_payload["support_chars"]), 8)
+        self.assertEqual(int(boundary_payload["samples"]), 1)
+        self.assertEqual(int(boundary_payload["boundaries"]), 1)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["micro_acc"]), 0.75)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_precision"]), 0.75)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_recall"]), 0.75)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_f1"]), 0.75)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "report.md"
+            evalmod.write_report(
+                report_path,
+                manifest=manifest,
+                args=args,
+                task_metrics=[metrics],
+                throughput_results=[],
+            )
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Boundary-region label metrics (`±4` tokens around sequence transitions):", report)
+            self.assertIn("| ALL (agg) |  | 0.7500 | 0.7500 | 0.7500 | 0.7500 |", report)
 
     def test_markdown_exact_region_counts_full_mixed_block_and_support_surfaces(self) -> None:
         content = "MMABCDTT"
@@ -374,6 +728,112 @@ class TestEvaluationRegionTasks(unittest.TestCase):
             self.assertIn("- Overall accuracy: 1.0000", report_section)
             self.assertNotIn("| markdown |", report_section)
             self.assertNotIn("| text |", report_section)
+
+    def test_markdown_boundary_region_metrics_flow_to_json_and_report(self) -> None:
+        content = "MMPPSSMM"
+        dataset = hfds.Dataset.from_list(
+            [
+                _record(
+                    task="markdown_mix",
+                    content=content,
+                    segments=[
+                        {"label": "markdown", "char_start": 0, "char_end": 2},
+                        {"label": "python", "char_start": 2, "char_end": 4},
+                        {"label": "shell", "char_start": 4, "char_end": 6},
+                        {"label": "markdown", "char_start": 6, "char_end": 8},
+                    ],
+                    metadata={
+                        "markdown_blocks": [
+                            {
+                                "role": "other",
+                                "wrapped": False,
+                                "language": "python",
+                                "char_start": 2,
+                                "char_end": 4,
+                                "truth_mode": "exact_region",
+                            }
+                        ],
+                        "inline_blocks": [
+                            {
+                                "language": "shell",
+                                "char_start": 4,
+                                "char_end": 6,
+                                "truth_mode": "exact_region",
+                            }
+                        ],
+                    },
+                )
+            ]
+        )
+        runner = _FakeRunner(
+            labels=[
+                int(evalmod.cfg.LANG2ID["markdown"]),
+                int(evalmod.cfg.LANG2ID["markdown"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["python"]),
+                int(evalmod.cfg.LANG2ID["shell"]),
+                int(evalmod.cfg.LANG2ID["markdown"]),
+                int(evalmod.cfg.LANG2ID["markdown"]),
+            ],
+            probs=[
+                _prob_row("markdown"),
+                _prob_row("markdown"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("python"),
+                _prob_row("shell"),
+                _prob_row("markdown"),
+                _prob_row("markdown"),
+            ],
+        )
+
+        metrics = evalmod.evaluate_task(
+            "markdown_mix",
+            "test",
+            dataset,
+            runner,
+            min_run_chars=1,
+        )
+        args = SimpleNamespace(
+            checkpoint="ckpt.msgpack",
+            model_dim=256,
+            channels=[96, 128, 192, 256],
+            dtype="bfloat16",
+            sample_seed=13,
+            other_threshold=0.0,
+            chunk=1536,
+            batch_size=8,
+            max_samples=0,
+        )
+        manifest = {
+            "output_root": "evaluation/data",
+            "generated_at": "2026-03-22T00:00:00",
+            "tasks": [],
+        }
+
+        payload = evalmod._collect_comparison_metrics(args, [metrics], [], manifest)
+        boundary_payload = payload["tasks"]["markdown_mix"]["boundary_region"]
+        self.assertEqual(int(boundary_payload["window_radius_tokens"]), 4)
+        self.assertEqual(int(boundary_payload["support_chars"]), 8)
+        self.assertEqual(int(boundary_payload["samples"]), 1)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["micro_acc"]), 7.0 / 8.0)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_precision"]), 8.0 / 9.0)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_recall"]), 5.0 / 6.0)
+        self.assertAlmostEqual(float(boundary_payload["aggregates"]["macro_f1"]), 37.0 / 45.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "report.md"
+            evalmod.write_report(
+                report_path,
+                manifest=manifest,
+                args=args,
+                task_metrics=[metrics],
+                throughput_results=[],
+            )
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Boundary-region label metrics (`±4` tokens around markdown/code transitions):", report)
+            self.assertIn("| ALL (agg) |  | 0.8750 | 0.8889 | 0.8333 | 0.8222 |", report)
 
     def test_markdown_report_filters_truth_labels_but_keeps_prediction_targets_in_confusions(self) -> None:
         content = "MMPPSSTT"

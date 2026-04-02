@@ -69,23 +69,17 @@ def build_window_spans(length: int, chunk_size: int) -> List[Tuple[int, int]]:
     if n <= 0:
         return []
     win = max(64, int(chunk_size))
+    if n <= win:
+        return [(0, n)]
     stride = max(1, win // 2)
-    start_positions = list(range(0, max(1, n - win + 1), stride))
-    if not start_positions:
-        start_positions = [0]
-    tail_start = max(0, n - win)
-    if start_positions[-1] + win < n and tail_start not in start_positions:
-        start_positions.append(tail_start)
     spans: List[Tuple[int, int]] = []
-    seen = set()
-    for start in start_positions:
-        if start in seen:
-            continue
-        seen.add(start)
+    start = 0
+    while True:
         end = min(start + win, n)
         spans.append((int(start), int(end)))
-    if not spans:
-        spans = [(0, n)]
+        if end >= n:
+            break
+        start += stride
     return spans
 
 
@@ -828,51 +822,8 @@ class FastInferenceEngine:
         self,
         arrays: Sequence[np.ndarray],
     ) -> Tuple[List[np.ndarray], List[List[Tuple[int, int]]]]:
-        vote_accum_list: List[np.ndarray] = [
-            np.zeros((int(arr.shape[0]), self.num_classes), dtype=np.float32)
-            for arr in arrays
-        ]
-        spans_by_text: List[List[Tuple[int, int]]] = []
-        window_refs: List[Tuple[int, int, int, np.ndarray]] = []
-
-        for text_idx, arr in enumerate(arrays):
-            spans = build_window_spans(int(arr.shape[0]), self.chunk_size)
-            spans_by_text.append(spans)
-            for start, end in spans:
-                window_refs.append((text_idx, int(start), int(end), arr[start:end]))
-
-        if not window_refs:
-            empty_labels = [np.zeros((int(arr.shape[0]),), dtype=np.uint8) for arr in arrays]
-            return empty_labels, spans_by_text
-
-        win_idx = 0
-        while win_idx < len(window_refs):
-            take = min(self.batch_size, len(window_refs) - win_idx)
-            while take > 1:
-                batch_lengths = [int(window_refs[win_idx + offset][3].shape[0]) for offset in range(take)]
-                if self._estimate_batch_bytes(batch_lengths) <= self.full_memory_budget_bytes:
-                    break
-                take = take - 1 if take <= 4 else max(1, take // 2)
-            batch_refs = window_refs[win_idx:win_idx + take]
-            batch_arrays = [ref[3] for ref in batch_refs]
-            labels_batch = self._apply_argmax(batch_arrays, path="fast_stream", mode="segment_stream_labels")
-            for row, (text_idx, start, end, _) in enumerate(batch_refs):
-                plen = int(end) - int(start)
-                if plen <= 0:
-                    continue
-                weights = self._window_weights_cached(plen)
-                window_labels = np.asarray(labels_batch[row, :plen], dtype=np.int64)
-                positions = np.arange(int(start), int(end), dtype=np.int64)
-                np.add.at(vote_accum_list[text_idx], (positions, window_labels), weights)
-            win_idx += take
-
-        out_labels: List[np.ndarray] = []
-        for vote_accum in vote_accum_list:
-            if vote_accum.size == 0:
-                out_labels.append(np.zeros((0,), dtype=np.uint8))
-                continue
-            out_labels.append(np.argmax(vote_accum, axis=-1).astype(np.uint8))
-        return out_labels, spans_by_text
+        labels, _, spans_by_text = self._segment_stream_batch(arrays)
+        return labels, spans_by_text
 
     def _segment_stream_batch_labels_and_max_probs(
         self,

@@ -897,6 +897,16 @@ def main():
         d_cfg.window_min_bytes = full_len
         d_cfg.window_max_bytes = full_len
         d_cfg.bucket_step = full_len
+    arch_name = str(args.arch).lower().strip()
+    if arch_name == "unet1d":
+        required_window = int(cfg.MODEL_WINDOW_BYTES)
+        if int(d_cfg.window_min_bytes) != required_window or int(d_cfg.window_max_bytes) != required_window:
+            raise ValueError(
+                "U-Net runs must use the fixed 1536-byte window size. "
+                f"Received window_min_bytes={int(d_cfg.window_min_bytes)} and "
+                f"window_max_bytes={int(d_cfg.window_max_bytes)}. "
+                "Disable full-file mode and keep the canonical U-Net window."
+            )
     if args.language_pair_prob is not None:
         prob = max(0.0, min(1.0, float(args.language_pair_prob)))
         d_cfg.language_pair_mode_prob = prob

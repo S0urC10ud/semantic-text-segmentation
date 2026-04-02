@@ -449,6 +449,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="medium",
     )
     parser.add_argument("--al-gemini-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--al-gemini-parallel-requests",
+        type=int,
+        default=None,
+        help=(
+            "Concurrent Gemini oracle requests to dispatch per AL round. "
+            "Defaults to --al-max-oracle-requests for backward compatibility."
+        ),
+    )
     parser.add_argument("--al-gemini-rate-limit-sleep-seconds", type=float, default=65.0)
     parser.add_argument("--al-gemini-rate-limit-max-retries", type=int, default=8)
     parser.add_argument("--al-gemini-missing-snippet-retries", type=int, default=2)
@@ -537,6 +546,11 @@ def main() -> None:
                 "al_gemini_model": str(args.al_gemini_model),
                 "al_gemini_thinking_level": str(args.al_gemini_thinking_level),
                 "al_gemini_batch_size": int(args.al_gemini_batch_size),
+                "al_gemini_parallel_requests": (
+                    None
+                    if args.al_gemini_parallel_requests is None
+                    else int(args.al_gemini_parallel_requests)
+                ),
                 "al_max_samples_per_lang": int(args.al_max_samples_per_lang),
                 "al_sample_workers": int(args.al_sample_workers),
                 "al_sample_prefetch": int(args.al_sample_prefetch),
@@ -626,6 +640,12 @@ def main() -> None:
                 args.al_gemini_thinking_level,
                 "--gemini-batch-size",
                 str(args.al_gemini_batch_size),
+                "--gemini-parallel-requests",
+                (
+                    ""
+                    if args.al_gemini_parallel_requests is None
+                    else str(max(1, int(args.al_gemini_parallel_requests)))
+                ),
                 "--gemini-rate-limit-sleep-seconds",
                 str(args.al_gemini_rate_limit_sleep_seconds),
                 "--gemini-rate-limit-max-retries",

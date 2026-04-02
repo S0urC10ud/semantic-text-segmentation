@@ -42,6 +42,7 @@ PREDICTION_LABEL_ALIASES: Dict[str, str] = {
 }
 
 NEEDLE_COVERAGE_THRESHOLD = 0.5
+NEEDLE_BOUNDARY_WINDOW_TOKENS = 4
 MARKDOWN_IOU_THRESHOLD = 0.5
 PAYLOAD_IOU_THRESHOLD = 0.5
 PAYLOAD_SOFT_PROB_THRESHOLD = 0.05
@@ -109,6 +110,16 @@ TEXT_LIKE_POSITIVE_LABELS: Tuple[str, ...] = (
     "markdown",
     "restructuredtext",
     "tex",
+)
+RELEVANT_CONTENT_POSTPROCESS_MIN_TOKENS = 10
+TEXT_HOST_POSTPROCESS_LABELS: Tuple[str, ...] = (
+    "markdown",
+    "restructuredtext",
+    "tex",
+)
+LOCAL_HOST_POSTPROCESS_RULES: Tuple[Tuple[str, str], ...] = (
+    ("json", "javascript_typescript"),
+    ("xml", "svg"),
 )
 REPORT_ONLY_TRUTH_LABEL_EXCLUSIONS: Dict[str, Tuple[str, ...]] = {
     "markdown_mix": ("markdown", "text"),
@@ -314,6 +325,19 @@ def _available_backends() -> Set[str]:
         if devices:
             platforms.add(devices[0].platform)
     return platforms
+
+
+def _assert_unet_chunk_size(arch: str, chunk: int) -> None:
+    arch_name = str(arch).lower().strip()
+    if arch_name != "unet1d":
+        return
+    required = int(cfg.MODEL_WINDOW_BYTES)
+    actual = int(chunk)
+    if actual != required:
+        raise ValueError(
+            "U-Net evaluation must use the fixed 1536-byte chunk size. "
+            f"Received chunk={actual}. Re-run with --chunk {required}."
+        )
 
 
 def _window_weights(length: int) -> np.ndarray:
@@ -620,6 +644,7 @@ class SegmenterRunner:
         self.batch_size = int(batch_size)
         self.num_classes = cfg.NUM_CLASSES
         self.arch = str(arch).lower().strip()
+        _assert_unet_chunk_size(self.arch, self.chunk)
         dt = getattr(jnp, dtype)
         requested_channels = tuple(int(ch) for ch in channels)
         self._weight_cache: Dict[int, np.ndarray] = {}
@@ -776,17 +801,8 @@ class SegmenterRunner:
         if N == 0:
             return np.zeros((0,), dtype=np.uint8), np.zeros((0, self.num_classes), dtype=np.float32)
 
-        win = max(64, int(self.chunk))
-        stride = max(1, win // 2)
-        windows: List[np.ndarray] = []
-        spans: List[Tuple[int, int]] = []
-        for start in range(0, max(1, N - win + 1), stride):
-            end = min(start + win, N)
-            windows.append(byte_arr[start:end])
-            spans.append((start, end))
-        if not windows:
-            windows = [byte_arr]
-            spans = [(0, N)]
+        spans = build_window_spans(N, self.chunk)
+        windows = [byte_arr[start:end] for start, end in spans]
 
         out_bytes = np.zeros((N,), dtype=np.uint8)
         probs_accum = np.zeros((N, self.num_classes), dtype=np.float32)
@@ -860,49 +876,8 @@ class SegmenterRunner:
             raise
 
     def _segment_bytes_labels_only_legacy(self, byte_arr: np.ndarray) -> np.ndarray:
-        byte_arr = sanitize_bytes(byte_arr)
-        N = int(len(byte_arr))
-        if N == 0:
-            return np.zeros((0,), dtype=np.uint8)
-
-        win = max(64, int(self.chunk))
-        stride = max(1, win // 2)
-        windows: List[np.ndarray] = []
-        spans: List[Tuple[int, int]] = []
-        for start in range(0, max(1, N - win + 1), stride):
-            end = min(start + win, N)
-            windows.append(byte_arr[start:end])
-            spans.append((start, end))
-        if not windows:
-            windows = [byte_arr]
-            spans = [(0, N)]
-
-        votes = np.zeros((N, self.num_classes), dtype=np.float32)
-        batch_size = self.batch_size
-        for i in range(0, len(windows), batch_size):
-            span_slice = spans[i:i + batch_size]
-            actual = len(span_slice)
-            tokens = np.full((batch_size, self.chunk), cfg.PAD_BYTE_ID, dtype=np.int32)
-            for j in range(actual):
-                win_bytes = windows[i + j]
-                length = min(len(win_bytes), self.chunk)
-                if length > 0:
-                    tokens[j, :length] = win_bytes[:length].astype(np.int32)
-            tokens = sanitize_tokens(tokens)
-            logits = self._apply_legacy(jnp.array(tokens, dtype=jnp.int32))
-            labels = np.asarray(jax.device_get(jnp.argmax(logits, axis=-1).astype(jnp.uint8)))[:actual, :self.chunk]
-
-            for j, (start, end) in enumerate(span_slice):
-                plen = end - start
-                if plen <= 0:
-                    continue
-                plen = min(plen, self.chunk)
-                weights = self._window_weights_cached(plen)
-                window_labels = np.asarray(labels[j, :plen], dtype=np.int64)
-                positions = np.arange(int(start), int(end), dtype=np.int64)
-                np.add.at(votes, (positions, window_labels), weights)
-
-        return np.argmax(votes, axis=-1).astype(np.uint8)
+        labels, _ = self._segment_bytes_legacy(byte_arr)
+        return labels
 
     def _segment_bytes_labels_only(self, byte_arr: np.ndarray) -> np.ndarray:
         if self.inference_backend == "legacy" or self._fast_engine is None:
@@ -1177,6 +1152,134 @@ def _segments_to_labels(content: str, segments: Sequence[dict], label_map: Dict[
     return labels
 
 
+def _canonical_eval_label_name(label: Any) -> str:
+    raw = str(label or "").strip().lower().replace("-", "_")
+    if not raw:
+        return ""
+    return PREDICTION_LABEL_ALIASES.get(raw, raw)
+
+
+def _declared_postprocess_host_label(metadata: Optional[Mapping[str, Any]]) -> Optional[str]:
+    if not isinstance(metadata, Mapping):
+        return None
+    candidates: List[Any] = [
+        metadata.get("host_lang"),
+        metadata.get("source_lang"),
+        metadata.get("declared_lang"),
+    ]
+    source_meta = metadata.get("source_meta")
+    if isinstance(source_meta, Mapping):
+        candidates.extend(
+            (
+                source_meta.get("declared_type"),
+                source_meta.get("source_lang"),
+            )
+        )
+    for value in candidates:
+        label = _canonical_eval_label_name(value)
+        if label:
+            return label
+    return None
+
+
+def _support_mask_from_text(content: str) -> np.ndarray:
+    if not content:
+        return np.zeros((0,), dtype=bool)
+    return np.fromiter((ch not in _VISUAL_WHITESPACE_SET for ch in content), dtype=bool, count=len(content))
+
+
+def _support_mask_from_bytes(byte_arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(byte_arr, dtype=np.int32).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros((0,), dtype=bool)
+    ignored = np.asarray(cfg.IGNORED_TRAINING_TOKEN_IDS, dtype=np.int32)
+    return np.logical_not(np.isin(arr, ignored))
+
+
+def _dense_label_runs(labels: np.ndarray) -> List[Tuple[int, int, int]]:
+    arr = np.asarray(labels, dtype=np.int32).reshape(-1)
+    if arr.size <= 0:
+        return []
+    runs: List[Tuple[int, int, int]] = []
+    start = 0
+    cur = int(arr[0])
+    for idx in range(1, int(arr.shape[0])):
+        nxt = int(arr[idx])
+        if nxt != cur:
+            runs.append((start, idx, cur))
+            start = idx
+            cur = nxt
+    runs.append((start, int(arr.shape[0]), cur))
+    return runs
+
+
+def _apply_relevant_content_postprocess_dense(
+    labels: np.ndarray,
+    *,
+    support_mask: np.ndarray,
+    label_to_idx: Mapping[str, int],
+    declared_host_label: Optional[str] = None,
+) -> np.ndarray:
+    arr = np.asarray(labels, dtype=np.int32).reshape(-1).copy()
+    if arr.size <= 0:
+        return arr
+    support = np.asarray(support_mask, dtype=bool).reshape(-1)
+    if support.shape[0] != arr.shape[0]:
+        support = np.ones((arr.shape[0],), dtype=bool)
+
+    min_support = int(RELEVANT_CONTENT_POSTPROCESS_MIN_TOKENS)
+    declared_host = _canonical_eval_label_name(declared_host_label)
+
+    def _idx(name: str) -> Optional[int]:
+        value = label_to_idx.get(name)
+        return int(value) if value is not None else None
+
+    text_idx = _idx("text")
+    if text_idx is not None and np.any(arr == text_idx):
+        candidate_counts: List[Tuple[int, int]] = []
+        for host_label in TEXT_HOST_POSTPROCESS_LABELS:
+            host_idx = _idx(host_label)
+            if host_idx is None:
+                continue
+            support_count = int(np.count_nonzero(np.logical_and(support, arr == host_idx)))
+            if support_count >= min_support:
+                candidate_counts.append((support_count, host_idx))
+        if candidate_counts:
+            best_support = max(count for count, _ in candidate_counts)
+            best_targets = [target_idx for count, target_idx in candidate_counts if count == best_support]
+            if len(best_targets) == 1:
+                arr[arr == text_idx] = int(best_targets[0])
+
+    runs = _dense_label_runs(arr)
+    for inner_label, host_label in LOCAL_HOST_POSTPROCESS_RULES:
+        inner_idx = _idx(inner_label)
+        host_idx = _idx(host_label)
+        if inner_idx is None or host_idx is None or inner_idx == host_idx:
+            continue
+        host_support = int(np.count_nonzero(np.logical_and(support, arr == host_idx)))
+        if host_support < min_support:
+            continue
+        host_declared = declared_host == host_label
+        changed = False
+        for run_idx, (start, end, lbl_idx) in enumerate(runs):
+            if lbl_idx != inner_idx:
+                continue
+            adjacent_support = 0
+            if run_idx > 0 and runs[run_idx - 1][2] == host_idx:
+                prev_start, prev_end, _ = runs[run_idx - 1]
+                adjacent_support += int(np.count_nonzero(support[prev_start:prev_end]))
+            if run_idx + 1 < len(runs) and runs[run_idx + 1][2] == host_idx:
+                next_start, next_end, _ = runs[run_idx + 1]
+                adjacent_support += int(np.count_nonzero(support[next_start:next_end]))
+            if adjacent_support >= min_support or host_declared:
+                arr[start:end] = host_idx
+                changed = True
+        if changed:
+            runs = _dense_label_runs(arr)
+
+    return arr
+
+
 def _confusion_size(labels: Iterable[str]) -> Tuple[List[str], Dict[str, int]]:
     uniq = sorted({label for label in labels})
     mapping = {label: idx for idx, label in enumerate(uniq)}
@@ -1439,6 +1542,72 @@ def _build_text_like_binary_payload(conf_mat: np.ndarray) -> Dict[str, Any]:
     return payload
 
 
+def _needle_boundary_metrics_payload(
+    boundary_stats: Mapping[str, Any],
+    *,
+    label_names: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    raw_confusion = boundary_stats.get("confusion")
+    if raw_confusion is None:
+        return None
+    confusion = np.asarray(raw_confusion, dtype=np.int64)
+    if confusion.ndim != 2 or confusion.shape[0] != confusion.shape[1] or confusion.size == 0:
+        return None
+    if int(confusion.sum()) <= 0:
+        return None
+    id2label = {idx: str(label) for idx, label in enumerate(label_names[: int(confusion.shape[0])])}
+    payload = _metrics_payload_from_confusion(
+        confusion,
+        id2label=id2label,
+        num_classes=int(confusion.shape[0]),
+        ignore_class=None,
+    )
+    payload["window_radius_tokens"] = int(
+        boundary_stats.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)
+    )
+    payload["support_chars"] = int(confusion.sum())
+    payload["samples"] = int(boundary_stats.get("samples", 0))
+    return payload
+
+
+def _sequence_boundary_metrics_payload(
+    boundary_stats: Mapping[str, Any],
+    *,
+    label_names: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    payload = _needle_boundary_metrics_payload(boundary_stats, label_names=label_names)
+    if payload is None:
+        return None
+    payload["boundaries"] = int(boundary_stats.get("boundaries", 0))
+    return payload
+
+
+def _monitor_boundary_metrics_payload(
+    boundary_stats: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    raw_confusion = boundary_stats.get("confusion")
+    if raw_confusion is None:
+        return None
+    confusion = np.asarray(raw_confusion, dtype=np.int64)
+    if confusion.ndim != 2 or confusion.shape[0] != confusion.shape[1] or confusion.size == 0:
+        return None
+    if int(confusion.sum()) <= 0:
+        return None
+    payload = _metrics_payload_from_confusion(
+        confusion,
+        id2label=_monitor_b_id2label(),
+        num_classes=int(confusion.shape[0]),
+        ignore_class=None,
+    )
+    payload["window_radius_tokens"] = int(
+        boundary_stats.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)
+    )
+    payload["support_chars"] = int(confusion.sum())
+    payload["samples"] = int(boundary_stats.get("samples", 0))
+    payload["boundaries"] = int(boundary_stats.get("boundaries", 0))
+    return payload
+
+
 def _append_text_like_binary_lines(lines: List[str], payload: Mapping[str, Any]) -> None:
     rows = payload.get("rows")
     if not isinstance(rows, Sequence) or not rows:
@@ -1455,9 +1624,19 @@ def _append_text_like_binary_lines(lines: List[str], payload: Mapping[str, Any])
     )
 
 
+def _monitor_b_id2label() -> Dict[int, str]:
+    labels = {int(idx): str(name) for idx, name in cfg.ID2LANG.items()}
+    other_id = getattr(cfg, "OTHER_CLASS_INDEX", None)
+    if other_id is not None:
+        labels[int(other_id)] = "other"
+    return labels
+
+
 def _evaluate_full_monitor_b(
     monitor_root: Path,
     runner: "SegmenterRunner",
+    *,
+    other_threshold: float = 0.0,
 ) -> Dict[str, Any]:
     monitor_data = load_monitor_memmaps(Path(monitor_root).resolve())
     files = monitor_data["files"]
@@ -1473,11 +1652,30 @@ def _evaluate_full_monitor_b(
     )
 
     start_time = time.perf_counter()
-    confusion = np.zeros((cfg.NUM_CLASSES, cfg.NUM_CLASSES), dtype=np.int64)
+    other_id = getattr(cfg, "OTHER_CLASS_INDEX", None)
+    use_other_threshold = (
+        other_id is not None
+        and other_threshold is not None
+        and float(other_threshold) > 0.0
+    )
+    num_monitor_classes = (
+        (int(other_id) + 1)
+        if other_id is not None
+        else int(cfg.NUM_CLASSES)
+    )
+    confusion = np.zeros((num_monitor_classes, num_monitor_classes), dtype=np.int64)
+    boundary_region = {
+        "window_radius_tokens": NEEDLE_BOUNDARY_WINDOW_TOKENS,
+        "samples": 0,
+        "boundaries": 0,
+        "confusion": np.zeros((num_monitor_classes, num_monitor_classes), dtype=np.int64),
+    }
     files_used = 0
     skipped = 0
     evaluated_bytes = 0
     raw_bytes = 0
+    low_confidence_bytes = 0
+    truth_other_bytes = 0
 
     for file_idx, row in enumerate(files):
         byte_len = int(row["byte_len"])
@@ -1492,6 +1690,12 @@ def _evaluate_full_monitor_b(
             contents[byte_start : byte_start + byte_len],
             dtype=np.uint8,
         )
+        support_mask = _support_mask_from_bytes(file_bytes)
+        declared_host_label = _canonical_eval_label_name(
+            cfg.ID2LANG.get(int(row["type_id"]), "other")
+            if int(row["type_id"]) in cfg.ID2LANG
+            else ("other" if other_id is not None and int(row["type_id"]) == int(other_id) else "")
+        )
         truth = np.full((byte_len,), cfg.PAD_ID, dtype=np.uint8)
         for seg in segments[seg_start : seg_start + seg_count]:
             start = int(seg["start"])
@@ -1501,46 +1705,117 @@ def _evaluate_full_monitor_b(
             truth[start:end] = int(seg["label"])
 
         if use_mamba_path:
-            pred = runner._segment_bytes_labels_only(file_bytes)
+            pred, probs = runner._segment_bytes(file_bytes)
         else:
-            pred = runner._segment_bytes_labels_only_legacy(file_bytes)
+            pred, probs = runner._segment_bytes_legacy(file_bytes)
         pred = np.asarray(pred, dtype=np.int32).reshape(-1)
+        probs = np.asarray(probs, dtype=np.float32)
         if int(pred.shape[0]) != byte_len:
             raise RuntimeError(
                 f"Monitor prediction length mismatch for file {file_idx}: "
                 f"expected {byte_len}, got {int(pred.shape[0])}"
             )
+        if probs.ndim != 2 or int(probs.shape[0]) != byte_len:
+            raise RuntimeError(
+                f"Monitor probability length mismatch for file {file_idx}: "
+                f"expected ({byte_len}, C), got {tuple(int(dim) for dim in probs.shape)}"
+            )
 
         mask = _valid_metric_mask(truth, file_bytes.astype(np.int32, copy=False))
-        core_mask = mask & (truth < cfg.NUM_CLASSES)
+        truth_i32 = truth.astype(np.int32, copy=False)
+        pred_i32 = pred.astype(np.int32, copy=True)
+        if other_id is not None:
+            pred_i32[(pred_i32 < 0) | (pred_i32 >= int(cfg.NUM_CLASSES))] = int(other_id)
+            truth_other_bytes += int(np.sum(mask & (truth_i32 == int(other_id))))
+            if use_other_threshold:
+                max_prob = probs.max(axis=-1)
+                low_conf_mask = mask & (max_prob < float(other_threshold))
+                if np.any(low_conf_mask):
+                    pred_i32[low_conf_mask] = int(other_id)
+                    low_confidence_bytes += int(low_conf_mask.sum())
+            core_mask = mask & (truth_i32 <= int(other_id))
+        else:
+            core_mask = mask & (truth_i32 < int(cfg.NUM_CLASSES))
+        truth_i32 = _apply_relevant_content_postprocess_dense(
+            truth_i32,
+            support_mask=support_mask,
+            label_to_idx=cfg.LANG2ID,
+            declared_host_label=declared_host_label,
+        )
+        pred_i32 = _apply_relevant_content_postprocess_dense(
+            pred_i32,
+            support_mask=support_mask,
+            label_to_idx=cfg.LANG2ID,
+            declared_host_label=declared_host_label,
+        )
         if core_mask.any():
             accumulate_confusion(
                 confusion,
-                truth[core_mask].astype(np.int32, copy=False),
-                pred[core_mask].astype(np.int32, copy=False),
+                truth_i32[core_mask],
+                pred_i32[core_mask],
             )
             evaluated_bytes += int(core_mask.sum())
+            evaluated_positions = np.flatnonzero(core_mask)
+            evaluated_truth = truth_i32[core_mask]
+            if evaluated_positions.size > 1:
+                transition_mask = evaluated_truth[1:] != evaluated_truth[:-1]
+                if np.any(transition_mask):
+                    boundary_positions = evaluated_positions[1:][transition_mask].tolist()
+                    boundary_mask_valid = _boundary_positions_valid_mask(
+                        byte_len,
+                        core_mask,
+                        boundary_positions,
+                        radius_tokens=int(
+                            boundary_region.get(
+                                "window_radius_tokens",
+                                NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                            )
+                        ),
+                    )
+                    if boundary_mask_valid is not None:
+                        boundary_region["samples"] += 1
+                        boundary_region["boundaries"] += len(boundary_positions)
+                        boundary_truth = evaluated_truth[boundary_mask_valid]
+                        boundary_pred = pred_i32[core_mask][boundary_mask_valid]
+                        boundary_valid_pred = np.logical_and(
+                            boundary_pred >= 0,
+                            boundary_pred < int(confusion.shape[0]),
+                        )
+                        if np.any(boundary_valid_pred):
+                            np.add.at(
+                                boundary_region["confusion"],
+                                (
+                                    boundary_truth[boundary_valid_pred],
+                                    boundary_pred[boundary_valid_pred],
+                                ),
+                                1,
+                            )
 
         files_used += 1
         raw_bytes += int(byte_len)
 
     metrics_payload = _metrics_payload_from_confusion(
         confusion,
-        id2label=cfg.ID2LANG,
-        num_classes=cfg.NUM_CLASSES,
-        ignore_class=cfg.PAD_ID,
+        id2label=_monitor_b_id2label(),
+        num_classes=int(confusion.shape[0]),
+        ignore_class=None,
     )
     metrics_payload.update(
         {
             "_confusion_matrix": confusion.tolist(),
+            "boundary_region": _monitor_boundary_metrics_payload(boundary_region),
             "root": str(Path(monitor_root).resolve()),
             "arch": arch,
             "inference_mode": inference_mode,
+            "open_set": True,
+            "other_threshold": float(other_threshold),
             "files_total": int(len(files)),
             "files_used": int(files_used),
             "skipped": int(skipped),
             "evaluated_bytes": int(evaluated_bytes),
             "raw_bytes": int(raw_bytes),
+            "truth_other_bytes": int(truth_other_bytes),
+            "low_confidence_bytes_routed_to_other": int(low_confidence_bytes),
             "elapsed_seconds": float(time.perf_counter() - start_time),
         }
     )
@@ -1612,6 +1887,65 @@ def _region_mask_valid(
     if int(region_valid.sum()) <= 0:
         return None
     return region_valid
+
+
+def _boundary_positions_valid_mask(
+    content_len: int,
+    valid_mask: np.ndarray,
+    positions: Sequence[Any],
+    *,
+    radius_tokens: int,
+) -> Optional[np.ndarray]:
+    if content_len <= 0:
+        return None
+    radius = max(0, int(radius_tokens))
+    if radius <= 0:
+        return None
+    mask = np.zeros((content_len,), dtype=bool)
+    had_window = False
+    for pos in positions:
+        try:
+            pos_i = int(pos)
+        except (TypeError, ValueError):
+            continue
+        pos_i = max(0, min(content_len, pos_i))
+        start_i = max(0, pos_i - radius)
+        end_i = min(content_len, pos_i + radius)
+        if end_i <= start_i:
+            continue
+        mask[start_i:end_i] = True
+        had_window = True
+    if not had_window:
+        return None
+    region_valid = mask[valid_mask]
+    if int(region_valid.sum()) <= 0:
+        return None
+    return region_valid
+
+
+def _boundary_region_valid_mask(
+    content_len: int,
+    valid_mask: np.ndarray,
+    start: Any,
+    end: Any,
+    *,
+    radius_tokens: int,
+) -> Optional[np.ndarray]:
+    try:
+        start_i = int(start)
+        end_i = int(end)
+    except (TypeError, ValueError):
+        return None
+    start_i = max(0, min(content_len, start_i))
+    end_i = max(start_i, min(content_len, end_i))
+    if end_i <= start_i:
+        return None
+    return _boundary_positions_valid_mask(
+        content_len,
+        valid_mask,
+        (start_i, end_i),
+        radius_tokens=radius_tokens,
+    )
 
 
 def _exact_region_stats(
@@ -1841,6 +2175,12 @@ def evaluate_task(
             label_candidates.add(seg["label"])
     for alias_target in PREDICTION_LABEL_ALIASES.values():
         label_candidates.add(alias_target)
+    label_candidates.add("text")
+    for host_label in TEXT_HOST_POSTPROCESS_LABELS:
+        label_candidates.add(host_label)
+    for inner_label, host_label in LOCAL_HOST_POSTPROCESS_RULES:
+        label_candidates.add(inner_label)
+        label_candidates.add(host_label)
     label_names, label_to_idx = _confusion_size(label_candidates)
     confusion = np.zeros((len(label_names), len(label_names)), dtype=np.int64)
 
@@ -1888,6 +2228,11 @@ def evaluate_task(
                 "coverage_count": 0,
             },
             "any_by_lang": {},
+            "boundary_region": {
+                "window_radius_tokens": NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                "samples": 0,
+                "confusion": np.zeros((len(label_names), len(label_names)), dtype=np.int64),
+            },
         }
         extra_payload["needle_detection"] = needle_stats
 
@@ -1904,6 +2249,11 @@ def evaluate_task(
             },
             "overall": {"wrapped": _markdown_stat_group(), "plain": _markdown_stat_group()},
             "wrong_label": {"cases": 0, "fooled": 0},
+            "boundary_region": {
+                "window_radius_tokens": NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                "samples": 0,
+                "confusion": np.zeros((len(label_names), len(label_names)), dtype=np.int64),
+            },
             "inline": {
                 "threshold": MARKDOWN_IOU_THRESHOLD,
                 "count": 0,
@@ -2007,7 +2357,13 @@ def evaluate_task(
             "segments": {
                 "first": {"correct": 0, "total": 0},
                 "second": {"correct": 0, "total": 0},
-            }
+            },
+            "boundary_region": {
+                "window_radius_tokens": NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                "samples": 0,
+                "boundaries": 0,
+                "confusion": np.zeros((len(label_names), len(label_names)), dtype=np.int64),
+            },
         }
         extra_payload["sequence_purity"] = sequence_stats
     elif name == "sequence_triplet":
@@ -2016,7 +2372,13 @@ def evaluate_task(
                 "first": {"correct": 0, "total": 0},
                 "second": {"correct": 0, "total": 0},
                 "third": {"correct": 0, "total": 0},
-            }
+            },
+            "boundary_region": {
+                "window_radius_tokens": NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                "samples": 0,
+                "boundaries": 0,
+                "confusion": np.zeros((len(label_names), len(label_names)), dtype=np.int64),
+            },
         }
         extra_payload["sequence_purity"] = sequence_stats
 
@@ -2027,11 +2389,19 @@ def evaluate_task(
         row = example if isinstance(example, dict) else dict(example)
         raw_content = row.get("content")
         content = normalize_eval_text(raw_content if isinstance(raw_content, str) else "")
+        metadata = _parse_metadata(row)
+        support_mask = _support_mask_from_text(content)
+        declared_host_label = _declared_postprocess_host_label(metadata)
         normalized_segments = _normalize_segments(row.get("segments"))
         truth = _segments_to_labels(content, normalized_segments, label_to_idx)
+        truth = _apply_relevant_content_postprocess_dense(
+            truth,
+            support_mask=support_mask,
+            label_to_idx=label_to_idx,
+            declared_host_label=declared_host_label,
+        )
         segments, pred_labels, pred_probs = runner.segment_text(content, min_run_chars=min_run_chars)
         pred_idx_array = np.full((len(pred_labels),), -1, dtype=np.int32)
-        pred_text_like_flags = np.zeros((len(pred_labels),), dtype=bool)
         prob_rows: Optional[List[Optional[np.ndarray]]] = [None] * len(pred_labels) if payload_stats is not None else None
         other_idx_eval = label_to_idx.get("other")
         use_other_threshold = other_threshold is not None and float(other_threshold) > 0.0 and other_idx_eval is not None
@@ -2041,7 +2411,6 @@ def evaluate_task(
                 alias = PREDICTION_LABEL_ALIASES.get(label_name)
                 if alias and alias in label_to_idx:
                     label_name = alias
-                pred_text_like_flags[i] = label_name in TEXT_LIKE_POSITIVE_LABELS
 
             # Compute max probability for this character if available.
             max_prob = None
@@ -2069,6 +2438,18 @@ def evaluate_task(
                 pred_idx_array[i] = other_idx_eval  # type: ignore[arg-type]
             else:
                 pred_idx_array[i] = label_to_idx[label_name]
+        pred_idx_array = _apply_relevant_content_postprocess_dense(
+            pred_idx_array,
+            support_mask=support_mask,
+            label_to_idx=label_to_idx,
+            declared_host_label=declared_host_label,
+        )
+        pred_text_like_flags = np.zeros((len(pred_idx_array),), dtype=bool)
+        for label_name in TEXT_LIKE_POSITIVE_LABELS:
+            label_idx = label_to_idx.get(label_name)
+            if label_idx is None:
+                continue
+            pred_text_like_flags[pred_idx_array == int(label_idx)] = True
 
         valid_mask = (truth >= 0)
         if content:
@@ -2079,8 +2460,6 @@ def evaluate_task(
         pred_text_like_valid = pred_text_like_flags[valid_mask]
         prob_valid = [prob_rows[i] for i, keep in enumerate(valid_mask) if keep] if prob_rows is not None else None
         same_mask = (pred_valid == truth_valid)
-
-        metadata = _parse_metadata(row)
 
         valid_pred_mask = pred_valid >= 0
         np.add.at(confusion, (truth_valid[valid_pred_mask], pred_valid[valid_pred_mask]), 1)
@@ -2159,11 +2538,35 @@ def evaluate_task(
                 host_label = normalized_segments[0].get("label")
             host_idx = label_to_idx.get(host_label) if host_label else None
             threshold = float(needle_stats.get("threshold", NEEDLE_COVERAGE_THRESHOLD))
+            region_start = metadata.get("inserted_char_start", metadata.get("needle_char_start"))
+            region_end = metadata.get("inserted_char_end", metadata.get("needle_char_end"))
+            boundary_entry = needle_stats.get("boundary_region")
+            if isinstance(boundary_entry, dict):
+                boundary_mask_valid = _boundary_region_valid_mask(
+                    len(content),
+                    valid_mask,
+                    region_start,
+                    region_end,
+                    radius_tokens=int(
+                        boundary_entry.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)
+                    ),
+                )
+                if boundary_mask_valid is not None:
+                    boundary_entry["samples"] += 1
+                    boundary_truth = truth_valid[boundary_mask_valid]
+                    boundary_pred = pred_valid[boundary_mask_valid]
+                    boundary_valid_pred = boundary_pred >= 0
+                    if np.any(boundary_valid_pred):
+                        np.add.at(
+                            boundary_entry["confusion"],
+                            (boundary_truth[boundary_valid_pred], boundary_pred[boundary_valid_pred]),
+                            1,
+                        )
             region_mask_valid = _region_mask_valid(
                 len(content),
                 valid_mask,
-                metadata.get("inserted_char_start", metadata.get("needle_char_start")),
-                metadata.get("inserted_char_end", metadata.get("needle_char_end")),
+                region_start,
+                region_end,
             )
             if region_mask_valid is not None:
                 exact = _exact_region_stats(truth_valid, pred_valid, region_mask_valid)
@@ -2317,6 +2720,7 @@ def evaluate_task(
         if markdown_stats is not None:
             threshold = float(markdown_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
             text_idx = label_to_idx.get("text")
+            boundary_positions: List[int] = []
             markdown_stats.setdefault("per_language", {})
             text_stats = markdown_stats.setdefault(
                 "text",
@@ -2358,6 +2762,7 @@ def evaluate_task(
                     block_len = int(region_valid_mask.sum())
                     if block_len <= 0:
                         continue
+                    boundary_positions.extend((start, end))
                     pred_slice = pred_valid[region_valid_mask]
                     exact = _exact_region_stats(truth_valid, pred_valid, region_valid_mask)
                     correct_chars = int(exact["correct_chars"])
@@ -2497,6 +2902,7 @@ def evaluate_task(
                     block_len = int(region_valid_mask.sum())
                     if block_len <= 0:
                         continue
+                    boundary_positions.extend((start, end))
                     exact = _exact_region_stats(truth_valid, pred_valid, region_valid_mask)
                     correct_chars = int(exact["correct_chars"])
                     nontext_chars, text_chars = _region_text_stats(
@@ -2650,6 +3056,31 @@ def evaluate_task(
                 lang_inline["correct_iou_hits"] += int(correct_iou >= inline_threshold)
                 lang_inline["nontext_iou_hits"] += int(nontext_iou >= inline_threshold)
                 lang_inline["text_iou_hits"] += int(text_iou >= inline_threshold)
+
+            boundary_entry = markdown_stats.get("boundary_region")
+            if isinstance(boundary_entry, dict) and boundary_positions:
+                boundary_mask_valid = _boundary_positions_valid_mask(
+                    len(content),
+                    valid_mask,
+                    boundary_positions,
+                    radius_tokens=int(
+                        boundary_entry.get(
+                            "window_radius_tokens",
+                            NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                        )
+                    ),
+                )
+                if boundary_mask_valid is not None:
+                    boundary_entry["samples"] += 1
+                    boundary_truth = truth_valid[boundary_mask_valid]
+                    boundary_pred = pred_valid[boundary_mask_valid]
+                    boundary_valid_pred = boundary_pred >= 0
+                    if np.any(boundary_valid_pred):
+                        np.add.at(
+                            boundary_entry["confusion"],
+                            (boundary_truth[boundary_valid_pred], boundary_pred[boundary_valid_pred]),
+                            1,
+                        )
 
         if payload_stats is not None:
             payload_lang = metadata.get("payload_lang")
@@ -2826,6 +3257,37 @@ def evaluate_task(
             segments_info = sequence_stats["segments"]
             region_meta = metadata.get("sequence_regions")
             if isinstance(region_meta, dict):
+                boundary_entry = sequence_stats.get("boundary_region")
+                if isinstance(boundary_entry, dict):
+                    boundary_positions: List[int] = []
+                    previous_region: Optional[Mapping[str, Any]] = None
+                    for pos_key in ("first", "second", "third"):
+                        region = region_meta.get(pos_key)
+                        if not isinstance(region, Mapping):
+                            continue
+                        if previous_region is not None:
+                            boundary_positions.append(region.get("char_start"))
+                        previous_region = region
+                    boundary_mask_valid = _boundary_positions_valid_mask(
+                        len(content),
+                        valid_mask,
+                        boundary_positions,
+                        radius_tokens=int(
+                            boundary_entry.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)
+                        ),
+                    )
+                    if boundary_mask_valid is not None:
+                        boundary_entry["samples"] += 1
+                        boundary_entry["boundaries"] += len(boundary_positions)
+                        boundary_truth = truth_valid[boundary_mask_valid]
+                        boundary_pred = pred_valid[boundary_mask_valid]
+                        boundary_valid_pred = boundary_pred >= 0
+                        if np.any(boundary_valid_pred):
+                            np.add.at(
+                                boundary_entry["confusion"],
+                                (boundary_truth[boundary_valid_pred], boundary_pred[boundary_valid_pred]),
+                                1,
+                            )
                 for pos_key in ("first", "second", "third"):
                     region = region_meta.get(pos_key)
                     if not isinstance(region, dict):
@@ -3563,6 +4025,10 @@ def _collect_task_highlights(
         inline_stats = md_stats.get("inline", {})
         text_stats_overall = md_stats.get("text", {})
         text_like_binary = md_stats.get("text_like_binary", {})
+        boundary_payload = _needle_boundary_metrics_payload(
+            md_stats.get("boundary_region", {}),
+            label_names=markdown_metrics.label_names,
+        )
         support_lines = _support_summary_lines(_task_support_payload(manifest, "markdown_mix"))
 
         def _wrapper_row(name: str, group: Dict[str, Any]) -> str:
@@ -3615,6 +4081,22 @@ def _collect_task_highlights(
             text_cov_line = f"Text region coverage: {_format_pct(_safe_ratio(text_stats_overall.get('correct_chars', 0), text_truth))}"
             wrapper_table.append("")
             wrapper_table.append(text_cov_line)
+
+        if boundary_payload is not None:
+            aggregates = boundary_payload.get("aggregates", {})
+            wrapper_table.extend(
+                [
+                    "",
+                    (
+                        "Boundary-region label metrics "
+                        f"(`±{int(boundary_payload.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                        f"tokens around markdown/code transitions): acc {float(aggregates.get('micro_acc', 0.0)):.4f}, "
+                        f"prec {float(aggregates.get('macro_precision', 0.0)):.4f}, "
+                        f"recall {float(aggregates.get('macro_recall', 0.0)):.4f}, "
+                        f"f1 {float(aggregates.get('macro_f1', 0.0)):.4f}."
+                    ),
+                ]
+            )
 
         _append_text_like_binary_lines(wrapper_table, text_like_binary)
         add_section("markdown_mix", wrapper_table)
@@ -3703,6 +4185,20 @@ def _collect_task_highlights(
             correct = int(data.get("correct", 0))
             coverage = _format_pct(correct / total) if total > 0 else "n/a"
             segment_lines.append(f"{key.title()} exact region coverage {coverage}")
+        boundary_payload = _sequence_boundary_metrics_payload(
+            seq_stats.get("boundary_region", {}),
+            label_names=seq_metrics.label_names,
+        )
+        if boundary_payload is not None:
+            aggregates = boundary_payload.get("aggregates", {})
+            segment_lines.append(
+                "Boundary-region label metrics "
+                f"(`±{int(boundary_payload.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                f"tokens around sequence transitions): acc {float(aggregates.get('micro_acc', 0.0)):.4f}, "
+                f"prec {float(aggregates.get('macro_precision', 0.0)):.4f}, "
+                f"recall {float(aggregates.get('macro_recall', 0.0)):.4f}, "
+                f"f1 {float(aggregates.get('macro_f1', 0.0)):.4f}."
+            )
         if segment_lines:
             add_section(name, segment_lines)
 
@@ -3737,6 +4233,33 @@ def _collect_task_highlights(
             f"| Any non-wrapper | {_format_hits(any_cov_hits, any_cov_total)} | {_format_hits(any_detected, any_count)} | {_format_float(any_avg_iou)} | {any_cov} |",
             f"| Exact inserted region | {_format_hits(coverage_hits, coverage_total)} | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage_pct} |",
         ]
+        boundary_payload = _needle_boundary_metrics_payload(
+            stats.get("boundary_region", {}),
+            label_names=m.label_names,
+        )
+        if boundary_payload is not None:
+            aggregates = boundary_payload.get("aggregates", {})
+            section_lines.extend(
+                [
+                    "",
+                    (
+                        "Boundary-region label metrics "
+                        f"(`±{int(boundary_payload.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                        "tokens around inserted start/end):"
+                    ),
+                    "",
+                    "| Acc | Prec | Recall | F1 | Boundary chars | Samples |",
+                    "| ---: | ---: | ---: | ---: | ---: | ---: |",
+                    (
+                        f"| {float(aggregates.get('micro_acc', 0.0)):.4f} | "
+                        f"{float(aggregates.get('macro_precision', 0.0)):.4f} | "
+                        f"{float(aggregates.get('macro_recall', 0.0)):.4f} | "
+                        f"{float(aggregates.get('macro_f1', 0.0)):.4f} | "
+                        f"{int(boundary_payload.get('support_chars', 0))} | "
+                        f"{int(boundary_payload.get('samples', 0))} |"
+                    ),
+                ]
+            )
         add_section(m.name, section_lines)
 
     return sections
@@ -3934,13 +4457,14 @@ def _monitor_b_confusion_payload(
 
     keep_indices: List[int] = []
     label_names: List[str] = []
+    id2label = _monitor_b_id2label()
     for idx in range(int(confusion.shape[0])):
         if idx == int(cfg.PAD_ID):
             continue
         if int(confusion[idx, :].sum()) <= 0 and int(confusion[:, idx].sum()) <= 0:
             continue
         keep_indices.append(idx)
-        label_names.append(str(cfg.ID2LANG.get(idx, str(idx))))
+        label_names.append(str(id2label.get(idx, str(idx))))
 
     if not keep_indices or not label_names:
         return None
@@ -4177,6 +4701,21 @@ def _collect_comparison_metrics(
                 "rows": list(text_like_binary.get("rows", [])),
                 "by_label": dict(text_like_binary.get("by_label", {})),
             }
+        boundary_payload = _needle_boundary_metrics_payload(
+            md_stats.get("boundary_region", {}),
+            label_names=markdown_metrics.label_names,
+        )
+        if boundary_payload is not None:
+            md_data["boundary_region"] = {
+                "window_radius_tokens": int(
+                    boundary_payload.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)
+                ),
+                "support_chars": int(boundary_payload.get("support_chars", 0)),
+                "samples": int(boundary_payload.get("samples", 0)),
+                "aggregates": dict(boundary_payload.get("aggregates", {})),
+                "rows": list(boundary_payload.get("rows", [])),
+                "by_label": dict(boundary_payload.get("by_label", {})),
+            }
 
         if md_data:
             data["tasks"]["markdown_mix"] = md_data
@@ -4326,10 +4865,27 @@ def _collect_comparison_metrics(
                 "support": total,
             }
         if segment_data:
-            data["tasks"][name] = {
+            task_payload = {
                 "segments": segment_data,
                 "overall_accuracy": _float_or_none(seq_metrics.overall_accuracy()),
             }
+            boundary_payload = _sequence_boundary_metrics_payload(
+                seq_stats.get("boundary_region", {}),
+                label_names=seq_metrics.label_names,
+            )
+            if boundary_payload is not None:
+                task_payload["boundary_region"] = {
+                    "window_radius_tokens": int(
+                        boundary_payload.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)
+                    ),
+                    "support_chars": int(boundary_payload.get("support_chars", 0)),
+                    "samples": int(boundary_payload.get("samples", 0)),
+                    "boundaries": int(boundary_payload.get("boundaries", 0)),
+                    "aggregates": dict(boundary_payload.get("aggregates", {})),
+                    "rows": list(boundary_payload.get("rows", [])),
+                    "by_label": dict(boundary_payload.get("by_label", {})),
+                }
+            data["tasks"][name] = task_payload
 
     # Needle datasets ------------------------------------------------------
     needle_entries = {}
@@ -4384,6 +4940,19 @@ def _collect_comparison_metrics(
             },
             "top_misclassifications": top_conf,
         }
+        boundary_payload = _needle_boundary_metrics_payload(
+            stats.get("boundary_region", {}),
+            label_names=metrics.label_names,
+        )
+        if boundary_payload is not None:
+            entry_payload["boundary_region"] = {
+                "window_radius_tokens": int(boundary_payload.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)),
+                "support_chars": int(boundary_payload.get("support_chars", 0)),
+                "samples": int(boundary_payload.get("samples", 0)),
+                "aggregates": dict(boundary_payload.get("aggregates", {})),
+                "rows": list(boundary_payload.get("rows", [])),
+                "by_label": dict(boundary_payload.get("by_label", {})),
+            }
         by_lang = stats.get("by_lang", {}) if isinstance(stats, dict) else {}
         if isinstance(by_lang, Mapping):
             per_anchor = {}
@@ -4534,15 +5103,47 @@ def write_report(
         report_lines.append(f"- Monitor root: `{monitor_b_report.get('root')}`")
         report_lines.append(f"- Architecture: {monitor_b_report.get('arch')}")
         report_lines.append(f"- Inference mode: {monitor_b_report.get('inference_mode')}")
+        report_lines.append(f"- Open-set classification: {bool(monitor_b_report.get('open_set', False))}")
+        report_lines.append(f"- Other threshold: {float(monitor_b_report.get('other_threshold', 0.0)):.4f}")
         report_lines.append(f"- Files used: {int(monitor_b_report.get('files_used', 0))}")
         report_lines.append(f"- Skipped: {int(monitor_b_report.get('skipped', 0))}")
         report_lines.append(f"- Evaluated bytes: {int(monitor_b_report.get('evaluated_bytes', 0))}")
+        report_lines.append(
+            f"- Truth `other` bytes: {int(monitor_b_report.get('truth_other_bytes', 0))}"
+        )
+        report_lines.append(
+            "- Low-confidence bytes routed to `other`: "
+            f"{int(monitor_b_report.get('low_confidence_bytes_routed_to_other', 0))}"
+        )
         if monitor_confusion_rel:
             report_lines.append(f"- Confusion matrix: [{monitor_confusion_rel}]({monitor_confusion_rel})")
+        monitor_boundary = monitor_b_report.get("boundary_region")
+        if isinstance(monitor_boundary, Mapping) and monitor_boundary.get("rows"):
+            aggregates = monitor_boundary.get("aggregates", {})
+            report_lines.append(
+                "- Boundary-region label metrics "
+                f"(`±{int(monitor_boundary.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                f"tokens around effective truth transitions): acc {float(aggregates.get('micro_acc', 0.0)):.4f}, "
+                f"prec {float(aggregates.get('macro_precision', 0.0)):.4f}, "
+                f"recall {float(aggregates.get('macro_recall', 0.0)):.4f}, "
+                f"f1 {float(aggregates.get('macro_f1', 0.0)):.4f} over "
+                f"{int(monitor_boundary.get('support_chars', 0))} bytes in "
+                f"{int(monitor_boundary.get('samples', 0))} files across "
+                f"{int(monitor_boundary.get('boundaries', 0))} transitions."
+            )
         report_lines.append("")
         monitor_rows = monitor_b_report.get("rows", [])
         if isinstance(monitor_rows, Sequence) and monitor_rows:
             report_lines.append(_render_training_style_metrics_table(monitor_rows))
+            report_lines.append("")
+        if isinstance(monitor_boundary, Mapping) and monitor_boundary.get("rows"):
+            report_lines.append(
+                "Boundary-region label metrics "
+                f"(`±{int(monitor_boundary.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                "tokens around effective truth transitions):"
+            )
+            report_lines.append("")
+            report_lines.append(_render_training_style_metrics_table(monitor_boundary.get("rows", [])))
             report_lines.append("")
 
     report_lines.append("## Task Details")
@@ -4744,6 +5345,19 @@ def write_report(
             report_lines.append(
                 f"| Exact inserted region | {_format_hits(coverage_hits, coverage_count)} | {_format_hits(detected, total)} | {_format_float(avg_iou)} | {coverage} | — |"
             )
+            boundary_payload = _needle_boundary_metrics_payload(
+                stats.get("boundary_region", {}),
+                label_names=metrics.label_names,
+            )
+            if boundary_payload is not None:
+                report_lines.append("")
+                report_lines.append(
+                    "Boundary-region label metrics "
+                    f"(`±{int(boundary_payload.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                    "tokens around inserted start/end):"
+                )
+                report_lines.append("")
+                report_lines.append(_render_training_style_metrics_table(boundary_payload.get("rows", [])))
             by_lang = stats.get("by_lang", {})
             any_by_lang = stats.get("any_by_lang", {})
             if isinstance(by_lang, Mapping) and by_lang:
@@ -4790,6 +5404,19 @@ def write_report(
                 correct = int(data.get("correct", 0))
                 coverage = _format_pct(correct / total) if total > 0 else "n/a"
                 report_lines.append(f"| {key.title()} | {coverage} |")
+            boundary_payload = _sequence_boundary_metrics_payload(
+                seq_stats.get("boundary_region", {}),
+                label_names=metrics.label_names,
+            )
+            if boundary_payload is not None:
+                report_lines.append("")
+                report_lines.append(
+                    "Boundary-region label metrics "
+                    f"(`±{int(boundary_payload.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                    "tokens around sequence transitions):"
+                )
+                report_lines.append("")
+                report_lines.append(_render_training_style_metrics_table(boundary_payload.get("rows", [])))
             report_lines.append("")
 
         # Default handling for other tasks
@@ -4799,6 +5426,10 @@ def write_report(
             wrapped_group = markdown_stats.get("overall", {}).get("wrapped", {})
             plain_group = markdown_stats.get("overall", {}).get("plain", {})
             text_like_binary = markdown_stats.get("text_like_binary", {})
+            boundary_payload = _needle_boundary_metrics_payload(
+                markdown_stats.get("boundary_region", {}),
+                label_names=metrics.label_names,
+            )
             report_lines.append("")
             report_lines.append("_Text hits column: lower is better._")
             report_lines.append("| Wrapper | Non-text cov ≥50% | Non-text region coverage | Text hits | Exact region cov ≥50% | Exact region avg coverage |")
@@ -4849,6 +5480,15 @@ def write_report(
                 )
                 report_lines.append("")
                 report_lines.append(f"Text region coverage: {text_cov}")
+            if boundary_payload is not None:
+                report_lines.append("")
+                report_lines.append(
+                    "Boundary-region label metrics "
+                    f"(`±{int(boundary_payload.get('window_radius_tokens', NEEDLE_BOUNDARY_WINDOW_TOKENS))}` "
+                    "tokens around markdown/code transitions):"
+                )
+                report_lines.append("")
+                report_lines.append(_render_training_style_metrics_table(boundary_payload.get("rows", [])))
             _append_text_like_binary_lines(report_lines, text_like_binary)
             report_lines.append("")
 
@@ -5187,7 +5827,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"▶️  Evaluating full monitor_b from {monitor_root}",
                 flush=True,
             )
-            monitor_b_report = _evaluate_full_monitor_b(monitor_root, accuracy_runner)
+            monitor_b_report = _evaluate_full_monitor_b(
+                monitor_root,
+                accuracy_runner,
+                other_threshold=args.other_threshold,
+            )
             print(
                 "    [monitor_b] completed in "
                 f"{float(monitor_b_report.get('elapsed_seconds', 0.0)):.1f}s "
