@@ -16,6 +16,11 @@
         <span class="toggle-switch" aria-hidden="true"></span>
         <span class="toggle-text">Focus Example 1</span>
       </label>
+      <label class="toggle" id="postprocessToggleLabel">
+        <input type="checkbox" id="postprocessToggle" onchange="document.body.classList.toggle('show-postprocess', this.checked)">
+        <span class="toggle-switch" aria-hidden="true"></span>
+        <span class="toggle-text">Show Post-Processing</span>
+      </label>
       <button id="runAll" class="btn primary small" title="Run segmentation on all examples">Segment All</button>
     </div>
   </header>

@@ -18,6 +18,8 @@ STATIC_ROOT = REPO_ROOT / "viewers" / "content_type_segmentor_static"
 DEFAULT_OUTPUT_DIR = STATIC_ROOT / "assets"
 DEFAULT_CHECKPOINT = REPO_ROOT / "checkpoints" / "sweeps" / "sfullfiles4.msgpack"
 DEFAULT_DEMO_TEXT_PATH = DEFAULT_OUTPUT_DIR / "demo_input.txt"
+DEFAULT_POSTPROCESS_MIN_RUN_CHARS = 5
+DEFAULT_POSTPROCESS_BOUNDARY_SNAP_MAX_SHIFT = 2
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -118,6 +120,8 @@ def _build_manifest(
         "window_stride_bytes": int(core.DEFAULT_CHUNK_SIZE // 2),
         "other_threshold": float(other_threshold),
         "max_input_bytes": int(max_input_bytes),
+        "postprocess_min_run_chars": int(DEFAULT_POSTPROCESS_MIN_RUN_CHARS),
+        "postprocess_boundary_snap_max_shift": int(DEFAULT_POSTPROCESS_BOUNDARY_SNAP_MAX_SHIFT),
         "default_text_path": "assets/demo_input.txt",
         "weights_path": "assets/sfullfiles4_weights.npz",
         "pyodide_js_url": "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js",

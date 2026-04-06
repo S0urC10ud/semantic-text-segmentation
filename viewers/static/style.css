@@ -218,6 +218,13 @@ textarea.code{
 
 /* Tooltip + per-char confidence heatmap */
 .char { position: relative; cursor: pointer; display: inline-block; border-radius: 3px; }
+body.show-postprocess .char.postprocessed{
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in srgb, var(--accent) 68%, rgba(14, 116, 144, 0.25));
+}
 .char.newline {
   display: block;
   width: 100%;
@@ -242,6 +249,25 @@ textarea.code{
   z-index: 1000;
   pointer-events: none;
   max-width: 250px;
+}
+.postprocess-note{
+  margin: 0 0 8px 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, white);
+}
+.postprocess-title{
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--accent) 72%, #475569);
+  margin-bottom: 2px;
+}
+.postprocess-text{
+  font-size: 12px;
+  line-height: 1.35;
 }
 .prob-bar { display: flex; align-items: center; margin: 4px 0; }
 .prob-bar .label { flex: 1; min-width: 80px; }

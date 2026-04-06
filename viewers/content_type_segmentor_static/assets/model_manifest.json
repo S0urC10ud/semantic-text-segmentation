@@ -128,6 +128,8 @@
   "model_id": "sfullfiles4",
   "num_classes": 35,
   "other_threshold": 0.3,
+  "postprocess_boundary_snap_max_shift": 2,
+  "postprocess_min_run_chars": 5,
   "pyodide_index_url": "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/",
   "pyodide_js_url": "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js",
   "weights_path": "assets/sfullfiles4_weights.npz",

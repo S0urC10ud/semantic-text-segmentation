@@ -135,7 +135,7 @@ parser.add_argument(
     "--other-threshold",
     dest="other_threshold",
     type=float,
-    default=0.5,
+    default=0.3,
     help="If >0, treat characters whose max softmax is below this (tau) as a virtual 'other' class.",
 )
 args, _ = parser.parse_known_args()
@@ -314,7 +314,7 @@ except Exception as e:
 
 class SegmentRequest(BaseModel):
     text: str
-    min_run: int = 4
+    min_run: int = 5
     chunk: Optional[int] = None
 
 app = FastAPI(title="Segmenter Viewer", docs_url="/docs" if args.openapi else None)
@@ -375,6 +375,20 @@ def api_segment(req: SegmentRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     elapsed_ms = float((_time.perf_counter() - t0) * 1000.0)
+    postprocess_trace = getattr(predictor, "last_postprocess_trace", None)
+    changed_mask = []
+    postprocess_descriptions = []
+    original_labels = []
+    if isinstance(postprocess_trace, dict):
+        changed_mask = list(postprocess_trace.get("changed_mask", []) or [])
+        postprocess_descriptions = list(postprocess_trace.get("descriptions", []) or [])
+        original_labels = list(postprocess_trace.get("original_labels", []) or [])
+    if len(changed_mask) != len(char_labels):
+        changed_mask = [False] * len(char_labels)
+    if len(postprocess_descriptions) != len(char_labels):
+        postprocess_descriptions = [""] * len(char_labels)
+    if len(original_labels) != len(char_labels):
+        original_labels = list(char_labels)
 
     import collections
     counts = collections.Counter(char_labels)
@@ -459,17 +473,27 @@ def api_segment(req: SegmentRequest):
                 payload["others"] = remaining
             probs_attr = esc(json.dumps(payload))
             display_label = esc(ID2NAME.get(lbl, str(lbl)))
+            postprocess_attr = ""
+            postprocess_class = ""
+            if changed_mask[char_idx]:
+                postprocess_class = " postprocessed"
+                original_label = int(original_labels[char_idx])
+                original_name = ID2NAME.get(original_label, str(original_label))
+                detail = postprocess_descriptions[char_idx] or "post-processed"
+                if original_label != int(lbl):
+                    detail = f"{original_name} -> {ID2NAME.get(lbl, str(lbl))} via {detail}"
+                postprocess_attr = f' data-postprocess="{esc(detail)}"'
 
             if ch == "\n":
                 chars_html.append(
-                    f'<span class="char newline" style="background-color:{char_bg};" '
-                    f'data-probs="{probs_attr}" data-label="{display_label}"><br></span>'
+                    f'<span class="char newline{postprocess_class}" style="background-color:{char_bg};" '
+                    f'data-probs="{probs_attr}" data-label="{display_label}"{postprocess_attr}><br></span>'
                 )
                 continue
 
             chars_html.append(
-                f'<span class="char" style="background-color:{char_bg};" '
-                f'data-probs="{probs_attr}" data-label="{display_label}">{esc(ch)}</span>'
+                f'<span class="char{postprocess_class}" style="background-color:{char_bg};" '
+                f'data-probs="{probs_attr}" data-label="{display_label}"{postprocess_attr}>{esc(ch)}</span>'
             )
         out_html.append(
             f'<span class="seg {cls}" '
@@ -501,6 +525,9 @@ def api_segment(req: SegmentRequest):
         "segments": [{"start": int(s), "end": int(e), "label": int(lbl)} for (s, e, lbl) in segs],
         "stats": stats,
         "html": html_joined,
+        "postprocess": {
+            "changed_chars": int(sum(1 for changed in changed_mask if changed)),
+        },
         "elapsed_ms": elapsed_ms,
         "window_info": window_info,
     }

@@ -205,6 +205,16 @@ class FastInferenceEngine:
         n = int(length)
         if n <= 0:
             return 0
+            
+        if self._is_mamba_arch():
+            # Mamba models handle large padding smoothly.
+            # Use strict power-of-two bucketing to eliminate JIT recompilation churn 
+            # for varying sequence lengths during interactive typing.
+            bucket = 1024
+            while bucket < n:
+                bucket *= 2
+            return bucket
+
         if self.execution_platform == "gpu":
             bucket = 256
             return int(((n + bucket - 1) // bucket) * bucket)
@@ -501,7 +511,7 @@ class FastInferenceEngine:
                 if path == "fast_full":
                     trigger = "oom_or_size" if self._looks_like_oom(exc) else "runtime_error"
                     reason = str(exc)
-                    if self.inference_backend == "auto":
+                    if self.inference_backend == "auto" and not self._is_mamba_arch():
                         self._emit_auto_fallback(
                             from_path="fast_full",
                             to_path="fast_stream",
@@ -562,7 +572,7 @@ class FastInferenceEngine:
                 if path == "fast_full":
                     trigger = "oom_or_size" if self._looks_like_oom(exc) else "runtime_error"
                     reason = str(exc)
-                    if self.inference_backend == "auto":
+                    if self.inference_backend == "auto" and not self._is_mamba_arch():
                         self._emit_auto_fallback(
                             from_path="fast_full",
                             to_path="fast_stream",
@@ -623,7 +633,7 @@ class FastInferenceEngine:
                 if path == "fast_full":
                     trigger = "oom_or_size" if self._looks_like_oom(exc) else "runtime_error"
                     reason = str(exc)
-                    if self.inference_backend == "auto":
+                    if self.inference_backend == "auto" and not self._is_mamba_arch():
                         self._emit_auto_fallback(
                             from_path="fast_full",
                             to_path="fast_stream",
@@ -682,6 +692,14 @@ class FastInferenceEngine:
         while candidate > 0:
             batch_lengths = [int(arr.shape[0]) for arr in arrays[start_idx:start_idx + candidate]]
             estimate = self._estimate_batch_bytes(batch_lengths)
+            
+            if self._is_mamba_arch():
+                # For Mamba, we avoid stream/sliding windows due to RNN sequence semantics.
+                if estimate <= self.full_memory_budget_bytes or candidate == 1:
+                    return candidate, "fast_full"
+                candidate = candidate - 1 if candidate <= 4 else max(1, candidate // 2)
+                continue
+                
             if estimate <= self.full_memory_budget_bytes:
                 return candidate, "fast_full"
             if candidate == 1:

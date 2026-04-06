@@ -833,6 +833,43 @@ _ALLOWED_TEXT_CHARS = {chr(b) for b in _VISIBLE_ASCII_BYTES}
 _ALLOWED_TEXT_CHARS.update({" ", "\n", "\t", _PLACEHOLDER_CHAR})
 _VISUAL_WHITESPACE_CHARS = (" ", "\t", "\n")
 _VISUAL_WHITESPACE_SET = frozenset(_VISUAL_WHITESPACE_CHARS)
+_INLINE_WHITESPACE_SET = frozenset((" ", "\t"))
+_BOUNDARY_SNAP_DELIMITER_CHARS = frozenset(
+    ("<", ">", "/", "\\", '"', "'", "`", "(", ")", "[", "]", "{", "}", ",", ";", ":", "=")
+)
+_BOUNDARY_SNAP_ADJACENT_CHARS = _BOUNDARY_SNAP_DELIMITER_CHARS | frozenset((" ", "\t"))
+_BOUNDARY_SNAP_PROB_MARGIN = 0.1
+_BOUNDARY_SNAP_DELIMITER_PROB_MARGIN = 0.15
+_BOUNDARY_SNAP_WHITESPACE_PROB_MARGIN = 0.05
+_BOUNDARY_SNAP_MIN_IMPROVEMENT = 0.75
+_BOUNDARY_WRAP_OPEN_TO_CLOSE = {
+    '"': '"',
+    "'": "'",
+    "`": "`",
+    "(": ")",
+    "[": "]",
+    "{": "}",
+}
+_BOUNDARY_WRAP_QUOTE_CHARS = frozenset(('"', "'", "`"))
+_BOUNDARY_WRAP_PROB_MARGIN = 0.20
+_BOUNDARY_WRAP_PAIR_BONUS = 1.35
+_BOUNDARY_WRAP_QUOTE_BONUS = 0.35
+_BOUNDARY_WRAP_SHELL_DELIMITER_EJECT_BONUS = 0.80
+_BOUNDARY_WRAP_SHELL_DELIMITER_SWALLOW_PENALTY = 0.45
+_BOUNDARY_WRAP_SHELL_QUOTE_EJECT_BONUS = 0.35
+_BOUNDARY_WRAP_MIN_IMPROVEMENT = 0.70
+_LOCAL_HOST_POSTPROCESS_RULE_NAMES: Tuple[Tuple[str, str, str], ...] = (
+    ("json", "javascript_typescript", "json"),
+)
+_LOCAL_HOST_SINGLE_SIDE_MIN_CHARS = 8
+_POSTPROCESS_STAGE_LABELS = {
+    "markdown_structure_fill": "markdown structure fill",
+    "boundary_snap": "boundary snap",
+    "paired_delimiter_fill": "paired delimiter fill",
+    "local_host_fill": "local host fill",
+    "min_run": "min-run normalization",
+    "newline_snap": "newline snap",
+}
 
 
 def _normalize_input_text(text: Optional[str]) -> str:
@@ -959,6 +996,1014 @@ def _relabel_whitespace_from_neighbors(
         if 0 <= src < len(char_probs):
             new_probs[i] = dict(char_probs[src])
     return new_labels, new_probs
+
+
+def _build_label_runs(labels: Sequence[int]) -> List[Tuple[int, int, int]]:
+    if not labels:
+        return []
+    runs: List[Tuple[int, int, int]] = []
+    current = int(labels[0])
+    start = 0
+    for idx in range(1, len(labels)):
+        label = int(labels[idx])
+        if label != current:
+            runs.append((start, idx, current))
+            start = idx
+            current = label
+    runs.append((start, len(labels), current))
+    return runs
+
+
+def _is_identifier_like_char(ch: str) -> bool:
+    return bool(ch) and (ch.isalnum() or ch in ("_", "$", "-"))
+
+
+def _label_prob_from_mapping(prob_row: Mapping[str, float] | None, label: int) -> float:
+    if not isinstance(prob_row, Mapping):
+        return 0.0
+    try:
+        value = prob_row.get(str(int(label)), 0.0)
+    except Exception:
+        return 0.0
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _dominant_label_from_prob_rows(
+    char_probs: Sequence[Mapping[str, float]],
+    start: int,
+    end: int,
+    *,
+    exclude_labels: Sequence[int] = (),
+) -> tuple[Optional[int], float, float]:
+    if start >= end:
+        return None, 0.0, 0.0
+    excluded = {int(label) for label in exclude_labels}
+    totals: Dict[int, float] = {}
+    argmax_counts: Dict[int, int] = {}
+    count = 0
+    for pos in range(max(0, int(start)), min(int(end), len(char_probs))):
+        row = char_probs[pos]
+        if not isinstance(row, Mapping):
+            continue
+        best_label: Optional[int] = None
+        best_prob = float("-inf")
+        for key, value in row.items():
+            try:
+                label = int(key)
+                prob = float(value)
+            except Exception:
+                continue
+            if label in excluded:
+                continue
+            totals[label] = totals.get(label, 0.0) + prob
+            if prob > best_prob:
+                best_prob = prob
+                best_label = label
+        if best_label is not None:
+            argmax_counts[best_label] = argmax_counts.get(best_label, 0) + 1
+            count += 1
+    if count <= 0 or not totals:
+        return None, 0.0, 0.0
+    best = max(
+        totals.keys(),
+        key=lambda label: (totals[label], argmax_counts.get(label, 0), -int(label)),
+    )
+    mean_support = float(totals[best]) / float(count)
+    argmax_fraction = float(argmax_counts.get(best, 0)) / float(count)
+    return int(best), mean_support, argmax_fraction
+
+
+def _matching_wrap_delimiter(left: str, right: str) -> bool:
+    return bool(left) and _BOUNDARY_WRAP_OPEN_TO_CLOSE.get(left) == right
+
+
+def _wrapped_pair_bonus(left: str, right: str) -> float:
+    if not _matching_wrap_delimiter(left, right):
+        return 0.0
+    bonus = _BOUNDARY_WRAP_PAIR_BONUS
+    if left in _BOUNDARY_WRAP_QUOTE_CHARS:
+        bonus += _BOUNDARY_WRAP_QUOTE_BONUS
+    return bonus
+
+
+def _is_codeish_wrapped_content(text: str, *, wrapper_char: str) -> bool:
+    if not text:
+        return False
+    has_identifier = any(_is_identifier_like_char(ch) for ch in text)
+    has_nonwrapper_delimiter = any(
+        ch in _BOUNDARY_SNAP_DELIMITER_CHARS and ch != wrapper_char
+        for ch in text
+    )
+    return has_identifier and has_nonwrapper_delimiter
+
+
+def _boundary_local_score(text: str, boundary: int) -> float:
+    if boundary < 0 or boundary > len(text):
+        return float("-inf")
+    left = text[boundary - 1] if boundary > 0 else ""
+    right = text[boundary] if boundary < len(text) else ""
+    score = 0.0
+    if left in _BOUNDARY_SNAP_DELIMITER_CHARS:
+        score += 1.25
+    elif left in _INLINE_WHITESPACE_SET:
+        score += 0.20
+    if right in _BOUNDARY_SNAP_DELIMITER_CHARS:
+        score += 1.25
+    elif right in _INLINE_WHITESPACE_SET:
+        score += 0.20
+    if left in _BOUNDARY_SNAP_DELIMITER_CHARS and right in _BOUNDARY_SNAP_DELIMITER_CHARS:
+        score += 0.35
+    if left in _INLINE_WHITESPACE_SET and right in _INLINE_WHITESPACE_SET:
+        score -= 0.25
+    if left in ("<", "(", "[", "{") and _is_identifier_like_char(right):
+        score += 0.35
+    if right in (">", ")", "]", "}") and _is_identifier_like_char(left):
+        score += 0.35
+    if _is_identifier_like_char(left) and _is_identifier_like_char(right):
+        score -= 1.5
+    return score
+
+
+def _configured_local_host_postprocess_rules() -> Tuple[Tuple[int, int, str], ...]:
+    if TRAIN_CONFIG is None:
+        return ()
+    mapping = getattr(TRAIN_CONFIG, "LANG2ID", None)
+    if not isinstance(mapping, dict):
+        return ()
+    resolved: List[Tuple[int, int, str]] = []
+    for inner_name, host_name, rule_kind in _LOCAL_HOST_POSTPROCESS_RULE_NAMES:
+        inner_idx = mapping.get(inner_name)
+        host_idx = mapping.get(host_name)
+        if inner_idx is None or host_idx is None:
+            continue
+        inner_id = int(inner_idx)
+        host_id = int(host_idx)
+        if inner_id == host_id:
+            continue
+        resolved.append((inner_id, host_id, str(rule_kind)))
+    return tuple(resolved)
+
+
+def _lookup_train_label_id(name: str) -> Optional[int]:
+    if TRAIN_CONFIG is None:
+        return None
+    mapping = getattr(TRAIN_CONFIG, "LANG2ID", None)
+    if not isinstance(mapping, dict):
+        return None
+    value = mapping.get(str(name))
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _new_lock_mask(length: int) -> List[bool]:
+    return [False] * max(0, int(length))
+
+
+def _mark_locked_range(mask: List[bool], start: int, end: int) -> None:
+    lo = max(0, int(start))
+    hi = min(len(mask), int(end))
+    for pos in range(lo, hi):
+        mask[pos] = True
+
+
+def _merge_lock_masks(base: List[bool], update: Sequence[bool]) -> List[bool]:
+    if len(base) != len(update):
+        return base
+    for idx, flag in enumerate(update):
+        if bool(flag):
+            base[idx] = True
+    return base
+
+
+def _find_next_backtick_run(text: str, start: int, end: int, *, min_len: int) -> tuple[int, int]:
+    pos = max(0, int(start))
+    line_end = min(len(text), int(end))
+    while pos < line_end:
+        if text[pos] != "`":
+            pos += 1
+            continue
+        run_end = pos
+        while run_end < line_end and text[run_end] == "`":
+            run_end += 1
+        if (run_end - pos) >= int(min_len):
+            return pos, run_end
+        pos = run_end
+    return -1, -1
+
+
+def _infer_uniform_body_label(
+    labels: Sequence[int],
+    char_probs: Sequence[Mapping[str, float]],
+    start: int,
+    end: int,
+    *,
+    markdown_label: int,
+) -> int:
+    if start >= end:
+        return int(markdown_label)
+    counts: Dict[int, int] = {}
+    supports: Dict[int, float] = {}
+    for pos in range(max(0, int(start)), min(int(end), len(labels))):
+        label = int(labels[pos])
+        counts[label] = counts.get(label, 0) + 1
+        supports[label] = supports.get(label, 0.0) + _label_prob_from_mapping(
+            char_probs[pos] if pos < len(char_probs) else None,
+            label,
+        )
+    if not counts:
+        return int(markdown_label)
+    best_count = max(counts.values())
+    candidates = [label for label, count in counts.items() if count == best_count]
+    if len(candidates) == 1:
+        return int(candidates[0])
+    best_support = max(supports.get(label, 0.0) for label in candidates)
+    support_candidates = [label for label in candidates if supports.get(label, 0.0) >= (best_support - 1e-9)]
+    if int(markdown_label) in support_candidates:
+        return int(markdown_label)
+    return int(min(support_candidates))
+
+
+def _is_jsonish_content(text: str) -> bool:
+    trimmed = text.strip()
+    if not trimmed:
+        return False
+    if len(trimmed) >= 2 and (
+        (trimmed[0] == "{" and trimmed[-1] == "}")
+        or (trimmed[0] == "[" and trimmed[-1] == "]")
+        or (trimmed[0] == '"' and trimmed[-1] == '"')
+    ):
+        return True
+    lowered = trimmed.lower()
+    if lowered in {"true", "false", "null"}:
+        return True
+    if re.fullmatch(r"-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?", trimmed):
+        return True
+    if ":" in trimmed and any(ch in trimmed for ch in ('"', "{", "[")):
+        return True
+    if "," in trimmed and any(ch in trimmed for ch in ('"', "{", "}", "[", "]")):
+        return True
+    return False
+
+
+def _local_host_rule_matches_text(rule_kind: str, text: str) -> bool:
+    if rule_kind == "json":
+        return _is_jsonish_content(text)
+    return bool(text)
+
+
+def _apply_local_host_postprocess_rules(
+    text: str,
+    labels: List[int],
+    *,
+    local_host_rules: Sequence[Tuple[int, int, str]],
+    min_run_chars: int,
+) -> List[int]:
+    if not labels or not text or not local_host_rules:
+        return labels
+    out = labels[:]
+    single_side_min_chars = max(int(min_run_chars), int(_LOCAL_HOST_SINGLE_SIDE_MIN_CHARS))
+    max_passes = max(1, len(out))
+    for _ in range(max_passes):
+        runs = _build_label_runs(out)
+        changed = False
+        for run_idx, (start, end, label) in enumerate(runs):
+            for inner_label, host_label, rule_kind in local_host_rules:
+                if int(label) != int(inner_label):
+                    continue
+                left_host_len = 0
+                right_host_len = 0
+                if run_idx > 0 and int(runs[run_idx - 1][2]) == int(host_label):
+                    left_host_len = int(runs[run_idx - 1][1] - runs[run_idx - 1][0])
+                if run_idx + 1 < len(runs) and int(runs[run_idx + 1][2]) == int(host_label):
+                    right_host_len = int(runs[run_idx + 1][1] - runs[run_idx + 1][0])
+                if left_host_len <= 0 and right_host_len <= 0:
+                    continue
+                if not _local_host_rule_matches_text(str(rule_kind), text[start:end]):
+                    continue
+                if left_host_len > 0 and right_host_len > 0:
+                    should_relabel = True
+                else:
+                    should_relabel = (left_host_len + right_host_len) >= single_side_min_chars
+                if not should_relabel:
+                    continue
+                for pos in range(start, end):
+                    out[pos] = int(host_label)
+                changed = True
+                break
+            if changed:
+                break
+        if not changed:
+            break
+    return out
+
+
+def _score_boundary_candidate(
+    text: str,
+    labels: Sequence[int],
+    char_probs: Sequence[Mapping[str, float]],
+    left_run: Tuple[int, int, int],
+    right_run: Tuple[int, int, int],
+    boundary: int,
+) -> Optional[float]:
+    current = int(left_run[1])
+    left_start, _, left_label = left_run
+    _, right_end, right_label = right_run
+    if boundary < left_start or boundary > right_end:
+        return None
+    left_adjacent = text[boundary - 1] if boundary > 0 else ""
+    right_adjacent = text[boundary] if boundary < len(text) else ""
+    if left_adjacent == "\n" or right_adjacent == "\n":
+        return None
+    if boundary != current and (
+        left_adjacent not in _BOUNDARY_SNAP_ADJACENT_CHARS
+        and right_adjacent not in _BOUNDARY_SNAP_ADJACENT_CHARS
+    ):
+        return None
+
+    score = _boundary_local_score(text, boundary)
+    moved_positions: range
+    src_label: int
+    dest_label: int
+    if boundary < current:
+        moved_positions = range(boundary, current)
+        src_label = int(left_label)
+        dest_label = int(right_label)
+    else:
+        moved_positions = range(current, boundary)
+        src_label = int(right_label)
+        dest_label = int(left_label)
+
+    for pos in moved_positions:
+        ch = text[pos]
+        if ch == "\n":
+            return None
+        src_prob = _label_prob_from_mapping(char_probs[pos] if pos < len(char_probs) else None, src_label)
+        dest_prob = _label_prob_from_mapping(char_probs[pos] if pos < len(char_probs) else None, dest_label)
+        if ch in _BOUNDARY_SNAP_DELIMITER_CHARS:
+            if dest_prob < (src_prob - _BOUNDARY_SNAP_DELIMITER_PROB_MARGIN):
+                return None
+        elif ch in _INLINE_WHITESPACE_SET:
+            if dest_prob < (src_prob - _BOUNDARY_SNAP_WHITESPACE_PROB_MARGIN):
+                return None
+        elif ch not in _BOUNDARY_SNAP_ADJACENT_CHARS and dest_prob < (src_prob - _BOUNDARY_SNAP_PROB_MARGIN):
+            return None
+        score += 0.5 * (dest_prob - src_prob)
+        if ch in _BOUNDARY_SNAP_DELIMITER_CHARS:
+            score += 0.15
+        elif ch in _INLINE_WHITESPACE_SET:
+            score += 0.02
+    return score
+
+
+def _score_wrapped_run_candidate(
+    text: str,
+    char_probs: Sequence[Mapping[str, float]],
+    left_run: Tuple[int, int, int],
+    middle_run: Tuple[int, int, int],
+    right_run: Tuple[int, int, int],
+    start: int,
+    end: int,
+) -> Optional[float]:
+    left_start, _, left_label = left_run
+    current_start, current_end, middle_label = middle_run
+    _, right_end, right_label = right_run
+    if int(left_label) != int(right_label) or int(middle_label) == int(left_label):
+        return None
+    if start < int(left_start) or end > int(right_end) or start >= end:
+        return None
+    if start <= 0 or end >= len(text):
+        return None
+    left_delim = text[start - 1]
+    right_delim = text[end]
+    score = _boundary_local_score(text, start) + _boundary_local_score(text, end)
+    score += _wrapped_pair_bonus(left_delim, right_delim)
+
+    host_label = int(left_label)
+    inner_label = int(middle_label)
+    changed = False
+    union_start = min(int(current_start), int(start))
+    union_end = max(int(current_end), int(end))
+    shift_penalty = 0
+    for pos in range(union_start, union_end):
+        current_assign = inner_label if int(current_start) <= pos < int(current_end) else host_label
+        candidate_assign = inner_label if int(start) <= pos < int(end) else host_label
+        if candidate_assign == current_assign:
+            continue
+        ch = text[pos]
+        if ch == "\n":
+            return None
+        changed = True
+        current_prob = _label_prob_from_mapping(
+            char_probs[pos] if pos < len(char_probs) else None,
+            current_assign,
+        )
+        candidate_prob = _label_prob_from_mapping(
+            char_probs[pos] if pos < len(char_probs) else None,
+            candidate_assign,
+        )
+        if ch not in _BOUNDARY_SNAP_ADJACENT_CHARS and candidate_prob < (current_prob - _BOUNDARY_WRAP_PROB_MARGIN):
+            return None
+        score += 0.8 * (candidate_prob - current_prob)
+        if ch in _BOUNDARY_SNAP_ADJACENT_CHARS:
+            score += 0.10
+        moving_out = candidate_assign == host_label and current_assign == inner_label
+        moving_in = candidate_assign == inner_label and current_assign == host_label
+        if ch in _BOUNDARY_SNAP_DELIMITER_CHARS:
+            if moving_out:
+                score += _BOUNDARY_WRAP_SHELL_DELIMITER_EJECT_BONUS
+            elif moving_in:
+                score -= _BOUNDARY_WRAP_SHELL_DELIMITER_SWALLOW_PENALTY
+        if ch in _BOUNDARY_WRAP_QUOTE_CHARS:
+            if moving_out:
+                score += _BOUNDARY_WRAP_SHELL_QUOTE_EJECT_BONUS
+            elif moving_in:
+                score -= 0.15
+        shift_penalty += 1
+    if changed:
+        score += 0.60 * (
+            _mean_label_support(char_probs, start, end, inner_label)
+            - _mean_label_support(char_probs, start, end, host_label)
+        )
+        score -= 0.05 * max(0, shift_penalty - 2)
+    return score
+
+
+def _apply_boundary_shift(
+    labels: List[int],
+    current: int,
+    boundary: int,
+    left_label: int,
+    right_label: int,
+) -> List[int]:
+    out = labels[:]
+    if boundary < current:
+        for pos in range(boundary, current):
+            out[pos] = int(right_label)
+    elif boundary > current:
+        for pos in range(current, boundary):
+            out[pos] = int(left_label)
+    return out
+
+
+def _snap_boundaries_to_delimiters(
+    text: str,
+    labels: List[int],
+    char_probs: Sequence[Mapping[str, float]],
+    *,
+    max_shift: int = 2,
+    min_run_chars: int = 1,
+) -> List[int]:
+    if max_shift <= 0 or len(labels) <= 1:
+        return labels
+    out = labels[:]
+    max_passes = max(1, len(out) * 2)
+    for _ in range(max_passes):
+        runs = _build_label_runs(out)
+        if len(runs) <= 1:
+            break
+        changed = False
+        for idx in range(len(runs) - 1):
+            left_run = runs[idx]
+            right_run = runs[idx + 1]
+            current = int(left_run[1])
+            window_start = int(runs[idx - 1][0]) if idx > 0 else int(left_run[0])
+            window_end = int(runs[idx + 2][1]) if (idx + 2) < len(runs) else int(right_run[1])
+            current_short_count, current_min_len = _count_local_submin_interior_runs(
+                out,
+                min_run_chars=int(min_run_chars),
+                window_start=window_start,
+                window_end=window_end,
+            )
+            current_score = _score_boundary_candidate(text, out, char_probs, left_run, right_run, current)
+            if current_score is None:
+                current_score = _boundary_local_score(text, current)
+            best_boundary = current
+            best_score = current_score
+            best_short_count = current_short_count
+            best_min_len = current_min_len
+            for shift in range(-int(max_shift), int(max_shift) + 1):
+                if shift == 0:
+                    continue
+                candidate = current + shift
+                score = _score_boundary_candidate(text, out, char_probs, left_run, right_run, candidate)
+                if score is None:
+                    continue
+                candidate_labels = _apply_boundary_shift(out, current, candidate, left_run[2], right_run[2])
+                candidate_short_count, candidate_min_len = _count_local_submin_interior_runs(
+                    candidate_labels,
+                    min_run_chars=int(min_run_chars),
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                better_structure = (
+                    candidate_short_count < best_short_count
+                    or (
+                        candidate_short_count == best_short_count
+                        and candidate_min_len > best_min_len
+                    )
+                )
+                same_structure = (
+                    candidate_short_count == best_short_count
+                    and candidate_min_len == best_min_len
+                )
+                if better_structure or (same_structure and score > (best_score + 1e-6)):
+                    best_boundary = candidate
+                    best_score = score
+                    best_short_count = candidate_short_count
+                    best_min_len = candidate_min_len
+            if best_boundary != current and best_score >= (current_score + _BOUNDARY_SNAP_MIN_IMPROVEMENT):
+                out = _apply_boundary_shift(out, current, best_boundary, left_run[2], right_run[2])
+                changed = True
+                break
+        if not changed:
+            break
+    return out
+
+
+def _apply_wrapped_run_shift(
+    labels: List[int],
+    current_start: int,
+    current_end: int,
+    start: int,
+    end: int,
+    *,
+    host_label: int,
+    inner_label: int,
+) -> List[int]:
+    out = labels[:]
+    union_start = min(int(current_start), int(start))
+    union_end = max(int(current_end), int(end))
+    for pos in range(union_start, union_end):
+        out[pos] = int(inner_label) if int(start) <= pos < int(end) else int(host_label)
+    return out
+
+
+def _fill_markdown_structure_regions(
+    text: str,
+    labels: List[int],
+    char_probs: Sequence[Mapping[str, float]],
+    *,
+    markdown_label: Optional[int],
+) -> tuple[List[int], List[bool]]:
+    out = labels[:]
+    locked = _new_lock_mask(len(labels))
+    if markdown_label is None or not text or not labels:
+        return out, locked
+    n = len(text)
+    line_start = 0
+    while line_start < n:
+        line_end = text.find("\n", line_start)
+        if line_end == -1:
+            line_end = n
+        pos = line_start
+        while pos < line_end:
+            if text[pos] != "`":
+                pos += 1
+                continue
+            run_end = pos
+            while run_end < line_end and text[run_end] == "`":
+                run_end += 1
+            run_len = run_end - pos
+            if run_len < 3:
+                pos = run_end
+                continue
+            next_start, next_end = _find_next_backtick_run(text, run_end, line_end, min_len=run_len)
+            if next_start != -1 and next_start > run_end:
+                for mark_pos in range(pos, run_end):
+                    out[mark_pos] = int(markdown_label)
+                body_label = _infer_uniform_body_label(
+                    out,
+                    char_probs,
+                    run_end,
+                    next_start,
+                    markdown_label=int(markdown_label),
+                )
+                for body_pos in range(run_end, next_start):
+                    out[body_pos] = int(body_label)
+                for mark_pos in range(next_start, next_end):
+                    out[mark_pos] = int(markdown_label)
+                _mark_locked_range(locked, pos, next_end)
+                pos = next_end
+                continue
+            token_end = run_end
+            while token_end < line_end and text[token_end] not in (" ", "\t"):
+                token_end += 1
+            for mark_pos in range(pos, token_end):
+                out[mark_pos] = int(markdown_label)
+            _mark_locked_range(locked, pos, token_end)
+            pos = token_end
+        line_start = line_end + 1
+    return out, locked
+
+
+def _refine_wrapped_runs(
+    text: str,
+    labels: List[int],
+    char_probs: Sequence[Mapping[str, float]],
+    *,
+    max_shift: int = 2,
+) -> List[int]:
+    if max_shift <= 0 or len(labels) <= 2:
+        return labels
+    out = labels[:]
+    max_passes = max(1, len(out))
+    for _ in range(max_passes):
+        runs = _build_label_runs(out)
+        if len(runs) <= 2:
+            break
+        changed = False
+        for idx in range(1, len(runs) - 1):
+            left_run = runs[idx - 1]
+            middle_run = runs[idx]
+            right_run = runs[idx + 1]
+            if int(left_run[2]) != int(right_run[2]) or int(middle_run[2]) == int(left_run[2]):
+                continue
+            current_start = int(middle_run[0])
+            current_end = int(middle_run[1])
+            current_score = _score_wrapped_run_candidate(
+                text,
+                char_probs,
+                left_run,
+                middle_run,
+                right_run,
+                current_start,
+                current_end,
+            )
+            if current_score is None:
+                current_score = _boundary_local_score(text, current_start) + _boundary_local_score(text, current_end)
+            best_start = current_start
+            best_end = current_end
+            best_score = current_score
+            for left_shift in range(-int(max_shift), int(max_shift) + 1):
+                cand_start = current_start + left_shift
+                if cand_start < int(left_run[0]) or cand_start >= current_end:
+                    continue
+                for right_shift in range(-int(max_shift), int(max_shift) + 1):
+                    cand_end = current_end + right_shift
+                    if cand_end <= cand_start or cand_end > int(right_run[1]):
+                        continue
+                    if cand_start == current_start and cand_end == current_end:
+                        continue
+                    if not _matching_wrap_delimiter(
+                        text[cand_start - 1] if cand_start > 0 else "",
+                        text[cand_end] if cand_end < len(text) else "",
+                    ):
+                        continue
+                    score = _score_wrapped_run_candidate(
+                        text,
+                        char_probs,
+                        left_run,
+                        middle_run,
+                        right_run,
+                        cand_start,
+                        cand_end,
+                    )
+                    if score is None:
+                        continue
+                    if score > (best_score + 1e-6):
+                        best_start = cand_start
+                        best_end = cand_end
+                        best_score = score
+            if (
+                (best_start != current_start or best_end != current_end)
+                and best_score >= (current_score + _BOUNDARY_WRAP_MIN_IMPROVEMENT)
+            ):
+                out = _apply_wrapped_run_shift(
+                    out,
+                    current_start,
+                    current_end,
+                    best_start,
+                    best_end,
+                    host_label=int(left_run[2]),
+                    inner_label=int(middle_run[2]),
+                )
+                changed = True
+                break
+        if not changed:
+            break
+    return out
+
+
+def _mean_label_support(
+    char_probs: Sequence[Mapping[str, float]],
+    start: int,
+    end: int,
+    label: int,
+) -> float:
+    if start >= end:
+        return 0.0
+    total = 0.0
+    count = 0
+    for pos in range(start, end):
+        total += _label_prob_from_mapping(char_probs[pos] if pos < len(char_probs) else None, label)
+        count += 1
+    return total / max(count, 1)
+
+
+def _count_local_submin_interior_runs(
+    labels: Sequence[int],
+    *,
+    min_run_chars: int,
+    window_start: int,
+    window_end: int,
+) -> tuple[int, int]:
+    runs = _build_label_runs(labels)
+    count = 0
+    min_len: Optional[int] = None
+    for idx, (start, end, _label) in enumerate(runs):
+        if end <= int(window_start) or start >= int(window_end):
+            continue
+        run_len = int(end - start)
+        min_len = run_len if min_len is None else min(min_len, run_len)
+        if 0 < idx < (len(runs) - 1) and run_len < int(min_run_chars):
+            count += 1
+    return count, (int(min_len) if min_len is not None else 0)
+
+
+def _has_locked_positions(locked_mask: Sequence[bool], start: int, end: int) -> bool:
+    lo = max(0, int(start))
+    hi = min(len(locked_mask), int(end))
+    return any(bool(locked_mask[pos]) for pos in range(lo, hi))
+
+
+def _normalize_short_runs(
+    labels: List[int],
+    char_probs: Sequence[Mapping[str, float]],
+    *,
+    min_run_chars: int,
+    locked_mask: Optional[Sequence[bool]] = None,
+) -> List[int]:
+    if min_run_chars <= 1 or len(labels) <= 2:
+        return labels
+    out = labels[:]
+    locks = list(locked_mask) if locked_mask is not None and len(locked_mask) == len(out) else [False] * len(out)
+    max_passes = max(1, len(out))
+    for _ in range(max_passes):
+        runs = _build_label_runs(out)
+        changed = False
+        for idx in range(1, len(runs) - 1):
+            start, end, _label = runs[idx]
+            if (end - start) >= int(min_run_chars):
+                continue
+            if _has_locked_positions(locks, start, end):
+                continue
+            left_run = runs[idx - 1]
+            right_run = runs[idx + 1]
+            left_label = int(left_run[2])
+            right_label = int(right_run[2])
+            left_len = int(left_run[1] - left_run[0])
+            right_len = int(right_run[1] - right_run[0])
+            candidates: List[tuple[tuple[float, ...], int]] = []
+            seen_targets: set[int] = set()
+            for direction, target, neighbor_len in (
+                ("left", left_label, left_len),
+                ("right", right_label, right_len),
+            ):
+                if int(target) in seen_targets:
+                    continue
+                seen_targets.add(int(target))
+                candidate = out[:]
+                for pos in range(start, end):
+                    candidate[pos] = int(target)
+                submin_count, min_run_len = _count_local_submin_interior_runs(
+                    candidate,
+                    min_run_chars=min_run_chars,
+                    window_start=int(left_run[0]),
+                    window_end=int(right_run[1]),
+                )
+                support = _mean_label_support(char_probs, start, end, int(target))
+                sandwich = 1.0 if left_label == right_label == int(target) else 0.0
+                direction_tiebreak = 1.0 if direction == "left" else 0.0
+                key = (
+                    -float(submin_count),
+                    float(min_run_len),
+                    sandwich,
+                    float(neighbor_len),
+                    float(support),
+                    direction_tiebreak,
+                )
+                candidates.append((key, int(target)))
+            if not candidates:
+                continue
+            target = max(candidates, key=lambda item: item[0])[1]
+            for pos in range(start, end):
+                out[pos] = int(target)
+            changed = True
+            break
+        if not changed:
+            break
+    return out
+
+
+def _record_postprocess_stage(
+    before: Sequence[int],
+    after: Sequence[int],
+    *,
+    stage: str,
+    stage_hits: List[set[str]],
+) -> None:
+    for idx, (left, right) in enumerate(zip(before, after)):
+        if int(left) != int(right):
+            stage_hits[idx].add(stage)
+
+
+def _build_postprocess_trace(
+    original: Sequence[int],
+    final: Sequence[int],
+    stage_hits: Sequence[set[str]],
+) -> Dict[str, Any]:
+    stage_order = tuple(_POSTPROCESS_STAGE_LABELS.keys())
+    changed_mask: List[bool] = []
+    stage_lists: List[List[str]] = []
+    descriptions: List[str] = []
+    for idx in range(len(final)):
+        changed = int(original[idx]) != int(final[idx])
+        changed_mask.append(changed)
+        ordered_hits = [name for name in stage_order if name in stage_hits[idx]]
+        stage_lists.append(ordered_hits)
+        descriptions.append(", ".join(_POSTPROCESS_STAGE_LABELS[name] for name in ordered_hits))
+    return {
+        "original_labels": [int(value) for value in original],
+        "final_labels": [int(value) for value in final],
+        "changed_mask": changed_mask,
+        "stages": stage_lists,
+        "descriptions": descriptions,
+    }
+
+
+def _snap_newlines_leading_trailing(
+    text: str,
+    labels: List[int],
+) -> List[int]:
+    out = labels[:]
+    n = len(text)
+    if n <= 3:
+        return out
+        
+    line_start = 0
+    while line_start < n:
+        line_end = text.find("\n", line_start)
+        if line_end == -1:
+            line_end = n
+            
+        line_len = line_end - line_start
+        if line_len > 3:
+            # Front shifting
+            # Only apply if it borders an actual newline (not start of file)
+            if line_start > 0:
+                out_1 = out[line_start + 1]
+                out_2 = out[line_start + 2]
+                
+                if out_1 != out_2 and out_2 == out[line_start + 3]:
+                    out[line_start] = out_2
+                    out[line_start + 1] = out_2
+                elif out[line_start] != out_1 and out_1 == out_2:
+                    out[line_start] = out_1
+                    
+            # Back shifting
+            # Only apply if it borders an actual newline (not end of file)
+            if line_end < n:
+                out_back_2 = out[line_end - 2]
+                out_back_3 = out[line_end - 3]
+                
+                if out_back_2 != out_back_3 and out_back_3 == out[line_end - 4]:
+                    out[line_end - 1] = out_back_3
+                    out[line_end - 2] = out_back_3
+                elif out[line_end - 1] != out_back_2 and out_back_2 == out_back_3:
+                    out[line_end - 1] = out_back_2
+                
+        line_start = line_end + 1
+        
+    return out
+
+
+def _postprocess_char_labels_with_trace(
+    text: str,
+    labels: List[int],
+    char_probs: Sequence[Mapping[str, float]],
+    *,
+    min_run_chars: int,
+    boundary_snap_max_shift: int = 2,
+    local_host_rules: Sequence[Tuple[int, int, str]] = (),
+    markdown_label: Optional[int] = None,
+    html_label: Optional[int] = None,
+) -> tuple[List[int], Dict[str, Any]]:
+    if not labels:
+        empty_trace = {
+            "original_labels": [],
+            "final_labels": [],
+            "changed_mask": [],
+            "stages": [],
+            "descriptions": [],
+        }
+        return labels, empty_trace
+    markdown_label = _lookup_train_label_id("markdown") if markdown_label is None else int(markdown_label)
+    html_label = _lookup_train_label_id("html") if html_label is None else int(html_label)
+    original = [int(value) for value in labels]
+    stage_hits: List[set[str]] = [set() for _ in labels]
+    markdown_filled, markdown_locked = _fill_markdown_structure_regions(
+        text,
+        labels,
+        char_probs,
+        markdown_label=markdown_label,
+    )
+    _record_postprocess_stage(labels, markdown_filled, stage="markdown_structure_fill", stage_hits=stage_hits)
+    snapped = _snap_boundaries_to_delimiters(
+        text,
+        markdown_filled,
+        char_probs,
+        max_shift=boundary_snap_max_shift,
+        min_run_chars=min_run_chars,
+    )
+    _record_postprocess_stage(markdown_filled, snapped, stage="boundary_snap", stage_hits=stage_hits)
+    wrapped = _refine_wrapped_runs(
+        text,
+        snapped,
+        char_probs,
+        max_shift=boundary_snap_max_shift,
+    )
+    _record_postprocess_stage(snapped, wrapped, stage="paired_delimiter_fill", stage_hits=stage_hits)
+    local_host_filled = _apply_local_host_postprocess_rules(
+        text,
+        wrapped,
+        local_host_rules=local_host_rules,
+        min_run_chars=min_run_chars,
+    )
+    _record_postprocess_stage(wrapped, local_host_filled, stage="local_host_fill", stage_hits=stage_hits)
+    locked_mask = _new_lock_mask(len(labels))
+    _merge_lock_masks(locked_mask, markdown_locked)
+    normalized = _normalize_short_runs(
+        local_host_filled,
+        char_probs,
+        min_run_chars=min_run_chars,
+        locked_mask=locked_mask,
+    )
+    _record_postprocess_stage(local_host_filled, normalized, stage="min_run", stage_hits=stage_hits)
+    snapped_relit = _snap_boundaries_to_delimiters(
+        text,
+        normalized,
+        char_probs,
+        max_shift=boundary_snap_max_shift,
+        min_run_chars=min_run_chars,
+    )
+    _record_postprocess_stage(normalized, snapped_relit, stage="boundary_snap", stage_hits=stage_hits)
+    wrapped_relit = _refine_wrapped_runs(
+        text,
+        snapped_relit,
+        char_probs,
+        max_shift=boundary_snap_max_shift,
+    )
+    _record_postprocess_stage(snapped_relit, wrapped_relit, stage="paired_delimiter_fill", stage_hits=stage_hits)
+    markdown_relit, _markdown_relock = _fill_markdown_structure_regions(
+        text,
+        wrapped_relit,
+        char_probs,
+        markdown_label=markdown_label,
+    )
+    _record_postprocess_stage(wrapped_relit, markdown_relit, stage="markdown_structure_fill", stage_hits=stage_hits)
+    final_with_local_host = _apply_local_host_postprocess_rules(
+        text,
+        markdown_relit,
+        local_host_rules=local_host_rules,
+        min_run_chars=min_run_chars,
+    )
+    _record_postprocess_stage(markdown_relit, final_with_local_host, stage="local_host_fill", stage_hits=stage_hits)
+    
+    final_snapped = _snap_newlines_leading_trailing(text, final_with_local_host)
+    _record_postprocess_stage(final_with_local_host, final_snapped, stage="newline_snap", stage_hits=stage_hits)
+    
+    return final_snapped, _build_postprocess_trace(original, final_snapped, stage_hits)
+
+
+def _postprocess_char_labels(
+    text: str,
+    labels: List[int],
+    char_probs: Sequence[Mapping[str, float]],
+    *,
+    min_run_chars: int,
+    boundary_snap_max_shift: int = 2,
+    local_host_rules: Sequence[Tuple[int, int, str]] = (),
+    markdown_label: Optional[int] = None,
+    html_label: Optional[int] = None,
+) -> List[int]:
+    final_labels, _trace = _postprocess_char_labels_with_trace(
+        text,
+        labels,
+        char_probs,
+        min_run_chars=min_run_chars,
+        boundary_snap_max_shift=boundary_snap_max_shift,
+        local_host_rules=local_host_rules,
+        markdown_label=markdown_label,
+        html_label=html_label,
+    )
+    return final_labels
 
 # ---------------------------
 # Model (must mirror training EXACTLY)
@@ -1286,6 +2331,8 @@ class Predictor:
         self._apply_fast = _jit_apply(self.fast_model) if self.fast_model is not None else self._apply_legacy
         self._apply = self._apply_legacy
         self._last_window_spans: List[Tuple[int, int]] = []
+        self._last_postprocess_traces: List[Dict[str, Any]] = []
+        self.last_postprocess_trace: Optional[Dict[str, Any]] = None
         # Optional virtual "other" bucket driven by a confidence threshold
         self.other_threshold: Optional[float] = (
             float(other_threshold) if other_threshold is not None and other_threshold > 0.0 else None
@@ -1607,13 +2654,22 @@ class Predictor:
         byte_probs: np.ndarray,
         spans: Sequence[Tuple[int, int]],
         min_run_chars: int,
-    ) -> tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]]:
+    ) -> tuple[
+        tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]],
+        Dict[str, Any],
+    ]:
         char_labels, char_probs = self._byte_labels_to_char_labels(text, byte_labels, byte_probs)
-        # Apply open-set thresholding first; when enabled we skip run-length
-        # smoothing to avoid mutating thresholded OTHER predictions.
         char_labels, char_probs = self._apply_other_threshold(char_labels, char_probs)
-        if self.other_threshold is None or self.other_threshold <= 0.0:
-            char_labels = self._smooth_min_run(char_labels, int(min_run_chars))
+        char_labels, postprocess_trace = _postprocess_char_labels_with_trace(
+            text,
+            char_labels,
+            char_probs,
+            min_run_chars=int(min_run_chars),
+            boundary_snap_max_shift=2,
+            local_host_rules=_configured_local_host_postprocess_rules(),
+            markdown_label=_lookup_train_label_id("markdown"),
+            html_label=_lookup_train_label_id("html"),
+        )
         segs: List[Tuple[int, int, int]] = []
         if len(char_labels) > 0:
             cur = char_labels[0]
@@ -1625,7 +2681,7 @@ class Predictor:
                     cur = char_labels[i]
             segs.append((start, len(char_labels), cur))
         windows_info = self._build_windows_info(text, spans)
-        return segs, char_labels, char_probs, windows_info
+        return (segs, char_labels, char_probs, windows_info), postprocess_trace
 
     def _predict_logits_legacy(self, token_batch: np.ndarray) -> np.ndarray:
         """
@@ -1748,35 +2804,12 @@ class Predictor:
         return out_labels, char_probs
 
     def _smooth_min_run(self, labels: List[int], min_run: int) -> List[int]:
-        if min_run <= 1 or len(labels) == 0:
-            return labels
-        runs = []
-        cur = labels[0]; start = 0
-        for i in range(1, len(labels)):
-            if labels[i] != cur:
-                runs.append((start, i, cur))
-                start = i; cur = labels[i]
-        runs.append((start, len(labels), cur))
-        if len(runs) <= 2:
-            return labels
-        arr = labels[:]
-        for k, (s, e, lbl) in enumerate(runs):
-            length = e - s
-            if length >= min_run:
-                continue
-            left_lbl = runs[k-1][2] if k-1 >= 0 else lbl
-            right_lbl = runs[k+1][2] if k+1 < len(runs) else lbl
-            left_len = runs[k-1][1] - runs[k-1][0] if k-1 >= 0 else 0
-            right_len = runs[k+1][1] - runs[k+1][0] if k+1 < len(runs) else 0
-            new_lbl = left_lbl if left_len >= right_len else right_lbl
-            for i in range(s, e):
-                arr[i] = new_lbl
-        return arr
+        return _normalize_short_runs(labels, (), min_run_chars=min_run)
 
     def segment_texts(
         self,
         texts: Sequence[str],
-        min_run_chars: int = 6,
+        min_run_chars: int = 5,
         chunk: int = None,
     ) -> List[tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]]]:
         byte_arrays = [
@@ -1788,27 +2821,32 @@ class Predictor:
             chunk=chunk,
         )
         results: List[tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]]] = []
+        traces: List[Dict[str, Any]] = []
         for text, byte_labels, byte_probs, spans in zip(
             texts,
             byte_labels_by_text,
             byte_probs_by_text,
             spans_by_text,
         ):
-            results.append(
-                self._finalize_segmented_text(
-                    text=text,
-                    byte_labels=byte_labels,
-                    byte_probs=byte_probs,
-                    spans=spans,
-                    min_run_chars=min_run_chars,
-                )
+            result, trace = self._finalize_segmented_text(
+                text=text,
+                byte_labels=byte_labels,
+                byte_probs=byte_probs,
+                spans=spans,
+                min_run_chars=min_run_chars,
             )
+            results.append(result)
+            traces.append(trace)
+        self._last_postprocess_traces = traces
+        self.last_postprocess_trace = traces[0] if len(traces) == 1 else None
         return results
 
-    def segment_text(self, text: str, min_run_chars: int = 6, chunk: int = None):
+    def segment_text(self, text: str, min_run_chars: int = 5, chunk: int = None):
         result = self.segment_texts([text], min_run_chars=min_run_chars, chunk=chunk)[0]
         self._last_window_spans = [
             (int(window["start_byte"]), int(window["end_byte"]))
             for window in result[3]
         ]
+        if self._last_postprocess_traces:
+            self.last_postprocess_trace = self._last_postprocess_traces[0]
         return result
