@@ -312,10 +312,19 @@ try:
 except Exception as e:
     load_error = str(e)
 
+class PostprocessConfig(BaseModel):
+    markdown_structure_fill: bool = True
+    boundary_snap: bool = True
+    paired_delimiter_fill: bool = True
+    local_host_fill: bool = True
+    min_run: bool = True
+    newline_snap: bool = True
+
 class SegmentRequest(BaseModel):
     text: str
     min_run: int = 5
     chunk: Optional[int] = None
+    postprocess_config: Optional[PostprocessConfig] = None
 
 app = FastAPI(title="Segmenter Viewer", docs_url="/docs" if args.openapi else None)
 
@@ -370,7 +379,9 @@ def api_segment(req: SegmentRequest):
     t0 = _time.perf_counter()
     try:
         segs, char_labels, char_probs, window_info = predictor.segment_text(
-            text, min_run_chars=int(req.min_run)
+            text, 
+            min_run_chars=int(req.min_run),
+            postprocess_config=req.postprocess_config.dict() if req.postprocess_config else None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

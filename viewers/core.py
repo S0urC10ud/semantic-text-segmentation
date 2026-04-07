@@ -1894,6 +1894,7 @@ def _postprocess_char_labels_with_trace(
     local_host_rules: Sequence[Tuple[int, int, str]] = (),
     markdown_label: Optional[int] = None,
     html_label: Optional[int] = None,
+    config: Optional[Dict[str, bool]] = None,
 ) -> tuple[List[int], Dict[str, Any]]:
     if not labels:
         empty_trace = {
@@ -1907,79 +1908,112 @@ def _postprocess_char_labels_with_trace(
     markdown_label = _lookup_train_label_id("markdown") if markdown_label is None else int(markdown_label)
     html_label = _lookup_train_label_id("html") if html_label is None else int(html_label)
     original = [int(value) for value in labels]
+    current = list(original)
     stage_hits: List[set[str]] = [set() for _ in labels]
-    markdown_filled, markdown_locked = _fill_markdown_structure_regions(
-        text,
-        labels,
-        char_probs,
-        markdown_label=markdown_label,
-    )
-    _record_postprocess_stage(labels, markdown_filled, stage="markdown_structure_fill", stage_hits=stage_hits)
-    snapped = _snap_boundaries_to_delimiters(
-        text,
-        markdown_filled,
-        char_probs,
-        max_shift=boundary_snap_max_shift,
-        min_run_chars=min_run_chars,
-    )
-    _record_postprocess_stage(markdown_filled, snapped, stage="boundary_snap", stage_hits=stage_hits)
-    wrapped = _refine_wrapped_runs(
-        text,
-        snapped,
-        char_probs,
-        max_shift=boundary_snap_max_shift,
-    )
-    _record_postprocess_stage(snapped, wrapped, stage="paired_delimiter_fill", stage_hits=stage_hits)
-    local_host_filled = _apply_local_host_postprocess_rules(
-        text,
-        wrapped,
-        local_host_rules=local_host_rules,
-        min_run_chars=min_run_chars,
-    )
-    _record_postprocess_stage(wrapped, local_host_filled, stage="local_host_fill", stage_hits=stage_hits)
-    locked_mask = _new_lock_mask(len(labels))
-    _merge_lock_masks(locked_mask, markdown_locked)
-    normalized = _normalize_short_runs(
-        local_host_filled,
-        char_probs,
-        min_run_chars=min_run_chars,
-        locked_mask=locked_mask,
-    )
-    _record_postprocess_stage(local_host_filled, normalized, stage="min_run", stage_hits=stage_hits)
-    snapped_relit = _snap_boundaries_to_delimiters(
-        text,
-        normalized,
-        char_probs,
-        max_shift=boundary_snap_max_shift,
-        min_run_chars=min_run_chars,
-    )
-    _record_postprocess_stage(normalized, snapped_relit, stage="boundary_snap", stage_hits=stage_hits)
-    wrapped_relit = _refine_wrapped_runs(
-        text,
-        snapped_relit,
-        char_probs,
-        max_shift=boundary_snap_max_shift,
-    )
-    _record_postprocess_stage(snapped_relit, wrapped_relit, stage="paired_delimiter_fill", stage_hits=stage_hits)
-    markdown_relit, _markdown_relock = _fill_markdown_structure_regions(
-        text,
-        wrapped_relit,
-        char_probs,
-        markdown_label=markdown_label,
-    )
-    _record_postprocess_stage(wrapped_relit, markdown_relit, stage="markdown_structure_fill", stage_hits=stage_hits)
-    final_with_local_host = _apply_local_host_postprocess_rules(
-        text,
-        markdown_relit,
-        local_host_rules=local_host_rules,
-        min_run_chars=min_run_chars,
-    )
-    _record_postprocess_stage(markdown_relit, final_with_local_host, stage="local_host_fill", stage_hits=stage_hits)
     
-    final_snapped = _snap_newlines_leading_trailing(text, final_with_local_host)
-    _record_postprocess_stage(final_with_local_host, final_snapped, stage="newline_snap", stage_hits=stage_hits)
+    if config is None:
+        config = {k: True for k in _POSTPROCESS_STAGE_LABELS.keys()}
+        
+    markdown_locked = _new_lock_mask(len(labels))
+    if config.get("markdown_structure_fill", True):
+        current, markdown_locked = _fill_markdown_structure_regions(
+            text,
+            current,
+            char_probs,
+            markdown_label=markdown_label,
+        )
+        _record_postprocess_stage(original, current, stage="markdown_structure_fill", stage_hits=stage_hits)
     
-    return final_snapped, _build_postprocess_trace(original, final_snapped, stage_hits)
+    if config.get("boundary_snap", True):
+        snapped = _snap_boundaries_to_delimiters(
+            text,
+            current,
+            char_probs,
+            max_shift=boundary_snap_max_shift,
+            min_run_chars=min_run_chars,
+        )
+        _record_postprocess_stage(current, snapped, stage="boundary_snap", stage_hits=stage_hits)
+        current = snapped
+
+    if config.get("paired_delimiter_fill", True):
+        wrapped = _refine_wrapped_runs(
+            text,
+            current,
+            char_probs,
+            max_shift=boundary_snap_max_shift,
+        )
+        _record_postprocess_stage(current, wrapped, stage="paired_delimiter_fill", stage_hits=stage_hits)
+        current = wrapped
+
+    if config.get("local_host_fill", True):
+        local_host_filled = _apply_local_host_postprocess_rules(
+            text,
+            current,
+            local_host_rules=local_host_rules,
+            min_run_chars=min_run_chars,
+        )
+        _record_postprocess_stage(current, local_host_filled, stage="local_host_fill", stage_hits=stage_hits)
+        current = local_host_filled
+
+    if config.get("min_run", True):
+        locked_mask = _new_lock_mask(len(labels))
+        _merge_lock_masks(locked_mask, markdown_locked)
+        normalized = _normalize_short_runs(
+            current,
+            char_probs,
+            min_run_chars=min_run_chars,
+            locked_mask=locked_mask,
+        )
+        _record_postprocess_stage(current, normalized, stage="min_run", stage_hits=stage_hits)
+        current = normalized
+
+    if config.get("boundary_snap", True):
+        snapped_relit = _snap_boundaries_to_delimiters(
+            text,
+            current,
+            char_probs,
+            max_shift=boundary_snap_max_shift,
+            min_run_chars=min_run_chars,
+        )
+        _record_postprocess_stage(current, snapped_relit, stage="boundary_snap", stage_hits=stage_hits)
+        current = snapped_relit
+
+    if config.get("paired_delimiter_fill", True):
+        wrapped_relit = _refine_wrapped_runs(
+            text,
+            current,
+            char_probs,
+            max_shift=boundary_snap_max_shift,
+        )
+        _record_postprocess_stage(current, wrapped_relit, stage="paired_delimiter_fill", stage_hits=stage_hits)
+        current = wrapped_relit
+
+    if config.get("markdown_structure_fill", True):
+        markdown_relit, _markdown_relock = _fill_markdown_structure_regions(
+            text,
+            current,
+            char_probs,
+            markdown_label=markdown_label,
+        )
+        _record_postprocess_stage(current, markdown_relit, stage="markdown_structure_fill", stage_hits=stage_hits)
+        current = markdown_relit
+
+    if config.get("local_host_fill", True):
+        final_with_local_host = _apply_local_host_postprocess_rules(
+            text,
+            current,
+            local_host_rules=local_host_rules,
+            min_run_chars=min_run_chars,
+        )
+        _record_postprocess_stage(current, final_with_local_host, stage="local_host_fill", stage_hits=stage_hits)
+        current = final_with_local_host
+    
+    if config.get("newline_snap", True):
+        final_snapped = _snap_newlines_leading_trailing(text, current)
+        _record_postprocess_stage(current, final_snapped, stage="newline_snap", stage_hits=stage_hits)
+        current = final_snapped
+    
+    return current, _build_postprocess_trace(original, current, stage_hits)
 
 
 def _postprocess_char_labels(
@@ -1992,6 +2026,7 @@ def _postprocess_char_labels(
     local_host_rules: Sequence[Tuple[int, int, str]] = (),
     markdown_label: Optional[int] = None,
     html_label: Optional[int] = None,
+    config: Optional[Dict[str, bool]] = None,
 ) -> List[int]:
     final_labels, _trace = _postprocess_char_labels_with_trace(
         text,
@@ -2002,6 +2037,7 @@ def _postprocess_char_labels(
         local_host_rules=local_host_rules,
         markdown_label=markdown_label,
         html_label=html_label,
+        config=config,
     )
     return final_labels
 
@@ -2654,6 +2690,7 @@ class Predictor:
         byte_probs: np.ndarray,
         spans: Sequence[Tuple[int, int]],
         min_run_chars: int,
+        postprocess_config: Optional[Dict[str, bool]] = None,
     ) -> tuple[
         tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]],
         Dict[str, Any],
@@ -2669,6 +2706,7 @@ class Predictor:
             local_host_rules=_configured_local_host_postprocess_rules(),
             markdown_label=_lookup_train_label_id("markdown"),
             html_label=_lookup_train_label_id("html"),
+            config=postprocess_config,
         )
         segs: List[Tuple[int, int, int]] = []
         if len(char_labels) > 0:
@@ -2811,6 +2849,7 @@ class Predictor:
         texts: Sequence[str],
         min_run_chars: int = 5,
         chunk: int = None,
+        postprocess_config: Optional[Dict[str, bool]] = None,
     ) -> List[tuple[List[Tuple[int, int, int]], List[int], List[Dict[str, float]], List[Dict[str, int]]]]:
         byte_arrays = [
             _sanitize_model_bytes(np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8))
@@ -2834,6 +2873,7 @@ class Predictor:
                 byte_probs=byte_probs,
                 spans=spans,
                 min_run_chars=min_run_chars,
+                postprocess_config=postprocess_config,
             )
             results.append(result)
             traces.append(trace)
@@ -2841,8 +2881,19 @@ class Predictor:
         self.last_postprocess_trace = traces[0] if len(traces) == 1 else None
         return results
 
-    def segment_text(self, text: str, min_run_chars: int = 5, chunk: int = None):
-        result = self.segment_texts([text], min_run_chars=min_run_chars, chunk=chunk)[0]
+    def segment_text(
+        self, 
+        text: str, 
+        min_run_chars: int = 5, 
+        chunk: int = None,
+        postprocess_config: Optional[Dict[str, bool]] = None,
+    ):
+        result = self.segment_texts(
+            [text], 
+            min_run_chars=min_run_chars, 
+            chunk=chunk,
+            postprocess_config=postprocess_config,
+        )[0]
         self._last_window_spans = [
             (int(window["start_byte"]), int(window["end_byte"]))
             for window in result[3]

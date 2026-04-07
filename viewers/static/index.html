@@ -22,8 +22,46 @@
         <span class="toggle-text">Show Post-Processing</span>
       </label>
       <button id="runAll" class="btn primary small" title="Run segmentation on all examples">Segment All</button>
+      <button id="settingsBtn" class="btn small" title="Configure Postprocessing Techniques" style="display:flex; align-items:center; justify-content:center; padding: 4px 8px; font-size:16px;">⚙️</button>
     </div>
   </header>
+
+  <!-- Settings Modal -->
+  <div id="settingsModal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Postprocessing Configuration</h3>
+        <button id="closeSettingsBtn" class="btn small">✕</button>
+      </div>
+      <div class="modal-body" id="postprocessConfigForm">
+        <label class="setting-row">
+          <input type="checkbox" name="boundary_snap" checked>
+          <span class="setting-name">Boundary Snap</span>
+          <span class="info-icon" title="A high-precision heuristic that aligns segmentation boundaries with natural text delimiters like brackets, quotes, and semicolons. It corrects cases where the model's prediction is off by a few characters, ensuring segments start and end exactly at logical code boundaries.">ⓘ</span>
+        </label>
+        <label class="setting-row">
+          <input type="checkbox" name="paired_delimiter_fill" checked>
+          <span class="setting-name">Paired Delimiter Fill</span>
+          <span class="info-icon" title="Analyzes matching pairs of characters like parentheses (), square brackets [], and quotes '' or &quot;&quot;. If the model predicts a language change inside a short pair, this stage unifies the content to match the surrounding context, fixing 'holey' or fragmented segments.">ⓘ</span>
+        </label>
+        <label class="setting-row">
+          <input type="checkbox" name="local_host_fill" checked>
+          <span class="setting-name">Local Host Fill</span>
+          <span class="info-icon" title="Applies specialized cleanup rules for specific 'host' languages. For example, if a small JSON snippet is detected inside a Javascript file, this rule ensures the transition is smooth and correctly follows the nesting logic of the primary programming language.">ⓘ</span>
+        </label>
+        <label class="setting-row">
+          <input type="checkbox" name="min_run" checked>
+          <span class="setting-name">Min-Run Normalization</span>
+          <span class="info-icon" title="Enforces a minimum character length for any continuous segment. It eliminates tiny, statistically insignificant label 'islands' (flickering) that are likely artifacts of model uncertainty rather than genuine language transitions.">ⓘ</span>
+        </label>
+        <label class="setting-row">
+          <input type="checkbox" name="newline_snap" checked>
+          <span class="setting-name">Newline Snap</span>
+          <span class="info-icon" title="A final aesthetic pass that cleans up boundaries directly bordering newline (\n) characters. It ensures that leading or trailing whitespace and the newlines themselves are correctly attributed to the preceding or following code block, preventing 'label bleeding' across lines.">ⓘ</span>
+        </label>
+      </div>
+    </div>
+  </div>
 
   <!-- Global tooltip (shared by all examples) -->
   <div id="tooltip" class="tooltip" role="tooltip" aria-hidden="true"></div>

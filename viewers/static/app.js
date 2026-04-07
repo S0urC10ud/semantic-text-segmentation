@@ -150,6 +150,16 @@ function renderStatsInto(holder, stats){
   });
 }
 
+function getPostprocessConfig() {
+  const form = el('#postprocessConfigForm');
+  if(!form) return undefined;
+  const config = {};
+  els('input[type="checkbox"]', form).forEach(cb => {
+    config[cb.name] = !!cb.checked;
+  });
+  return config;
+}
+
 async function runOne(section){
   const idx = parseInt(section.dataset.index, 10);
   const codeEl = section.querySelector('.code');
@@ -176,7 +186,8 @@ async function runOne(section){
       body: JSON.stringify({
         text: codeEl.value,
         min_run: minRun,
-        chunk
+        chunk,
+        postprocess_config: getPostprocessConfig()
       })
     });
     const data = await res.json();
@@ -377,6 +388,23 @@ async function bootstrap(){
   const runAllBtn = el('#runAll');
   if (runAllBtn){
     runAllBtn.addEventListener('click', runAll);
+  }
+
+  // Settings Modal
+  const settingsBtn = el('#settingsBtn');
+  const settingsModal = el('#settingsModal');
+  const closeSettingsBtn = el('#closeSettingsBtn');
+  if (settingsBtn && settingsModal && closeSettingsBtn) {
+    settingsBtn.addEventListener('click', () => settingsModal.classList.remove('hidden'));
+    closeSettingsBtn.addEventListener('click', () => settingsModal.classList.add('hidden'));
+    settingsModal.addEventListener('click', e => {
+      if (e.target === settingsModal) settingsModal.classList.add('hidden');
+    });
+    
+    // Listen to config changes to re-run automatically
+    els('#postprocessConfigForm input[type="checkbox"]').forEach(cb => {
+      cb.addEventListener('change', () => runAll());
+    });
   }
 }
 
