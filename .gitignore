@@ -101,3 +101,5 @@ htmlcov/
 data/
 models/
 output/
+.distributed_eval/*
+evaluation/reports**
