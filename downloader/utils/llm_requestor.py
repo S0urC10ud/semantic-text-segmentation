@@ -1282,103 +1282,15 @@ Your turn:
 <INPUT>
 '''
 
-PROMPT_WITH_CODE_EXECUTION = f"""
-Segment the file embedded between <INPUT> and </INPUT> into its constituent content types (e.g., markdown, shell, python) and reproduce the content accordingly.
-Only treat <INPUT></INPUT> and <OUTPUT></OUTPUT> as control tokens.
-
-Rules:
-- map to one of the following content types: php,csharp,javascript,typescript,go,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,makefile; if nothing fits, use discovered_<lang> or better other_<best_guess> rather than plain "other".
-- be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
-- Within HTML, the `<script>`/`<style>` tags themselves are html wrappers but their bodies are javascript/css even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
-- Inline attributes that embed code are already that code: handlers like onClick/onmouseover/onkeydown are javascript; javascript: URLs (e.g., iframe src="javascript:void(0)") are javascript; inline `style="..."` is css. Drop markers inside the attribute so the embedded language is typed correctly without changing bytes.
-- VERY IMPORTANT: BE SUPER PRECISE FOR FOREIGN CODE INJECTIONS: For instance, inline style attributes must always be split: keep `style="` and closing quotes as html and put the style body in css; do this for every occurrence (no CSS may remain inside html segments).
-- Template languages: In React/JSX/TSX keep tag wrappers/custom components as other_jsx (never plain html); Angular templates that include Angular syntax (e.g., *ngIf, [(ngModel)], {{{{...}}}}, (click)) use other_angular_template for the tag/text wrappers while plain HTML without Angular stays html; Django/Jinja templates use other_django_template for their blocks/tags. Inline `style` stays css; handlers/expressions (e.g., `onClick=...`, `{{{{ title }}}}`, `(click)="save()"`, `{{% if %}}`) are javascript/typescript or template-language content.
-- Comments stay with their host language (e.g., `#` in Dockerfile/python); if a comment hides real executable code (like JS inside a CSS comment), segment that code as its true language while keeping the surrounding comment bytes.
-- Never invent continuation bytes or "helpful" closing tags if SOURCE_TEXT ends abruptly; stop exactly at the final byte even when braces/tags remain open.
-- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands, and label them as encoding_base64/encoding_hex/etc rather than the surrounding language.
-- text or comments belong to the wrapping/adjacent content type.
-- Treat Windows cmd/batch scripts (cmd.exe syntax like @echo off, set VAR, goto/end labels) as shell, not powershell.
-- Key/value configuration files (e.g., spring.datasource.* application.properties) should be labeled as other_application_properties (not java/javascript/shell/etc.).
-- Within HTML, split tiny wrappers from bodies: the `<style>`/`</style>` tags stay html, the CSS inside is css. Even when `<style>...CSS...</style>` or `</style><style>` appear on one line, break into html→css→html so no CSS bytes remain in html segments and no html tags remain in css segments; closing fragments like `</style><` are html.
-- Makefile rule prefixes (targets/assignments like `cmd_foo :=`) are makefile, while the command after the assignment is shell; split them if they coexist on one line.
-- Markdown with YAML front matter: the block from the first `---` through the matching closing `---` is yaml; start markdown after that. Always split front matter out.
-- IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes).
-  - Emit exactly one literal assignment 'segments = [ {{...}}, ... ]'. Build every entry directly inside that literal. Do not call segments.append, loops, helper functions, or reassignment. My tooling parses the AST and only sees literal lists, so any procedural construction fails.
-  - Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly
-- also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types
-- preserve every character exactly as provided (including trailing spaces or backslashes) so SOURCE_TEXT matches the original input.
-- Emit literal characters exactly as they appear: real newlines stay as newline characters, quotes stay as quotes, HTML entities stay as-is; never replace text with escape sequences such as \\n, \\t, \\\" or numeric entities unless those escapes exist in SOURCE_TEXT.
-- When SOURCE_TEXT already encodes characters via literal escape sequences (e.g., \\n, \\r\\n, \\t, \\u2192, \\xNN, \\\"), reproduce those exact backslash sequences instead of decoding them into the actual newline/tab/unicode characters. Keep the bytes verbatim, even inside HTML/JS literals.
-- output only executable Python: define SOURCE_TEXT with the literal data between <INPUT> tags and create a single `segments` list. Do not emit <OUTPUT> tags.
-- Immediately after emitting the final SOURCE_TEXT character, close the surrounding string literal and finish the `segments` list; never start a new literal or statement afterwards.
-- Always finish every opened quote/backtick/triple-quoted string, bracket, brace, or parenthesis before the response ends. Prefer multiple smaller string literals over one huge triple-quoted block if that helps ensure closure.
-- after defining `segments`, run `_assert_segments_cover_source(SOURCE_TEXT, segments)` using the coverage verifier below via the code-execution tool. Do not modify that verifier; just execute it.
-
-Coverage verifier to copy/paste verbatim (expects SOURCE_TEXT and segments):
-
-{COVERAGE_VERIFIER_FUNCTION_CODE}
-{PROMPT_EXAMPLE_BLOCK}
-"""
-
-PROMPT_WITH_LOCAL_VERIFICATION = f"""
-Segment the file embedded between <INPUT> and </INPUT> into its constituent content types (e.g., markdown, shell, python) and reproduce the content accordingly.
-Only treat <INPUT></INPUT> and <OUTPUT></OUTPUT> as control tokens.
-
-Rules:
-- map to one of the following content types: php,csharp,javascript,typescript,sql,rust,yaml,ruby,python,java,c,cpp,json,css,html,csv,shell,powershell,visual_basic,dockerfile,xml,markdown,go,svg,gettext-catalog,scala,swift,restructuredtext,kotlin,dart,encoding_hex,encoding_base64,encoding_base32,encoding_base58,encoding_base85,makefile; if this is not suitable (for the later rules or as it is simply something else), use discovered_<lang> or better other_<best_guess> rather than plain "other".
-- be precise: classify JS/CSS inside HTML as JS/CSS, HTML blocks inside Markdown as HTML, etc.
-- For React/JSX/TSX/Angular/Vue/Django..., tag wrappers/custom components as other_jsx (or other_angular, other_vue, ...), and reserve javascript/typescript for the code inside {{...}} / {{{{...}}}} expressions.
-- For React/JSX/TSX specifically, DO NOT over-split tiny scalar expressions in attributes. It is better to keep an entire attribute or attribute list as other_jsx than to insert many tiny markers around numbers like cx={{13.967}} cy={{13.967}} r={{13}}. You may keep:
-
-    <circle stroke="#FEAE16" cx={{13.967}} cy={{13.967}} r={{13}} />
-
-  entirely as other_jsx instead of splitting out the numeric values.
-- also small segments should be classified appropriately in general (for example, an alert(...) statement within onclick="alert(...)" is javascript, or HTML inside JS strings is html). This DOES NOT require splitting trivial numeric values or very short literals inside JSX attributes when that would introduce many markers inline.- Similarly for django or jinja templates - only the precise django or jinja code have to be tagged as other_django or other_jinja respectively and not as their surrounding context
-- Never label JSX tag wrappers (like <Square ... />) as javascript or html.
-- Within HTML, the `<script>`/`<style>` tags themselves are html wrappers but their bodies are javascript/css even if the tags live inside Markdown or strings; mirror this rule for any other language nests (e.g., SQL embedded in Rust strings).
-- Inline attributes that embed code are already that code: handlers like onClick/onmouseover/onkeydown are javascript; javascript: URLs (e.g., iframe src="javascript:void(0)") are javascript; inline `style="..."` is css. Drop markers inside the attribute so the embedded language is typed correctly without changing bytes.
-- VERY IMPORTANT: BE SUPER PRECISE FOR FOREIGN CODE INJECTIONS: Inline style attributes must always be split: keep `style="` and closing quotes as html and put the style body in css; do this for every occurrence (no CSS may remain inside html segments).
-- Template languages: In React/JSX/TSX keep tag wrappers/custom components as other_jsx (never plain html); Angular templates that include Angular syntax (e.g., *ngIf, [(ngModel)], {{...}}, (click)) use other_angular_template for the tag/text wrappers while plain HTML without Angular stays html; Django/Jinja templates use other_django_template for their blocks/tags. Inline `style` stays css; handlers/expressions (e.g., `onClick=...`, `{{{{ title }}}}`, `(click)="save()"`, `{{% if %}}`) are javascript/typescript or template-language content.
-- Comments stay with their host language (e.g., `#` in Dockerfile/python); if a comment hides real executable code (like JS inside a CSS comment), segment that code as its true language while keeping the surrounding comment bytes.
-- Never invent continuation bytes or "helpful" closing tags if SOURCE_TEXT ends abruptly; stop exactly at the final byte even when braces/tags remain open.
-- When you encounter encoded blobs (e.g., Base64/hex) or other literal payloads, copy the bytes exactly once as-is—do not decode, re-encode, summarize, or append new URLs/commands, and label them as encoding_base64/encoding_hex/etc rather than the surrounding language.
-- text or comments belong to the wrapping/adjacent content type.
-- Treat Windows cmd/batch scripts (cmd.exe syntax like @echo off, set VAR, goto/end labels) as shell, not powershell.
-- Key/value configuration files (e.g., spring.datasource.* application.properties) should be labeled as other_application_properties (not java/javascript/shell/etc.).
-- Within HTML, split tiny wrappers from bodies: the `<style>`/`</style>` tags stay html, the CSS inside is css; similarly keep closing tags like `</style><` as html, not css.
-- Makefile rule prefixes (targets/assignments like `cmd_foo :=`) are makefile, while the command after the assignment is shell; split them if they coexist on one line.
-- Markdown with YAML front matter: the block from the first `---` through the matching closing `---` is yaml; start markdown after that. Always split front matter out.
-- IMPORTANT INSTRUCTION: preserve every character exactly as provided (including trailing spaces or backslashes). Also markdown fences should remain the same type (for instance, if you think there is a powershell block but the author wrote it in a shell-fence, still label it powershell but keep the shell fence in the output bytes) - i.e., keep wrong type hints from the files but label them correctly.
-- also small segments should be classified appropriately - like an alert(...) statement within onclick="alert(...)" should definitely already be JS, or html inside JS strings would be HTML, etc. - generalize this to all content types.
-- Output format: for each contiguous block, emit a marker `<CONTENT-TYPE:<type>>` (no extra text attached) followed immediately by the exact bytes of that block. Repeat marker + bytes for every block so the concatenation of all blocks equals SOURCE_TEXT exactly once.
-- CRITICAL: The substring `<CONTENT-TYPE:` must NEVER appear inside the content bytes of any segment. The ONLY place you may output `<CONTENT-TYPE:` is at the start of a marker line.
-- Never execute code, give verbose outputs, tool instructions, or your own commentary. Do not wrap the response in <OUTPUT> tags or markdown fences --> IMPORTANT: Produce only the alternating sequence of marker lines and raw bytes.
-- The marker lines are control-plane only: they belong strictly between segments, never inside them. Do not insert extra markers inside strings/comments/data; copy the bytes exactly and only switch types when the outer content type truly changes.
-- When you switch types mid-line (e.g., inside a JavaScript string or attribute), place the marker immediately before the next byte with zero extra whitespace/newlines. Never introduce or remove bytes to “make room” for a marker; the bytes emitted after the marker must continue exactly where SOURCE_TEXT continues.
-- Emit literal characters exactly as they appear: real newlines stay as newline characters, quotes stay as quotes, HTML entities stay as-is; never replace text with escape sequences such as \\n, \\t, \\\" or numeric entities unless those escapes exist in SOURCE_TEXT.
-- When SOURCE_TEXT already encodes characters via literal escape sequences (e.g., \\n, \\r\\n, \\t, \\u2192, \\xNN, \\\"), reproduce those exact backslash sequences instead of decoding them into the actual newline/tab/unicode characters. Keep the bytes verbatim, even inside HTML/JS literals.
-- Always finish every opened quote/backtick/triple-quoted string, bracket, brace, or parenthesis in the bytes you reproduce. Since you are copying SOURCE_TEXT exactly, that should happen automatically—do not invent fixes.
-- After you emit the final block, stop immediately; no trailing blank lines or summaries.
-- Again, to illustrate how precise you should be: Any shell commands within dockerfiles should be classified as such. If there is a small inline JS snippet inside HTML it should be highlighted as that, even if it is only about a few bytes! 
-- Another purity checker has determined that the file you will be given is not pure, so likely there will be mixed content types for you to classify!
-
-Reference format:
-{LOCAL_RESPONSE_EXAMPLE}
-"""
-
-
-SYSTEM_PROMPT = (
-    "You are a meticulous text-segmentation and coverage assistant. "
-    "Follow every rule literally, preserve SOURCE_TEXT bytes, and never add commentary or extra output. "
-    "When code execution is enabled you must emit executable Python exactly as specified; "
-    "otherwise emit only the CONTENT-TYPE blocks. "
-    "Emit characters exactly as provided (no synthetic escape sequences), close every quote/bracket you open "
-    "when emitting Python, and never emit partial dictionary entries."
-)
-
-
-def build_prompt(use_code_execution: bool) -> str:
-    return PROMPT_WITH_CODE_EXECUTION if use_code_execution else PROMPT_WITH_LOCAL_VERIFICATION
+def load_dense_prompt() -> tuple[str, str]:
+    import os
+    template_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dense_prompt.template")
+    with open(template_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    parts = content.split("=== USER ===\n")
+    system_prompt = parts[0].replace("=== SYSTEM ===\n", "").strip()
+    user_prompt = parts[1].strip() + "\n"
+    return system_prompt, user_prompt
 
 DEFAULT_SAMPLE_INPUT = """# syntax=docker/dockerfile:1
 
@@ -1642,13 +1554,8 @@ def segment(
     model: str,
     use_code_execution: bool,
 ) -> tuple[str, Any | None]:
-    """
-    Ask Gemini to produce either executable Python (code-execution mode) or
-    CONTENT-TYPE blocks (local verification mode).
-
-    We collect the streamed response text verbatim.
-    """
-    prompt_text = build_prompt(use_code_execution)
+    system_prompt, user_prompt = load_dense_prompt()
+    prompt_text = user_prompt
     contents = [
         types.Content(
             role="user",
@@ -1658,10 +1565,8 @@ def segment(
 
     config_kwargs = {
         "thinking_config": types.ThinkingConfig(thinking_budget=-1),
-        "system_instruction": SYSTEM_PROMPT,
+        "system_instruction": system_prompt,
     }
-    if use_code_execution:
-        config_kwargs["tools"] = [types.Tool(code_execution=types.ToolCodeExecution)]
 
     generate_content_config = types.GenerateContentConfig(**config_kwargs)
 
@@ -1683,29 +1588,13 @@ def segment(
             continue
 
         for part in content_obj.parts:
-            # Collect plain text emitted by the model (sometimes code comes via text).
             if getattr(part, "text", None):
                 print(part.text, end="")
                 str_chunks.append(part.text)
-            # Collect executable code blocks (use .code string).
-            if getattr(part, "executable_code", None):
-                code_str = getattr(part.executable_code, "code", None)
-                if isinstance(code_str, str):
-                    print(code_str)
-                    str_chunks.append(code_str)
-            # We ignore code_execution_result here; it's for display/logging only.
 
     _print_usage_and_pricing(model, usage_metadata)
     generated_code = "".join(str_chunks)
-    if use_code_execution:
-        generated_code = generated_code.strip()
     return generated_code, usage_metadata
-
-
-_OUTER_CODE_FENCE_RE = re.compile(
-    r"^\s*```[^\r\n]*\r?\n(?P<body>.*)\r?\n```\s*$",
-    re.DOTALL,
-)
 
 
 def _strip_markdown_code_fences(text: str) -> str:

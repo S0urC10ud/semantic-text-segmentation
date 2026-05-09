@@ -35,40 +35,7 @@ from downloader.utils import llm_requestor
 import utils.config as cfg
 
 
-ORACLE_RESPONSE_SCHEMA: Dict[str, object] = {
-    "type": "object",
-    "required": ["snippets"],
-    "properties": {
-        "snippets": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["snippet_id", "segments"],
-                "properties": {
-                    "snippet_id": {"type": "string"},
-                    "segments": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["label", "text"],
-                            "properties": {
-                                "label": {
-                                    "type": "string",
-                                    "description": (
-                                        "Use a closed-set training label when possible. "
-                                        "For unsupported template/open-set wrappers, prefer "
-                                        "other_<best_guess> such as other_jsx or other_angular."
-                                    ),
-                                },
-                                "text": {"type": "string"},
-                            },
-                        },
-                    },
-                },
-            },
-        }
-    },
-}
+
 
 
 _LABEL_ALIASES = {
@@ -643,8 +610,6 @@ class GeminiBoundaryOracle:
             thinking_config=types.ThinkingConfig(
                 thinking_level=self._thinking_level_for_sdk(),
             ),
-            response_mime_type="application/json",
-            response_schema=ORACLE_RESPONSE_SCHEMA,
         )
 
     def annotate(self, snippets: Sequence[BoundarySnippet]) -> Dict[str, List[OracleSegment]]:
@@ -743,15 +708,21 @@ class GeminiBoundaryOracle:
 
     @staticmethod
     def _system_instruction() -> str:
-        return (
-            "You are a meticulous text-segmentation and boundary-refinement assistant. "
-            "Follow rules literally, preserve snippet bytes, and output strict JSON only. "
-            "Be highly attentive to small but real boundary changes: even tiny embedded spans "
-            "should be split when there is compelling evidence of a different content type. "
-            "Use closed-set labels whenever they fit; otherwise use an open-set label like "
-            "'other_jsx', 'other_angular' or really 'other_<best_guess>' in general "
-            "so it can be normalized downstream. Never add commentary."
-        )
+        import os
+        template_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "downloader", "active_learning_prompt.template")
+        with open(template_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        parts = content.split("=== USER ===\n")
+        return parts[0].replace("=== SYSTEM ===\n", "").strip()
+
+    @staticmethod
+    def _user_prompt() -> str:
+        import os
+        template_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "downloader", "active_learning_prompt.template")
+        with open(template_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        parts = content.split("=== USER ===\n")
+        return parts[1].strip() + "\n"
 
     @staticmethod
     def _message_content_as_text(content: object) -> str:
@@ -792,7 +763,7 @@ class GeminiBoundaryOracle:
             "model": self._openrouter_model,
             "messages": [
                 {"role": "system", "content": self._system_instruction()},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": self._user_prompt() + prompt},
             ],
             "temperature": 0.0,
         }
@@ -1145,13 +1116,53 @@ class GeminiBoundaryOracle:
         *,
         snippet_text_by_id: Optional[Dict[str, str]] = None,
     ) -> tuple[Dict[str, List[OracleSegment]], Dict[str, str], set[str]]:
+        import re
         parsed_map: Dict[str, List[OracleSegment]] = {}
         parse_failures: Dict[str, str] = {}
         returned_snippet_ids: set[str] = set()
-        parsed = _extract_json_payload(raw_text)
-        raw_items = parsed.get("snippets") if isinstance(parsed, dict) else None
-        if not isinstance(raw_items, list):
-            return parsed_map, parse_failures, returned_snippet_ids
+        
+        snippet_blocks = re.findall(r'<SNIPPET id="([^"]+)">([\s\S]*?)</SNIPPET>', raw_text)
+        
+        for sid, body in snippet_blocks:
+            returned_snippet_ids.add(sid)
+            if not isinstance(snippet_text_by_id, dict) or sid not in snippet_text_by_id:
+                parse_failures[sid] = "unknown_snippet_id"
+                continue
+                
+            parts = body.split('<CONTENT-TYPE:')
+            segs_raw = []
+            for part in parts:
+                if not part:
+                    continue
+                idx = part.find('>')
+                if idx == -1:
+                    continue # malformed
+                label = part[:idx].strip()
+                text = part[idx+1:]
+                segs_raw.append({"label": label, "text": text})
+                
+            missing_text_field = False
+            for seg in segs_raw:
+                if not isinstance(seg.get("text"), str):
+                    missing_text_field = True
+                    break
+            if missing_text_field:
+                parse_failures[sid] = "segments_missing_text_field"
+                continue
+                
+            snippet_text = str(snippet_text_by_id.get(sid, ""))
+            text_chunk_segs = GeminiBoundaryOracle._segments_from_text_chunks(
+                snippet_text,
+                segs_raw,
+            )
+            if text_chunk_segs is not None:
+                parsed_map[sid] = text_chunk_segs
+                if sid in parse_failures:
+                    del parse_failures[sid]
+            else:
+                parse_failures[sid] = "exact_reconstruction_failed"
+                
+        return parsed_map, parse_failures, returned_snippet_ids
         for entry in raw_items:
             if not isinstance(entry, dict):
                 continue
@@ -1533,7 +1544,6 @@ class GeminiBoundaryOracle:
                 sid: str(final_parse_failures.get(sid, "parse_failed"))
                 for sid in final_parse_failed_ids
             },
-            "response_schema": ORACLE_RESPONSE_SCHEMA,
             "allowed_labels": self.allowed_labels,
             "usage_metadata": llm_requestor._serialize_usage_metadata(usage_metadata),
         }
@@ -1596,155 +1606,16 @@ class GeminiBoundaryOracle:
 
     @staticmethod
     def _build_batch_prompt(snippets: Sequence[BoundarySnippet]) -> str:
-        allowed_labels = ", ".join(ALLOWED_LABELS_BY_ID)
-        rules = (
-            "Task: refine uncertain class boundaries for each snippet.\n"
-            "Return valid JSON with this schema:\n"
-            "{'snippets':[{'snippet_id':str,'segments':[{'label':str,'text':str}]}]}.\n"
-            "Rules:\n"
-            "- Return exactly one entry for every provided snippet_id, and include every snippet_id exactly once.\n"
-            "- If you omit any snippet_id, the whole request is considered incomplete.\n"
-            "- Prefer segmenting by exact text chunks: provide `text` and `label` for each segment in order.\n"
-            "- `text` must be exact substring bytes from snippet text; concatenating all segment texts must equal snippet text exactly.\n"
-            "- Segments must cover full snippet text exactly once (after merge), in order, without overlap.\n"
-            "- Do not output `start`/`end`; output only `label` + exact `text` chunks.\n"
-            "- Preserve bytes exactly: never rewrite snippet text content.\n"
-            "- Prefer changing only uncertain boundary regions; keep stable regions intact.\n"
-            f"- Closed-set training labels: {allowed_labels}.\n"
-            "- If content does not match a closed-set label clearly, emit an open-set label "
-            "formatted as `other_<best_guess>` instead of plain `other` when you can name it "
-            "(for example `other_jsx`, `other_angular`, `other_django_template`).\n"
-            "- Open-set `other_<best_guess>` labels will be normalized to `other` downstream for "
-            "training, so prefer the more specific raw label when it is clear.\n"
-            "- Avoid collapsing a whole snippet to a single generic label ('text'/'other') unless truly homogeneous.\n"
-            "- For markdown with frontmatter, the frontmatter block should be labeled as yaml. Other yaml-formatted blocks within the document may also be labeled as yaml if they clearly match that format.\n"
-            "- Prose is `text` only when there is no compelling evidence of a more specific content type (it has a special role). "
-            "Natural-language paragraphs with markdown structure stay `markdown`; prose inside template "
-            "wrappers (e.g. html, markdown, ...) stays with that host language unless there is a clearer embedded type.\n"
-            "- Be precise for embedded code: the examples should give you a feeling for keeping each character in its most precise type (e.g. if there is base64 in javascript in html, each of the parts should be labeled respectively).\n"
-            "- For embedded strings or encodings (e.g., 'key=value'), the 'key=' part and quotes are the host language; only the raw 'value' is the embedded language.\n"
-            "- For HTML-like regions, inline event-handler values and javascript: URLs are javascript_typescript.\n"
-            "- For HTML-like regions, style attribute values are css; style wrappers remain host/wrapper text.\n"
-            "- Use open-set labels especially for template-specific syntax when the surrounding bytes fit a standard type. "
-            "reserve `other_<best_guess>` for the actual template-only bytes. IMPORTANT: Precisely look at the examples to get a feeling of the segmentation task\n"
-            "- For React/JSX/TSX, ordinary markup may stay `html`, but JSX-only syntax such as `className`, "
-            "`onClick={...}`, `{...}` delimiters, fragments, or custom-language syntax that is not common in any other relevant type, like <NewTag> should be `other_jsx`; "
-            "expressions inside `{...}` are `javascript_typescript` - the examples should make this clear.\n"
-            "- For Angular templates, ordinary markup/text may stay `html`, but Angular-only syntax such as "
-            "`*ngIf`, `(click)`, `[(ngModel)]`, or `{{ ... }}` may be `other_angular`; expressions/handlers "
-            "inside those constructs remain `javascript_typescript`.\n"
-            "- For Django/Jinja templates, ordinary markup/text may stay `html`, while template block/expression "
-            "syntax such as `{% ... %}` and `{{ ... }}` may be `other_django_template`.\n"
-            "- Example (correct SVG inline-style split):\n"
-            "  snippet: style=\"font-size:3.88584304px;fill:#00cedb;fill-opacity:1;stroke:none;"
-            "stroke-width:0.29143822;stroke-opacity:1\"></tspan>\n"
-            "  expected segments: [\n"
-            "    {'label':'svg','text':'style=\"'},\n"
-            "    {'label':'css','text':'font-size:3.88584304px;fill:#00cedb;fill-opacity:1;"
-            "stroke:none;stroke-width:0.29143822;stroke-opacity:1'},\n"
-            "    {'label':'svg','text':'\"></tspan>'}\n"
-            "  ]\n"
-            "- In SVG/XML, tag syntax + attribute names/quotes/ids/coords stay svg/xml; "
-            "only the CSS declaration body inside style=\"...\" is css.\n"
-            "- Example (markdown prose stays markdown, not text):\n"
-            "  snippet: ## Release Notes\\nThis paragraph explains the change in prose.\\n- keep bytes exact\\n\n"
-            "  expected segments: [\n"
-            "    {'label':'markdown','text':'## Release Notes\\nThis paragraph explains the change in prose.\\n- keep bytes exact\\n'}\n"
-            "  ]\n"
-            "- Example (true HTML inline handler/style splits still matter):\n"
-            "  snippet: <button style=\"color:red;\" onclick=\"save()\">Go</button>\n"
-            "  expected segments: [\n"
-            "    {'label':'html','text':'<button style=\"'},\n"
-            "    {'label':'css','text':'color:red;'},\n"
-            "    {'label':'html','text':'\" onclick=\"'},\n"
-            "    {'label':'javascript_typescript','text':'save()'},\n"
-            "    {'label':'html','text':'\">Go</button>'}\n"
-            "  ]\n"
-            "- Example (true HTML wrapper with javascript body):\n"
-            "  snippet: <script type=\"text/javascript\">\\ninitMenu();\\n</script>\\n<div onclick=\"save()\">Go</div>\\n\n"
-            "  expected segments: [\n"
-            "    {'label':'html','text':'<script type=\"text/javascript\">\\n'},\n"
-            "    {'label':'javascript_typescript','text':'initMenu();\\n'},\n"
-            "    {'label':'html','text':'</script>\\n<div onclick=\"'},\n"
-            "    {'label':'javascript_typescript','text':'save()'},\n"
-            "    {'label':'html','text':'\">Go</div>\\n'}\n"
-            "  ]\n"
-            "- Example (html/css nested inside a javascript string literal):\n"
-            "  snippet: const snippet = \"<div><style>p{color:red;}</style></div>\";\n"
-            "  expected segments: [\n"
-            "    {'label':'javascript_typescript','text':'const snippet = \"'},\n"
-            "    {'label':'html','text':'<div><style>'},\n"
-            "    {'label':'css','text':'p{color:red;}'},\n"
-            "    {'label':'html','text':'</style></div>'},\n"
-            "    {'label':'javascript_typescript','text':'\";'}\n"
-            "  ]\n"
-            "- Example (Django template syntax is open-set, surrounding markup stays html/css; Note that in this example also user.name is not python but django template language so we keep it as django as well):\n"
-            "  snippet: {% block content %}<div class=\"card\" style=\"color:red;\">Hello {{ user.name }}</div>{% endblock %}\n"
-            "  expected segments: [\n"
-            "    {'label':'other_django_template','text':'{% block content %}'},\n"
-            "    {'label':'html','text':'<div class=\"card\" style=\"'},\n"
-            "    {'label':'css','text':'color:red;'},\n"
-            "    {'label':'html','text':'\">Hello '},\n"
-            "    {'label':'other_django_template','text':'{{ user.name }}'},\n"
-            "    {'label':'html','text':'</div>'},\n"
-            "    {'label':'other_django_template','text':'{% endblock %}'}\n"
-            "  ]\n"
-            "- Example (React JSX uses open-set labels only for JSX-specific syntax - which, in general, contains JS content):\n"
-            "  snippet: return (\\n  <div className={style.content} onClick={handleSave}><span>Save</span></div>\\n);\n"
-            "  expected segments: [\n"
-            "    {'label':'javascript_typescript','text':'return (\\n  '},\n"
-            "    {'label':'html','text':'<div '},\n"
-            "    {'label':'other_jsx','text':'className={'},\n"
-            "    {'label':'javascript_typescript','text':'style.content'},\n"
-            "    {'label':'other_jsx','text':'} '},\n"
-            "    {'label':'other_jsx','text':'onClick={'},\n"
-            "    {'label':'javascript_typescript','text':'handleSave'},\n"
-            "    {'label':'other_jsx','text':'}'},\n"
-            "    {'label':'html','text':'><span>Save</span></div>'},\n"
-            "    {'label':'javascript_typescript','text':'\\n);'}\n"
-            "  ]\n"
-            "- Example (Angular uses open-set labels only for Angular-specific syntax):\n"
-            "  snippet: <div class=\"card\" *ngIf=\"hasCard\">{{ title }}<button (click)=\"save()\">Save</button></div>\n"
-            "  expected segments: [\n"
-            "    {'label':'html','text':'<div class=\"card\" '},\n"
-            "    {'label':'other_angular','text':'*ngIf=\"'},\n"
-            "    {'label':'javascript_typescript','text':'hasCard'},\n"
-            "    {'label':'other_angular','text':'\"'},\n"
-            "    {'label':'html','text':'>'},\n"
-            "    {'label':'other_angular','text':'{{ '},\n"
-            "    {'label':'javascript_typescript','text':'title'},\n"
-            "    {'label':'other_angular','text':' }}'},\n"
-            "    {'label':'html','text':'<button '},\n"
-            "    {'label':'other_angular','text':'(click)=\"'},\n"
-            "    {'label':'javascript_typescript','text':'save()'},\n"
-            "    {'label':'other_angular','text':'\"'},\n"
-            "    {'label':'html','text':'>Save</button></div>'}\n"
-            "  ]\n"
-            "- Keep tiny foreign-code injections typed correctly when boundaries clearly indicate a switch.\n"
-            "- Use predicted_segments as a strong prior unless clearly contradicted by snippet text.\n"
-            "- If `full_file_mode` is true, the input text is a full training/eval sample rather than a tiny local snippet. "
-            "In that case, return a segmentation for the entire text and treat `trigger_ranges` only as hints about where the "
-            "model seemed most uncertain.\n"
-            "- Return exactly one entry for every input snippet_id; never omit any snippet_id.\n"
-            "- Output JSON only.\n"
-        )
-        payload: List[Dict[str, object]] = []
+        payload = ""
         for snippet in snippets:
-            trigger_ranges = snippet.metadata.get("trigger_ranges")
-            if not isinstance(trigger_ranges, list):
-                trigger_ranges = []
-            payload.append(
-                {
-                    "snippet_id": snippet.snippet_id,
-                    "source_lang": str(snippet.metadata.get("source_lang", "")),
-                    "full_file_mode": bool(snippet.metadata.get("full_file_mode", False)),
-                    "boundary_index": int(snippet.boundary),
-                    "trigger_ranges": trigger_ranges,
-                    "predicted_segments": [
-                        {"start": int(seg.start), "end": int(seg.end), "label": str(seg.label)}
-                        for seg in _segments_from_labels(snippet.predicted_labels)
-                    ],
-                    "text": snippet.text,
-                }
-            )
-        return rules + "\nINPUT:\n" + json.dumps({"snippets": payload}, ensure_ascii=False)
+            payload += f'<SNIPPET id="{snippet.snippet_id}" source_lang="{snippet.metadata.get("source_lang", "")}" boundary_index="{snippet.boundary}">\n'
+            payload += '<PREDICTED_SEGMENTS>\n'
+            for seg in _segments_from_labels(snippet.predicted_labels):
+                payload += f'start={seg.start} end={seg.end} label={seg.label}\n'
+            payload += '</PREDICTED_SEGMENTS>\n'
+            payload += '<TEXT>\n'
+            payload += snippet.text + '\n'
+            payload += '</TEXT>\n'
+            payload += '</SNIPPET>\n'
+        
+        return payload

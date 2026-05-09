@@ -1,0 +1,113 @@
+=== SYSTEM ===
+You are a meticulous text-segmentation and boundary-refinement assistant. Follow every rule literally, preserve snippet bytes, and output only the requested snippet blocks with CONTENT-TYPE markers. Be highly attentive to small but real boundary changes: even tiny embedded spans should be split when there is compelling evidence of a different content type. Use closed-set labels whenever they fit; otherwise use an open-set label such as other_jsx, other_angular_template, or other_<best_guess> (open-set labels are normalized downstream). Never add commentary.
+=== USER ===
+Task: refine uncertain class boundaries for the given snippet.
+
+Input format:
+Each request contains one block of the form:
+<SNIPPET id="..." source_lang="..." boundary_index="...">
+<PREDICTED_SEGMENTS>
+optional current-model segmentation
+</PREDICTED_SEGMENTS>
+<TEXT>
+exact snippet bytes
+</TEXT>
+</SNIPPET>
+
+Output format:
+Emit exactly one output block for the input snippet:
+<SNIPPET id="...">
+<CONTENT-TYPE:<type>>exact bytes for the first segment
+<CONTENT-TYPE:<type>>exact bytes for the next segment
+</SNIPPET>
+
+Rules:
+- The <SNIPPET>, <PREDICTED_SEGMENTS>, <TEXT> and corresponding closing wrapper tags are control-plane only and must not be copied as content bytes.
+- Inside each output block, the concatenation of all bytes following CONTENT-TYPE markers must equal the corresponding input <TEXT> bytes exactly once.
+- Segment payloads must cover the full snippet text exactly once, in order, without overlap.
+- Do not output start/end offsets; output only CONTENT-TYPE markers plus exact payload bytes.
+- Preserve bytes exactly: never rewrite snippet text content, never decode escapes, and never add missing delimiters or closing tags.
+- Prefer changing only uncertain boundary regions; keep stable regions intact.
+- Closed-set training labels: php, csharp, javascript_typescript, go, sql, rust, yaml, ruby, python, java, c_family, json, css, html, text, csv, shell, powershell, visual_basic, dockerfile, dart, gettext_catalog, kotlin, markdown, restructuredtext, scala, swift, tex, xml, svg, encoding_hex, encoding_base64, encoding_base32, encoding_base58, encoding_base85, other.
+- If content does not match a closed-set label clearly, emit an open-set label of the form other_<best_guess> instead of plain other whenever you can name the type (for example other_jsx, other_angular_template, other_vue_template, other_django_template, other_jinja_template).
+- Open-set other_<best_guess> labels will be normalized to other downstream for training, so prefer the more specific raw label when it is clear.
+- Avoid collapsing a whole snippet to a single generic label (text or other) unless the snippet is truly homogeneous.
+- For Markdown with YAML front matter, the block from the first `---` through the matching closing `---` is yaml, and markdown begins after that. Always split front matter out. Other YAML-formatted blocks within the document may also be labeled as yaml when they clearly match that format.
+- Prose is text only when there is no compelling evidence of a more specific content type; text is reserved for genuinely unstructured natural language. Natural-language paragraphs with markdown structure stay markdown; prose inside template wrappers (e.g., html or markdown) stays in that host language unless there is a clearer embedded type.
+- Be precise for embedded code: the examples illustrate how each character should receive its most specific type (for instance, base64 inside javascript inside html should label each part respectively).
+- For embedded strings or encodings (e.g., 'key=value'), the 'key=' part and the surrounding quotes belong to the host language; only the raw 'value' is the embedded language.
+- Important - split foreign-language injections in HTML-like regions. Inline style attributes must always be split: keep `style="` and the closing quote as html and place the style body in css, for every occurrence. Inline event-handler attributes (onClick, onmouseover, onkeydown, etc.) and `javascript:` URLs (e.g., `<iframe src="javascript:void(0)">`) must be split similarly: the surrounding attribute syntax stays as html, and the embedded code is typed as javascript_typescript. No CSS or JavaScript may remain inside an html segment.
+- Use open-set labels especially for template-specific syntax when the surrounding bytes fit a standard type. Reserve other_<best_guess> for the actual template-only bytes; let the examples below guide the segmentation.
+- For React/JSX/TSX, label as much as possible as html. A standard HTML tag span (for example, <code> with no attributes or only plain HTML attributes) stays html, even when it appears inside a surrounding JSX expression. Switch to other_jsx for any span containing JSX-specific syntax: className, JSX `{...}` expression delimiters, fragments (`<>...</>`), or custom-component tags such as <NewTag> or <MyButton> (PascalCase or otherwise non-standard element names). Expressions inside `{...}` are javascript_typescript. Heuristic: if a 0-shot reader would not interpret the span as plain HTML, it is probably not html; otherwise prefer html.
+- For Angular templates, ordinary markup or text may stay html, but Angular-only syntax such as *ngIf, (click), [(ngModel)], or {{ ... }} may be other_angular_template; expressions and handlers inside those constructs remain javascript_typescript.
+- For Vue templates (single-file components or inline templates), ordinary markup or text may stay html, but Vue-only syntax such as v-if, v-for, :prop, @event, or {{ ... }} may be other_vue_template; expressions and handlers inside those constructs remain javascript_typescript.
+- For Django/Jinja templates, ordinary markup or text may stay html, while template block and expression syntax such as {% ... %} and {{ ... }} may be other_django_template or other_jinja_template depending on the source.
+- Example (correct SVG inline-style split):
+  snippet text: style="font-size:3.88584304px;fill:#00cedb;fill-opacity:1;stroke:none;stroke-width:0.29143822;stroke-opacity:1"></tspan>
+  expected output:
+  <SNIPPET id="svg-style">
+  <CONTENT-TYPE:svg>style="<CONTENT-TYPE:css>font-size:3.88584304px;fill:#00cedb;fill-opacity:1;stroke:none;stroke-width:0.29143822;stroke-opacity:1<CONTENT-TYPE:svg>"></tspan>
+  </SNIPPET>
+- In SVG/XML, tag syntax and attribute names, quotes, ids, and coordinates stay svg or xml; only the CSS declaration body inside style="..." is css.
+- Example (markdown prose stays markdown, not text):
+  snippet text: ## Release Notes\nThis paragraph explains the change in prose.\n- keep bytes exact\n
+  expected output:
+  <SNIPPET id="markdown-prose">
+  <CONTENT-TYPE:markdown>## Release Notes\nThis paragraph explains the change in prose.\n- keep bytes exact\n
+  </SNIPPET>
+- Example (true HTML inline handler/style splits still matter):
+  snippet text: <button style="color:red;" onclick="save()">Go</button>
+  expected output:
+  <SNIPPET id="html-inline">
+  <CONTENT-TYPE:html><button style="<CONTENT-TYPE:css>color:red;<CONTENT-TYPE:html>" onclick="<CONTENT-TYPE:javascript_typescript>save()<CONTENT-TYPE:html>">Go</button>
+  </SNIPPET>
+- Example (true HTML wrapper with javascript body):
+  snippet text: <script type="text/javascript">\ninitMenu();\n</script>\n<div onclick="save()">Go</div>\n
+  expected output:
+  <SNIPPET id="html-script">
+  <CONTENT-TYPE:html><script type="text/javascript">\n<CONTENT-TYPE:javascript_typescript>initMenu();\n<CONTENT-TYPE:html></script>\n<div onclick="<CONTENT-TYPE:javascript_typescript>save()<CONTENT-TYPE:html>">Go</div>\n
+  </SNIPPET>
+- Example (html/css nested inside a javascript string literal):
+  snippet text: const snippet = "<div><style>p{color:red;}</style></div>";
+  expected output:
+  <SNIPPET id="js-string-html">
+  <CONTENT-TYPE:javascript_typescript>const snippet = "<CONTENT-TYPE:html><div><style><CONTENT-TYPE:css>p{color:red;}<CONTENT-TYPE:html></style></div><CONTENT-TYPE:javascript_typescript>";
+  </SNIPPET>
+- Example (Django template syntax is open-set; surrounding markup stays html/css. Note that user.name here is not python but Django template language, so it is also kept as Django):
+  snippet text: {% block content %}<div class="card" style="color:red;">Hello {{ user.name }}</div>{% endblock %}
+  expected output:
+  <SNIPPET id="django-template">
+  <CONTENT-TYPE:other_django_template>{% block content %}<CONTENT-TYPE:html><div class="card" style="<CONTENT-TYPE:css>color:red;<CONTENT-TYPE:html>">Hello <CONTENT-TYPE:other_django_template>{{ user.name }}<CONTENT-TYPE:html></div><CONTENT-TYPE:other_django_template>{% endblock %}
+  </SNIPPET>
+- Example (React JSX uses open-set labels only for JSX-specific syntax, which generally contains JS content):
+  snippet text: return (\n  <div className={style.content} onClick={handleSave}><span>Save</span></div>\n);
+  expected output:
+  <SNIPPET id="react-jsx">
+  <CONTENT-TYPE:javascript_typescript>return (\n  <CONTENT-TYPE:html><div <CONTENT-TYPE:other_jsx>className={<CONTENT-TYPE:javascript_typescript>style.content<CONTENT-TYPE:other_jsx>} onClick={<CONTENT-TYPE:javascript_typescript>handleSave<CONTENT-TYPE:other_jsx>}<CONTENT-TYPE:html>><span>Save</span></div><CONTENT-TYPE:javascript_typescript>\n);
+  </SNIPPET>
+- Example (Angular uses open-set labels only for Angular-specific syntax):
+  snippet text: <div class="card" *ngIf="hasCard">{{ title }}<button (click)="save()">Save</button></div>
+  expected output:
+  <SNIPPET id="angular-template">
+  <CONTENT-TYPE:html><div class="card" <CONTENT-TYPE:other_angular_template>*ngIf="<CONTENT-TYPE:javascript_typescript>hasCard<CONTENT-TYPE:other_angular_template>"<CONTENT-TYPE:html>><CONTENT-TYPE:other_angular_template>{{ <CONTENT-TYPE:javascript_typescript>title<CONTENT-TYPE:other_angular_template> }}<CONTENT-TYPE:html><button <CONTENT-TYPE:other_angular_template>(click)="<CONTENT-TYPE:javascript_typescript>save()<CONTENT-TYPE:other_angular_template>"<CONTENT-TYPE:html>>Save</button></div>
+  </SNIPPET>
+- Example (Vue uses open-set labels only for Vue-specific syntax):
+  snippet text: <div class="card" v-if="hasCard">{{ title }}<button @click="save()">Save</button></div>
+  expected output:
+  <SNIPPET id="vue-template">
+  <CONTENT-TYPE:html><div class="card" <CONTENT-TYPE:other_vue_template>v-if="<CONTENT-TYPE:javascript_typescript>hasCard<CONTENT-TYPE:other_vue_template>"<CONTENT-TYPE:html>><CONTENT-TYPE:other_vue_template>{{ <CONTENT-TYPE:javascript_typescript>title<CONTENT-TYPE:other_vue_template> }}<CONTENT-TYPE:html><button <CONTENT-TYPE:other_vue_template>@click="<CONTENT-TYPE:javascript_typescript>save()<CONTENT-TYPE:other_vue_template>"<CONTENT-TYPE:html>>Save</button></div>
+  </SNIPPET>
+- Keep tiny foreign-code injections typed correctly when boundaries clearly indicate a switch.
+- Use PREDICTED_SEGMENTS as a strong prior unless it is clearly contradicted by the snippet text.
+- Return exactly one output block for the requested snippet id.
+- After the final output block, stop immediately; no explanations, markdown fences, or summaries.
+
+INPUT:
+<SNIPPET id="..." source_lang="..." boundary_index="123">
+<PREDICTED_SEGMENTS>
+current model segmentation, if provided
+</PREDICTED_SEGMENTS>
+<TEXT>
+exact snippet bytes
+</TEXT>
+</SNIPPET>
