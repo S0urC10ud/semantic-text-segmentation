@@ -13,7 +13,8 @@
 #   3. no_line_inject       — line_inject_prob=0.0 → remaining mass split over pure/mix/md
 #   4. no_markdown_wrap     — markdown_prob=0.0    → remaining mass split over pure/mix/inject
 #
-# The VM auto-stops after all 4 runs finish or any run crashes.
+# The VM auto-stops after all 4 runs finish or immediately if any run crashes.
+# Estimated runtime: ~200 min per run × 4 = ~13 hours total.
 
 set -euo pipefail
 
@@ -44,7 +45,7 @@ echo "=============================="
 sleep 10
 
 su - "${REMOTE_USER}" << 'USEREOF'
-set -uo pipefail
+set -euo pipefail
 
 REPO_DIR="/home/martindallinger2002_gmail_com/semantic-text-segmentation"
 cd "${REPO_DIR}"
@@ -60,6 +61,7 @@ git pull
 #   eval_every=2000, monitor_eval_every=2000, monitor_eval_limit=4096
 #   monitor_other_threshold=0.3, oe_lambda=0.1, oe_ratio=0.05
 #   Capped at 100k steps for ablation.
+#   Estimated ~200 minutes per run (from wandb qwy0hvt2 timings).
 
 COMMON_ARGS=(
     --arch unet1d
@@ -80,14 +82,14 @@ COMMON_ARGS=(
     --num-gpus 1
 )
 
-OVERALL_EXIT=0
+# ──────────────────────────────────────────────────────────────
+# With set -e, any non-zero exit immediately aborts this block,
+# triggering the shutdown below. Runs execute strictly sequentially.
+# ──────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────
-# Ablation 1: No pure windows (pure_prob=0)
+# ── Ablation 1: No pure windows (pure_prob=0) ────────────────
 #   Redistribute 0.65 over mix(0.15), inject(0.15), md(0.10) → ratios 3:3:2
-#   mix=0.15+0.65*(3/8)=0.394, inject=0.15+0.65*(3/8)=0.394, md=0.10+0.65*(2/8)=0.2625
 #   → normalized: mix=0.375, inject=0.375, md=0.25
-# ──────────────────────────────────────────────────────────────
 echo "=============================="
 echo "🔬 Ablation 1/4: No pure windows"
 echo "  \$(date)"
@@ -100,20 +102,11 @@ CUDA_VISIBLE_DEVICES=0 python "${REPO_DIR}/train/main.py" \
     --line_inject_prob 0.375 \
     --markdown_prob 0.25
 
-ABL1_EXIT=\$?
-if [ \$ABL1_EXIT -ne 0 ]; then
-    echo "❌ Ablation 1 (no_pure_windows) CRASHED (exit code \$ABL1_EXIT)"
-    OVERALL_EXIT=1
-else
-    echo "✅ Ablation 1 (no_pure_windows) finished successfully"
-fi
+echo "✅ Ablation 1 (no_pure_windows) finished successfully"
 
-# ──────────────────────────────────────────────────────────────
-# Ablation 2: No mixture concatenation (mix_prob=0)
+# ── Ablation 2: No mixture concatenation (mix_prob=0) ────────
 #   Redistribute 0.15 over pure(0.65), inject(0.15), md(0.10) → ratios 13:3:2
-#   pure=0.65+0.15*(13/18)=0.758, inject=0.15+0.15*(3/18)=0.175, md=0.10+0.15*(2/18)=0.117
 #   → normalized: pure=0.7222, inject=0.1667, md=0.1111
-# ──────────────────────────────────────────────────────────────
 echo "=============================="
 echo "🔬 Ablation 2/4: No mixture concatenation"
 echo "  \$(date)"
@@ -126,19 +119,11 @@ CUDA_VISIBLE_DEVICES=0 python "${REPO_DIR}/train/main.py" \
     --line_inject_prob 0.1667 \
     --markdown_prob 0.1111
 
-ABL2_EXIT=\$?
-if [ \$ABL2_EXIT -ne 0 ]; then
-    echo "❌ Ablation 2 (no_mix_concat) CRASHED (exit code \$ABL2_EXIT)"
-    OVERALL_EXIT=1
-else
-    echo "✅ Ablation 2 (no_mix_concat) finished successfully"
-fi
+echo "✅ Ablation 2 (no_mix_concat) finished successfully"
 
-# ──────────────────────────────────────────────────────────────
-# Ablation 3: No line injection (line_inject_prob=0)
+# ── Ablation 3: No line injection (line_inject_prob=0) ────────
 #   Redistribute 0.15 over pure(0.65), mix(0.15), md(0.10) → ratios 13:3:2
-#   pure=0.7222, mix=0.1667, md=0.1111
-# ──────────────────────────────────────────────────────────────
+#   → normalized: pure=0.7222, mix=0.1667, md=0.1111
 echo "=============================="
 echo "🔬 Ablation 3/4: No line injection"
 echo "  \$(date)"
@@ -151,20 +136,11 @@ CUDA_VISIBLE_DEVICES=0 python "${REPO_DIR}/train/main.py" \
     --line_inject_prob 0.0 \
     --markdown_prob 0.1111
 
-ABL3_EXIT=\$?
-if [ \$ABL3_EXIT -ne 0 ]; then
-    echo "❌ Ablation 3 (no_line_inject) CRASHED (exit code \$ABL3_EXIT)"
-    OVERALL_EXIT=1
-else
-    echo "✅ Ablation 3 (no_line_inject) finished successfully"
-fi
+echo "✅ Ablation 3 (no_line_inject) finished successfully"
 
-# ──────────────────────────────────────────────────────────────
-# Ablation 4: No synthetic markdown wrapping (markdown_prob=0)
+# ── Ablation 4: No synthetic markdown wrapping (markdown_prob=0)
 #   Redistribute 0.10 over pure(0.65), mix(0.15), inject(0.15) → ratios 13:3:3
-#   pure=0.65+0.10*(13/19)=0.7184, mix=0.15+0.10*(3/19)=0.1658, inject=0.15+0.10*(3/19)=0.1658
 #   → normalized: pure=0.6842, mix=0.1579, inject=0.1579
-# ──────────────────────────────────────────────────────────────
 echo "=============================="
 echo "🔬 Ablation 4/4: No synthetic markdown wrapping"
 echo "  \$(date)"
@@ -177,22 +153,10 @@ CUDA_VISIBLE_DEVICES=0 python "${REPO_DIR}/train/main.py" \
     --line_inject_prob 0.1579 \
     --markdown_prob 0.0
 
-ABL4_EXIT=\$?
-if [ \$ABL4_EXIT -ne 0 ]; then
-    echo "❌ Ablation 4 (no_markdown_wrap) CRASHED (exit code \$ABL4_EXIT)"
-    OVERALL_EXIT=1
-else
-    echo "✅ Ablation 4 (no_markdown_wrap) finished successfully"
-fi
+echo "✅ Ablation 4 (no_markdown_wrap) finished successfully"
 
 echo "=============================="
-echo "📊 Ablation study complete"
-echo "  Exit codes: abl1=\$ABL1_EXIT abl2=\$ABL2_EXIT abl3=\$ABL3_EXIT abl4=\$ABL4_EXIT"
-if [ \$OVERALL_EXIT -eq 0 ]; then
-    echo "  ✅ All 4 ablation runs succeeded!"
-else
-    echo "  ⚠️  Some runs failed — check wandb for partial results."
-fi
+echo "📊 All 4 ablation runs completed successfully!"
 echo "  \$(date)"
 echo "=============================="
 USEREOF
@@ -241,8 +205,9 @@ echo "     2. no_mix_concat        (mix_prob=0)"
 echo "     3. no_line_inject       (line_inject_prob=0)"
 echo "     4. no_markdown_wrap     (markdown_prob=0)"
 echo ""
+echo "  ⏱️  Estimated: ~200 min/run × 4 = ~13 hours total"
 echo "  ✅ All runs log directly to wandb project 'code-segmentation-v2'"
-echo "  ✅ VM auto-stops after all runs finish OR any run crashes."
+echo "  ✅ VM auto-stops after completion OR immediately on error."
 echo ""
 echo "  To monitor logs:"
 echo "    gcloud compute ssh ${REMOTE_USER}@${INSTANCE} \\"
