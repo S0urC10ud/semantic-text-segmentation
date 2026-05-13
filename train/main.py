@@ -438,6 +438,30 @@ def main():
         help="Probability of enabling curated language pair mixing/transitivity (0 disables, default).",
     )
     parser.add_argument(
+        "--pure_prob",
+        type=float,
+        default=None,
+        help="Override probability of pure (single-language) windows (default from DataConfig: 0.65).",
+    )
+    parser.add_argument(
+        "--mix_prob",
+        type=float,
+        default=None,
+        help="Override probability of mixed (concatenation) windows (default from DataConfig: 0.15).",
+    )
+    parser.add_argument(
+        "--line_inject_prob",
+        type=float,
+        default=None,
+        help="Override probability of line-injection windows (default from DataConfig: 0.15).",
+    )
+    parser.add_argument(
+        "--markdown_prob",
+        type=float,
+        default=None,
+        help="Override probability of synthetic markdown wrapping windows (default from DataConfig: 0.1).",
+    )
+    parser.add_argument(
         "--lang",
         dest="langs",
         action="append",
@@ -892,6 +916,15 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
+    # Override mode probabilities when provided via CLI (for ablation studies).
+    if args.pure_prob is not None:
+        d_cfg.pure_prob = max(0.0, float(args.pure_prob))
+    if args.mix_prob is not None:
+        d_cfg.mix_prob = max(0.0, float(args.mix_prob))
+    if args.line_inject_prob is not None:
+        d_cfg.line_inject_prob = max(0.0, float(args.line_inject_prob))
+    if args.markdown_prob is not None:
+        d_cfg.markdown_prob = max(0.0, float(args.markdown_prob))
     if bool(args.full_files):
         full_len = max(1, int(args.full_file_max_bytes))
         d_cfg.window_min_bytes = full_len
