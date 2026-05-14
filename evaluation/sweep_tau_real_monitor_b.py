@@ -38,6 +38,7 @@ if str(TRAIN_ROOT) not in sys.path:
 import utils.config as cfg
 from utils.metrics_helper import _valid_metric_mask
 from utils.monitor_eval import load_monitor_memmaps
+from magika_label_map import THESIS_ENCODING_LABELS
 
 DEFAULT_MAMBA_CHUNK = 10000
 
@@ -58,6 +59,7 @@ DEFAULT_CHANNELS = _EVALMOD.DEFAULT_CHANNELS
 SegmenterRunner = _EVALMOD.SegmenterRunner
 _apply_label_mapping = _EVALMOD._apply_label_mapping
 _load_checkpoint_hparams = _EVALMOD._load_checkpoint_hparams
+DEFAULT_MAGIKA_CHUNK = getattr(_EVALMOD, "DEFAULT_MAGIKA_WINDOW_SIZE", int(cfg.MODEL_WINDOW_BYTES))
 
 
 def _parse_channels(channels: Optional[str]) -> Optional[List[int]]:
@@ -283,7 +285,35 @@ def _select_score(row: Mapping[str, Any], select_by: str) -> float:
 def _resolve_runner_args(
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    ckpt_path = Path(args.checkpoint).resolve()
+    requested_arch = str(args.arch or "").lower().strip()
+    checkpoint_arg = str(args.checkpoint or "").strip()
+    is_magika = requested_arch == "magika" or checkpoint_arg.startswith("magika://")
+
+    if is_magika:
+        channels_cli = _parse_channels(args.channels)
+        channels = [int(ch) for ch in (channels_cli or DEFAULT_CHANNELS)]
+        resolved_magika: Dict[str, Any] = {
+            "checkpoint": checkpoint_arg or "magika://default",
+            "arch": "magika",
+            "model_dim": int(args.model_dim or 256),
+            "dtype": str(args.dtype or "bfloat16").rsplit(".", 1)[-1],
+            "chunk": int(args.chunk if args.chunk is not None else DEFAULT_MAGIKA_CHUNK),
+            "channels": channels,
+            "device": str(args.device),
+            "batch_size": int(args.batch_size),
+            "inference_backend": str(args.inference_backend),
+            "mamba_layers": int(args.mamba_layers or 6),
+            "mamba_d_state": int(args.mamba_d_state or 8),
+            "mamba_expand": int(args.mamba_expand or 1),
+            "mamba_dt_rank": int(args.mamba_dt_rank or 16),
+            "mamba_conv": int(args.mamba_conv or 4),
+            "mamba_bidirectional": bool(True if args.mamba_bidirectional is None else args.mamba_bidirectional),
+        }
+        runner_kwargs = dict(resolved_magika)
+        runner_kwargs.pop("checkpoint")
+        return resolved_magika, runner_kwargs
+
+    ckpt_path = Path(checkpoint_arg).resolve()
     auto_hparams = _load_checkpoint_hparams(ckpt_path)
     inferred_hparams = _infer_hparams_from_checkpoint(ckpt_path)
 
@@ -498,7 +528,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default=str(REPO_ROOT / "checkpoints" / "sweeps" / "sfullfiles3.msgpack"),
+        default="",
         help="Checkpoint path (.msgpack or Orbax directory).",
     )
     parser.add_argument(
@@ -559,9 +589,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--chunk",
         type=int,
         default=None,
-        help="Inference chunk size. Defaults to 10000 for Mamba and 1536 for U-Net.",
+        help="Inference chunk size. Defaults to 10000 for Mamba and 1536 for U-Net/Magika.",
     )
-    parser.add_argument("--arch", type=str, choices=("unet1d", "mamba"), default=None)
+    parser.add_argument("--arch", type=str, choices=("unet1d", "mamba", "magika"), default=None)
     parser.add_argument("--model-dim", type=int, default=None)
     parser.add_argument("--channels", type=str, default=None)
     parser.add_argument("--dtype", type=str, default=None)
@@ -577,6 +607,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--out-csv", type=str, default="")
     parser.add_argument("--out-json", type=str, default="")
+    parser.add_argument(
+        "--exclude-truth-labels",
+        nargs="*",
+        default=(),
+        help="Skip any monitor_b file whose truth segments contain one of these labels.",
+    )
     return parser.parse_args(argv)
 
 
@@ -584,12 +620,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     tau_grid = _build_tau_grid(args)
     monitor_root = Path(args.monitor_root).resolve()
+    excluded_truth_labels = tuple(
+        str(label).strip()
+        for label in (args.exclude_truth_labels or ())
+        if str(label).strip()
+    )
+    excluded_truth_labels_set = set(excluded_truth_labels)
+    excluded_truth_label_ids = {
+        int(cfg.LANG2ID[label])
+        for label in excluded_truth_labels_set
+        if label in cfg.LANG2ID
+    }
 
     resolved_runner, runner_kwargs = _resolve_runner_args(args)
-    ckpt_path = Path(resolved_runner["checkpoint"]).resolve()
+    resolved_checkpoint = str(resolved_runner["checkpoint"])
     print(
         "Resolved model config: "
-        f"checkpoint={ckpt_path} "
+        f"checkpoint={resolved_checkpoint} "
         f"arch={resolved_runner['arch']} "
         f"model_dim={resolved_runner['model_dim']} "
         f"dtype={resolved_runner['dtype']} "
@@ -606,6 +653,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"dt_rank={resolved_runner['mamba_dt_rank']} "
             f"conv={resolved_runner['mamba_conv']} "
             f"bidirectional={bool(resolved_runner['mamba_bidirectional'])}",
+            flush=True,
+        )
+    if excluded_truth_labels:
+        print(
+            "Excluded truth labels: " + ", ".join(excluded_truth_labels),
             flush=True,
         )
 
@@ -651,10 +703,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     files_used = 0
     skipped = 0
+    skipped_for_truth_label = 0
     raw_bytes = 0
     valid_tokens = 0
     truth_other_tokens = 0
     started_at = time.perf_counter()
+    skipped_label_counts: Dict[str, int] = {}
 
     for position, file_idx in enumerate(subset_indices, start=1):
         row = files[int(file_idx)]
@@ -665,18 +719,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         byte_start = int(row["byte_start"])
         seg_start = int(row["seg_start"])
         seg_count = int(row["seg_count"])
-
-        file_bytes = np.asarray(
-            contents[byte_start : byte_start + byte_len],
-            dtype=np.uint8,
-        )
         truth = np.full((byte_len,), cfg.PAD_ID, dtype=np.uint8)
+        file_truth_label_names = set()
+        file_has_excluded_truth_label = False
         for seg in segments[seg_start : seg_start + seg_count]:
             seg_s = int(seg["start"])
             seg_e = int(seg["end"])
             if seg_e <= seg_s:
                 continue
-            truth[seg_s:seg_e] = int(seg["label"])
+            seg_label = int(seg["label"])
+            truth[seg_s:seg_e] = seg_label
+            if seg_label in excluded_truth_label_ids:
+                file_has_excluded_truth_label = True
+            label_name = cfg.ID2LANG.get(seg_label)
+            if label_name is not None:
+                file_truth_label_names.add(str(label_name))
+
+        if excluded_truth_label_ids and file_has_excluded_truth_label:
+            skipped += 1
+            skipped_for_truth_label += 1
+            for label_name in sorted(file_truth_label_names.intersection(excluded_truth_labels_set)):
+                skipped_label_counts[label_name] = int(skipped_label_counts.get(label_name, 0)) + 1
+            continue
+
+        file_bytes = np.asarray(
+            contents[byte_start : byte_start + byte_len],
+            dtype=np.uint8,
+        )
 
         if use_fast_path:
             pred, probs = runner._segment_bytes(file_bytes)
@@ -731,7 +800,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             rate = float(position) / elapsed if elapsed > 0.0 else 0.0
             print(
                 f"[progress] {position}/{int(subset_indices.shape[0])} files "
-                f"processed={files_used} skipped={skipped} valid_tokens={valid_tokens} "
+                f"processed={files_used} skipped={skipped} skipped_for_truth_label={skipped_for_truth_label} "
+                f"valid_tokens={valid_tokens} "
                 f"truth_other_tokens={truth_other_tokens} files_per_sec={rate:.2f}",
                 flush=True,
             )
@@ -781,7 +851,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     payload = {
-        "checkpoint": str(ckpt_path),
+        "checkpoint": str(resolved_checkpoint),
         "monitor_root": str(monitor_root),
         "subset_seed": int(args.subset_seed),
         "limit_files": int(args.limit_files),
@@ -789,6 +859,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "files_selected": int(subset_indices.shape[0]),
         "files_used": int(files_used),
         "skipped": int(skipped),
+        "skipped_for_truth_label": int(skipped_for_truth_label),
+        "excluded_truth_labels": list(excluded_truth_labels),
+        "skipped_label_counts": dict(sorted(skipped_label_counts.items())),
         "raw_bytes": int(raw_bytes),
         "valid_tokens": int(valid_tokens),
         "truth_other_tokens": int(truth_other_tokens),

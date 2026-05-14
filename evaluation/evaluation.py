@@ -77,6 +77,8 @@ from inference.backend import (  # noqa: E402
     format_auto_fallback_message,
 )
 from inference.mamba_cuda import has_cuda_mamba_kernel  # noqa: E402
+from magika_label_map import THESIS_ENCODING_LABELS  # noqa: E402
+from magika_windowed import DEFAULT_MAGIKA_WINDOW_SIZE, SlidingWindowMagikaSegmenter  # noqa: E402
 import utils.config as cfg  # noqa: E402
 from utils.model import (  # noqa: E402
     Mamba1D,
@@ -128,6 +130,11 @@ _TEXT_LIKE_ID2LABEL: Dict[int, str] = {
     0: "not_text_like",
     1: "text_like",
 }
+MAGIKA_REDUCED_SUPPORT_NOTE = (
+    "Encoding-related injections and full-file evaluations were excluded before scoring. "
+    "This Magika baseline is therefore evaluated on an easier reduced-support subset and "
+    "should only be compared on the remaining counted samples/files."
+)
 
 
 def normalize_eval_text(text: Optional[str]) -> str:
@@ -329,13 +336,18 @@ def _available_backends() -> Set[str]:
 
 def _assert_unet_chunk_size(arch: str, chunk: int) -> None:
     arch_name = str(arch).lower().strip()
-    if arch_name != "unet1d":
+    if arch_name not in {"unet1d", "magika"}:
         return
-    required = int(cfg.MODEL_WINDOW_BYTES)
+    required = int(cfg.MODEL_WINDOW_BYTES if arch_name == "unet1d" else DEFAULT_MAGIKA_WINDOW_SIZE)
     actual = int(chunk)
     if actual != required:
+        if arch_name == "unet1d":
+            raise ValueError(
+                "U-Net evaluation must use the fixed 1536-byte chunk size. "
+                f"Received chunk={actual}. Re-run with --chunk {required}."
+            )
         raise ValueError(
-            "U-Net evaluation must use the fixed 1536-byte chunk size. "
+            "Magika sliding-window evaluation must use the fixed 1536-byte chunk size. "
             f"Received chunk={actual}. Re-run with --chunk {required}."
         )
 
@@ -607,7 +619,7 @@ def _smooth_min_run(labels: List[int], min_run: int) -> List[int]:
 class SegmenterRunner:
     def __init__(
         self,
-        checkpoint_path: str,
+        checkpoint_path: Optional[str],
         *,
         arch: str = "unet1d",
         model_dim: int,
@@ -625,12 +637,20 @@ class SegmenterRunner:
         inference_backend: str = "auto",
         full_memory_budget_bytes: Optional[int] = None,
     ):
-        backend = _resolve_backend(device)
-        available = _available_backends()
-        if backend is not None and backend not in available:
-            raise RuntimeError(
-                f"Requested backend '{backend}' not available. Available: {sorted(available)}"
-            )
+        self.arch = str(arch).lower().strip()
+        requested_device = str(device or "auto").lower().strip()
+        backend: Optional[str]
+        if self.arch == "magika":
+            if requested_device not in {"", "auto", "cpu"}:
+                raise RuntimeError("Magika evaluation currently supports CPU execution only.")
+            backend = "cpu"
+        else:
+            backend = _resolve_backend(device)
+            available = _available_backends()
+            if backend is not None and backend not in available:
+                raise RuntimeError(
+                    f"Requested backend '{backend}' not available. Available: {sorted(available)}"
+                )
         self.backend = backend
         self.inference_backend = str(inference_backend).lower().strip()
         if self.inference_backend not in {"auto", "fast", "legacy"}:
@@ -642,9 +662,41 @@ class SegmenterRunner:
         if self.chunk <= 0:
             raise ValueError("Chunk size must be positive.")
         self.batch_size = int(batch_size)
-        self.num_classes = cfg.NUM_CLASSES
-        self.arch = str(arch).lower().strip()
         _assert_unet_chunk_size(self.arch, self.chunk)
+        self._magika_segmenter: Optional[SlidingWindowMagikaSegmenter] = None
+        self.magika_module_version: Optional[str] = None
+        self.magika_model_name: Optional[str] = None
+        self.num_classes = (
+            int(getattr(cfg, "OTHER_CLASS_INDEX", cfg.NUM_CLASSES - 1)) + 1
+            if self.arch == "magika"
+            else int(cfg.NUM_CLASSES)
+        )
+        if self.arch == "magika":
+            self._weight_cache = {}
+            self.model = None
+            self.fast_model = None
+            self.params = None
+            self.channels = ()
+            self._apply_legacy = None
+            self._apply_fast = None
+            self._apply = None
+            self._fast_engine = None
+            other_idx = getattr(cfg, "OTHER_CLASS_INDEX", None)
+            if other_idx is None:
+                raise RuntimeError("Magika evaluation requires cfg.OTHER_CLASS_INDEX.")
+            self._magika_segmenter = SlidingWindowMagikaSegmenter(
+                label_to_id=cfg.LANG2ID,
+                other_class_index=int(other_idx),
+                batch_size=self.batch_size,
+                window_size=self.chunk,
+            )
+            self.magika_module_version = self._magika_segmenter.module_version
+            self.magika_model_name = self._magika_segmenter.model_name
+            return
+
+        if not checkpoint_path:
+            raise RuntimeError(f"Architecture '{self.arch}' requires a checkpoint path.")
+
         dt = getattr(jnp, dtype)
         requested_channels = tuple(int(ch) for ch in channels)
         self._weight_cache: Dict[int, np.ndarray] = {}
@@ -796,6 +848,10 @@ class SegmenterRunner:
         return cached
 
     def _segment_bytes_legacy(self, byte_arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if self.arch == "magika":
+            if self._magika_segmenter is None:
+                raise RuntimeError("Magika runner is not initialized.")
+            return self._magika_segmenter.segment_bytes(byte_arr)
         byte_arr = sanitize_bytes(byte_arr)
         N = int(len(byte_arr))
         if N == 0:
@@ -843,6 +899,8 @@ class SegmenterRunner:
         return out_bytes, probs_accum
 
     def _segment_bytes(self, byte_arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if self.arch == "magika":
+            return self._segment_bytes_legacy(byte_arr)
         if self.inference_backend == "legacy" or self._fast_engine is None:
             return self._segment_bytes_legacy(byte_arr)
         try:
@@ -880,6 +938,8 @@ class SegmenterRunner:
         return labels
 
     def _segment_bytes_labels_only(self, byte_arr: np.ndarray) -> np.ndarray:
+        if self.arch == "magika":
+            return self._segment_bytes_labels_only_legacy(byte_arr)
         if self.inference_backend == "legacy" or self._fast_engine is None:
             return self._segment_bytes_labels_only_legacy(byte_arr)
         try:
@@ -919,6 +979,10 @@ class SegmenterRunner:
         arrays = [sanitize_bytes(np.asarray(arr, dtype=np.uint8)) for arr in byte_arrays]
         if not arrays:
             return [], []
+        if self.arch == "magika":
+            if self._magika_segmenter is None:
+                raise RuntimeError("Magika runner is not initialized.")
+            return self._magika_segmenter.segment_byte_arrays_batch_labels_only(arrays)
         if self.inference_backend == "legacy" or self._fast_engine is None:
             labels = [self._segment_bytes_labels_only_legacy(arr) for arr in arrays]
             spans = [build_window_spans(int(arr.shape[0]), self.chunk) for arr in arrays]
@@ -957,10 +1021,18 @@ class SegmenterRunner:
             raise
 
     def clear_fast_execution_history(self) -> None:
+        if self.arch == "magika":
+            if self._magika_segmenter is not None:
+                self._magika_segmenter.clear_execution_history()
+            return
         if self._fast_engine is not None:
             self._fast_engine.execution_history.clear()
 
     def get_fast_execution_history(self) -> List[Any]:
+        if self.arch == "magika":
+            if self._magika_segmenter is None:
+                return []
+            return self._magika_segmenter.get_execution_history()
         if self._fast_engine is None:
             return []
         return list(self._fast_engine.execution_history)
@@ -1133,6 +1205,77 @@ def _normalize_segments(segments) -> List[Dict[str, int]]:
             normalized.append({"label": str(label), "char_start": start_i, "char_end": end_i})
         return normalized
     raise TypeError(f"Unsupported segments type: {type(segments)}")
+
+
+def _normalize_truth_label_exclusions(excluded_labels: Optional[Sequence[str]]) -> Set[str]:
+    return {
+        str(label).strip()
+        for label in (excluded_labels or ())
+        if str(label).strip()
+    }
+
+
+def _excluded_truth_labels_in_segments(
+    segments,
+    excluded_labels: Optional[Sequence[str]],
+) -> Tuple[str, ...]:
+    excluded = _normalize_truth_label_exclusions(excluded_labels)
+    if not excluded:
+        return ()
+    found = {
+        str(seg.get("label")).strip()
+        for seg in _normalize_segments(segments)
+        if str(seg.get("label")).strip() in excluded
+    }
+    return tuple(sorted(found))
+
+
+def _truth_label_exclusion_payload(
+    *,
+    requested_total: int,
+    excluded_labels: Optional[Sequence[str]],
+    unit_name: str,
+) -> Optional[Dict[str, Any]]:
+    normalized = sorted(_normalize_truth_label_exclusions(excluded_labels))
+    if not normalized:
+        return None
+    return {
+        "unit": str(unit_name),
+        "requested_labels": list(normalized),
+        "requested": int(requested_total),
+        "counted": 0,
+        "skipped_for_truth_label": 0,
+        "skipped_label_counts": {},
+    }
+
+
+def _record_truth_label_exclusion_skip(
+    payload: Optional[Dict[str, Any]],
+    skipped_labels: Sequence[str],
+) -> None:
+    if payload is None:
+        return
+    payload["skipped_for_truth_label"] = int(payload.get("skipped_for_truth_label", 0)) + 1
+    label_counts = payload.setdefault("skipped_label_counts", {})
+    for label in skipped_labels:
+        label_counts[str(label)] = int(label_counts.get(str(label), 0)) + 1
+
+
+def _truth_label_exclusion_note(
+    *,
+    arch: str,
+    excluded_labels: Optional[Sequence[str]],
+) -> Optional[str]:
+    normalized = _normalize_truth_label_exclusions(excluded_labels)
+    if not normalized:
+        return None
+    if str(arch).lower().strip() == "magika" and normalized == set(THESIS_ENCODING_LABELS):
+        return MAGIKA_REDUCED_SUPPORT_NOTE
+    labels_text = ", ".join(sorted(normalized))
+    return (
+        "Samples/files whose ground-truth labels contain any of the following labels were "
+        f"excluded before scoring: {labels_text}."
+    )
 
 
 def _segments_to_labels(content: str, segments: Sequence[dict], label_map: Dict[str, int]) -> np.ndarray:
@@ -1637,6 +1780,7 @@ def _evaluate_full_monitor_b(
     runner: "SegmenterRunner",
     *,
     other_threshold: float = 0.0,
+    excluded_truth_labels: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     monitor_data = load_monitor_memmaps(Path(monitor_root).resolve())
     files = monitor_data["files"]
@@ -1648,11 +1792,22 @@ def _evaluate_full_monitor_b(
     inference_mode = (
         "full_file_auto_with_stream_fallback"
         if use_mamba_path
-        else "sliding_window_legacy"
+        else ("sliding_window_magika_rawdl" if arch == "magika" else "sliding_window_legacy")
     )
 
     start_time = time.perf_counter()
     other_id = getattr(cfg, "OTHER_CLASS_INDEX", None)
+    excluded_truth_labels_set = _normalize_truth_label_exclusions(excluded_truth_labels)
+    excluded_truth_label_ids = {
+        int(cfg.LANG2ID[label])
+        for label in excluded_truth_labels_set
+        if label in cfg.LANG2ID
+    }
+    truth_label_exclusions = _truth_label_exclusion_payload(
+        requested_total=int(len(files)),
+        excluded_labels=excluded_truth_labels,
+        unit_name="files",
+    )
     use_other_threshold = (
         other_id is not None
         and other_threshold is not None
@@ -1672,6 +1827,7 @@ def _evaluate_full_monitor_b(
     }
     files_used = 0
     skipped = 0
+    skipped_for_truth_label = 0
     evaluated_bytes = 0
     raw_bytes = 0
     low_confidence_bytes = 0
@@ -1697,17 +1853,34 @@ def _evaluate_full_monitor_b(
             else ("other" if other_id is not None and int(row["type_id"]) == int(other_id) else "")
         )
         truth = np.full((byte_len,), cfg.PAD_ID, dtype=np.uint8)
+        file_truth_label_names: Set[str] = set()
+        file_has_excluded_truth_label = False
         for seg in segments[seg_start : seg_start + seg_count]:
             start = int(seg["start"])
             end = int(seg["end"])
             if end <= start:
                 continue
-            truth[start:end] = int(seg["label"])
+            seg_label = int(seg["label"])
+            truth[start:end] = seg_label
+            if seg_label in excluded_truth_label_ids:
+                file_has_excluded_truth_label = True
+            label_name = cfg.ID2LANG.get(seg_label)
+            if label_name is not None:
+                file_truth_label_names.add(str(label_name))
+
+        if excluded_truth_label_ids and file_has_excluded_truth_label:
+            skipped += 1
+            skipped_for_truth_label += 1
+            matched_labels = tuple(
+                sorted(file_truth_label_names.intersection(excluded_truth_labels_set))
+            )
+            _record_truth_label_exclusion_skip(truth_label_exclusions, matched_labels)
+            continue
 
         if use_mamba_path:
             pred, probs = runner._segment_bytes(file_bytes)
         else:
-            pred, probs = runner._segment_bytes_legacy(file_bytes)
+            pred, probs = runner._segment_bytes(file_bytes) if arch == "magika" else runner._segment_bytes_legacy(file_bytes)
         pred = np.asarray(pred, dtype=np.int32).reshape(-1)
         probs = np.asarray(probs, dtype=np.float32)
         if int(pred.shape[0]) != byte_len:
@@ -1812,6 +1985,7 @@ def _evaluate_full_monitor_b(
             "files_total": int(len(files)),
             "files_used": int(files_used),
             "skipped": int(skipped),
+            "skipped_for_truth_label": int(skipped_for_truth_label),
             "evaluated_bytes": int(evaluated_bytes),
             "raw_bytes": int(raw_bytes),
             "truth_other_bytes": int(truth_other_bytes),
@@ -1819,6 +1993,9 @@ def _evaluate_full_monitor_b(
             "elapsed_seconds": float(time.perf_counter() - start_time),
         }
     )
+    if truth_label_exclusions is not None:
+        truth_label_exclusions["counted"] = int(files_used)
+        metrics_payload["truth_label_exclusions"] = truth_label_exclusions
     return metrics_payload
 
 
@@ -2166,12 +2343,21 @@ def evaluate_task(
     *,
     min_run_chars: int,
     other_threshold: float = 0.0,
+    excluded_truth_labels: Optional[Sequence[str]] = None,
 ) -> TaskMetrics:
     total_samples = len(dataset)
+    excluded_truth_label_set = _normalize_truth_label_exclusions(excluded_truth_labels)
+    truth_label_exclusions = _truth_label_exclusion_payload(
+        requested_total=total_samples,
+        excluded_labels=excluded_truth_labels,
+        unit_name="samples",
+    )
     # Always include an 'other' bucket for open-set handling.
     label_candidates = {"other"}
     for example in dataset:
         for seg in _normalize_segments(example["segments"]):
+            if str(seg["label"]).strip() in excluded_truth_label_set:
+                continue
             label_candidates.add(seg["label"])
     for alias_target in PREDICTION_LABEL_ALIASES.values():
         label_candidates.add(alias_target)
@@ -2188,6 +2374,9 @@ def evaluate_task(
     per_label_counts: Dict[str, int] = {label: 0 for label in label_names}
     per_label_correct: Dict[str, int] = {label: 0 for label in label_names}
     extra_payload: Dict[str, Any] = {}
+    counted_samples = 0
+    if truth_label_exclusions is not None:
+        extra_payload["truth_label_exclusions"] = truth_label_exclusions
 
     pure_stats: Optional[Dict[str, int]] = None
     if name == "pure_fragments":
@@ -2387,6 +2576,14 @@ def evaluate_task(
 
     for idx, example in enumerate(dataset):
         row = example if isinstance(example, dict) else dict(example)
+        skipped_truth_labels = _excluded_truth_labels_in_segments(
+            row.get("segments"),
+            excluded_truth_labels,
+        )
+        if skipped_truth_labels:
+            _record_truth_label_exclusion_skip(truth_label_exclusions, skipped_truth_labels)
+            continue
+        counted_samples += 1
         raw_content = row.get("content")
         content = normalize_eval_text(raw_content if isinstance(raw_content, str) else "")
         metadata = _parse_metadata(row)
@@ -3340,11 +3537,13 @@ def evaluate_task(
     if markdown_stats is not None and text_like_confusion is not None:
         markdown_stats["text_like_binary"] = _build_text_like_binary_payload(text_like_confusion)
     extra_payload["elapsed_seconds"] = elapsed_total
+    if truth_label_exclusions is not None:
+        truth_label_exclusions["counted"] = int(counted_samples)
 
     return TaskMetrics(
         name=name,
         description=description,
-        samples=total_samples,
+        samples=counted_samples,
         total_chars=total_chars,
         confusion=confusion,
         label_names=label_names,
@@ -3363,10 +3562,13 @@ def evaluate_task(
 class ThroughputResult:
     task: str
     device: str
+    arch: str
     samples: int
     total_bytes: int
+    total_windows: int
     elapsed: float
     throughput: float
+    windows_per_second: float
     rss_delta: Optional[float]
     device_mem_delta: Optional[float]
 
@@ -3401,9 +3603,10 @@ def measure_throughput(
 ) -> ThroughputResult:
     samples = len(dataset)
     if samples == 0:
-        return ThroughputResult(task, device_name, 0, 0, 0.0, 0.0, None, None)
+        return ThroughputResult(task, device_name, str(getattr(runner, "arch", "unknown")), 0, 0, 0, 0.0, 0.0, 0.0, None, None)
 
     total_bytes = 0
+    byte_arrays: List[np.ndarray] = []
     for example in dataset:
         meta_raw = example.get("metadata_json")
         if meta_raw:
@@ -3412,17 +3615,13 @@ def measure_throughput(
                 total_bytes += int(meta.get("actual_bytes", 0))
             except Exception:
                 pass
-    if total_bytes <= 0:
-        total_bytes = int(
-            sum(
-                len(
-                    normalize_eval_text(
-                        row.get("content") if isinstance(row, dict) else row["content"]
-                    ).encode("utf-8", "ignore")
-                )
-                for row in dataset
-            )
+        text = normalize_eval_text(
+            example.get("content") if isinstance(example, dict) else example["content"]
         )
+        byte_arr = np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8).copy()
+        byte_arrays.append(byte_arr)
+    if total_bytes <= 0:
+        total_bytes = int(sum(int(arr.shape[0]) for arr in byte_arrays))
 
     devices: List[jax.Device] = []
     if runner.backend:
@@ -3438,16 +3637,15 @@ def measure_throughput(
     dev_before = _device_mem_mb(device)
 
     # Warm-up with first example to trigger compilation
-    warm_example = dataset[0]
-    warm_text = normalize_eval_text(
-        warm_example.get("content") if isinstance(warm_example, dict) else warm_example["content"]
-    )
-    runner.segment_text_labels_only(warm_text, min_run_chars=min_run_chars)
+    warm_bytes = byte_arrays[0]
+    runner.segment_byte_arrays_batch_labels_only([warm_bytes])
 
+    total_windows = 0
     start = time.perf_counter()
-    for example in dataset:
-        text = normalize_eval_text(example.get("content") if isinstance(example, dict) else example["content"])
-        runner.segment_text_labels_only(text, min_run_chars=min_run_chars)
+    for byte_arr in byte_arrays:
+        _, spans_by_text = runner.segment_byte_arrays_batch_labels_only([byte_arr])
+        if spans_by_text:
+            total_windows += int(len(spans_by_text[0]))
     elapsed = time.perf_counter() - start
 
     rss_after = _process_rss_mb()
@@ -3457,13 +3655,17 @@ def measure_throughput(
     dev_delta = (dev_after - dev_before) if (dev_after is not None and dev_before is not None) else None
 
     throughput = (total_bytes / elapsed) if elapsed > 0 else 0.0
+    windows_per_second = (total_windows / elapsed) if elapsed > 0 else 0.0
     return ThroughputResult(
         task=task,
         device=device_name,
+        arch=str(getattr(runner, "arch", "unknown")),
         samples=samples,
         total_bytes=total_bytes,
+        total_windows=int(total_windows),
         elapsed=elapsed,
         throughput=throughput,
+        windows_per_second=windows_per_second,
         rss_delta=rss_delta,
         device_mem_delta=dev_delta,
     )
@@ -4267,17 +4469,19 @@ def _collect_task_highlights(
 
 def _render_throughput_table(results: List[ThroughputResult]) -> str:
     lines = [
-        "| Task | Device | Samples | Total Bytes | Throughput | Latency (s) |",
-        "| --- | --- | ---: | ---: | ---: | ---: |",
+        "| Task | Device | Samples | Total Bytes | Throughput | Windows/s | Latency (s) |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for res in results:
+        windows_text = "--" if str(res.arch).lower().strip() == "mamba" else f"{float(res.windows_per_second):.1f}"
         lines.append(
-            "| {task} | {device} | {samples} | {bytes} | {through} | {lat:.2f} |".format(
+            "| {task} | {device} | {samples} | {bytes} | {through} | {windows} | {lat:.2f} |".format(
                 task=res.task,
                 device=res.device,
                 samples=res.samples,
                 bytes=res.total_bytes,
                 through=_format_bytes_per_sec(res.throughput),
+                windows=windows_text,
                 lat=res.elapsed,
             )
         )
@@ -4530,14 +4734,23 @@ def _collect_comparison_metrics(
 ) -> Dict[str, Any]:
     other_summary = _aggregate_other_confusion(task_metrics)
     metrics_by_name = {m.name: m for m in task_metrics}
+    exclusion_note = _truth_label_exclusion_note(
+        arch=str(getattr(args, "arch", "")),
+        excluded_labels=getattr(args, "exclude_truth_labels", None),
+    )
     data: Dict[str, Any] = {
         "meta": {
+            "arch": getattr(args, "arch", None),
             "checkpoint": args.checkpoint,
             "model_dim": args.model_dim,
             "channels": list(args.channels) if isinstance(args.channels, (list, tuple)) else args.channels,
             "dtype": args.dtype,
             "sample_seed": args.sample_seed,
             "other_threshold": _float_or_none(getattr(args, "other_threshold", 0.0)),
+            "excluded_truth_labels": list(getattr(args, "exclude_truth_labels", []) or []),
+            "truth_label_exclusion_note": exclusion_note,
+            "magika_module_version": getattr(args, "magika_module_version", None),
+            "magika_model_name": getattr(args, "magika_model_name", None),
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         },
         "summary": {
@@ -4994,10 +5207,13 @@ def _collect_comparison_metrics(
         for res in throughput_results:
             throughput_data[res.task] = {
                 "device": res.device,
+                "arch": res.arch,
                 "samples": res.samples,
                 "total_bytes": res.total_bytes,
+                "total_windows": res.total_windows,
                 "elapsed": _float_or_none(res.elapsed),
                 "throughput_bytes_per_sec": _float_or_none(res.throughput),
+                "windows_per_second": _float_or_none(res.windows_per_second),
                 "rss_delta_mb": _float_or_none(res.rss_delta),
                 "device_mem_delta_mb": _float_or_none(res.device_mem_delta),
             }
@@ -5008,6 +5224,21 @@ def _collect_comparison_metrics(
             key: value
             for key, value in dict(monitor_b_report).items()
             if not str(key).startswith("_")
+        }
+
+    reduced_support_tasks = {
+        metrics.name: dict(metrics.extras.get("truth_label_exclusions", {}))
+        for metrics in task_metrics
+        if isinstance(metrics.extras.get("truth_label_exclusions"), Mapping)
+    }
+    monitor_exclusions = None
+    if isinstance(monitor_b_report, Mapping) and isinstance(monitor_b_report.get("truth_label_exclusions"), Mapping):
+        monitor_exclusions = dict(monitor_b_report.get("truth_label_exclusions", {}))
+    if reduced_support_tasks or monitor_exclusions or exclusion_note:
+        data["reduced_support"] = {
+            "note": exclusion_note,
+            "tasks": reduced_support_tasks,
+            "monitor_b": monitor_exclusions,
         }
 
     return data
@@ -5055,14 +5286,22 @@ def write_report(
     report_lines: List[str] = []
     report_lines.append("# Segmenter Evaluation Report")
     report_lines.append("")
+    report_lines.append(f"- Architecture: {getattr(args, 'arch', 'unet1d')}")
     report_lines.append(f"- Checkpoint: `{args.checkpoint}`")
-    report_lines.append(f"- Model dim: {args.model_dim}")
-    report_lines.append(f"- Channels: {_format_channels(args.channels)}")
+    if str(getattr(args, "arch", "")).lower().strip() == "magika":
+        report_lines.append(f"- Magika version: {getattr(args, 'magika_module_version', 'unknown')}")
+        report_lines.append(f"- Magika model: {getattr(args, 'magika_model_name', 'unknown')}")
+    else:
+        report_lines.append(f"- Model dim: {args.model_dim}")
+        report_lines.append(f"- Channels: {_format_channels(args.channels)}")
     report_lines.append(f"- Chunk: {args.chunk}")
     report_lines.append(f"- Batch size: {args.batch_size}")
     report_lines.append(f"- Other threshold: {float(getattr(args, 'other_threshold', 0.0)):.4f}")
     report_lines.append(f"- Max samples per task: {'all' if args.max_samples <= 0 else args.max_samples}")
     report_lines.append(f"- Sample seed: {args.sample_seed}")
+    excluded_truth_labels = list(getattr(args, "exclude_truth_labels", []) or [])
+    if excluded_truth_labels:
+        report_lines.append(f"- Excluded truth labels: {', '.join(excluded_truth_labels)}")
     report_lines.append(f"- Evaluation data root: `{manifest.get('output_root')}`")
     if getattr(args, "fine_tuned_mode", None) is not None:
         report_lines.append(
@@ -5079,6 +5318,12 @@ def write_report(
     aggregated_confusion_rel = confusion_artifacts.get("all_tasks")
     if aggregated_confusion_rel:
         report_lines.append(f"- Aggregated confusion matrix: [{aggregated_confusion_rel}]({aggregated_confusion_rel})")
+    exclusion_note = _truth_label_exclusion_note(
+        arch=str(getattr(args, "arch", "")),
+        excluded_labels=excluded_truth_labels,
+    )
+    if exclusion_note:
+        report_lines.append(f"- Reduced-support note: {exclusion_note}")
     report_lines.append("")
     highlights = _collect_task_highlights(ordered_task_metrics, manifest)
     if highlights:
@@ -5107,6 +5352,20 @@ def write_report(
         report_lines.append(f"- Other threshold: {float(monitor_b_report.get('other_threshold', 0.0)):.4f}")
         report_lines.append(f"- Files used: {int(monitor_b_report.get('files_used', 0))}")
         report_lines.append(f"- Skipped: {int(monitor_b_report.get('skipped', 0))}")
+        monitor_exclusions = monitor_b_report.get("truth_label_exclusions")
+        if isinstance(monitor_exclusions, Mapping):
+            report_lines.append(f"- Files requested: {int(monitor_exclusions.get('requested', 0))}")
+            report_lines.append(f"- Files counted: {int(monitor_exclusions.get('counted', 0))}")
+            report_lines.append(
+                f"- Files skipped for excluded truth labels: {int(monitor_exclusions.get('skipped_for_truth_label', 0))}"
+            )
+            skipped_label_counts = monitor_exclusions.get("skipped_label_counts", {})
+            if isinstance(skipped_label_counts, Mapping) and skipped_label_counts:
+                skipped_summary = ", ".join(
+                    f"{label}={int(count)}"
+                    for label, count in sorted(skipped_label_counts.items())
+                )
+                report_lines.append(f"- Excluded-label skip counts: {skipped_summary}")
         report_lines.append(f"- Evaluated bytes: {int(monitor_b_report.get('evaluated_bytes', 0))}")
         report_lines.append(
             f"- Truth `other` bytes: {int(monitor_b_report.get('truth_other_bytes', 0))}"
@@ -5167,7 +5426,22 @@ def write_report(
         confusion_rel = confusion_artifacts.get(metrics.name)
         if confusion_rel:
             report_lines.append(f"- Confusion matrix: [{confusion_rel}]({confusion_rel})")
-        report_lines.append(f"- Samples: {metrics.samples}")
+        truth_exclusions = extras.get("truth_label_exclusions")
+        if isinstance(truth_exclusions, Mapping):
+            report_lines.append(f"- Samples requested: {int(truth_exclusions.get('requested', 0))}")
+            report_lines.append(f"- Samples counted: {int(truth_exclusions.get('counted', 0))}")
+            report_lines.append(
+                f"- Samples skipped for excluded truth labels: {int(truth_exclusions.get('skipped_for_truth_label', 0))}"
+            )
+            skipped_label_counts = truth_exclusions.get("skipped_label_counts", {})
+            if isinstance(skipped_label_counts, Mapping) and skipped_label_counts:
+                skipped_summary = ", ".join(
+                    f"{label}={int(count)}"
+                    for label, count in sorted(skipped_label_counts.items())
+                )
+                report_lines.append(f"- Excluded-label skip counts: {skipped_summary}")
+        else:
+            report_lines.append(f"- Samples: {metrics.samples}")
         report_lines.append(f"- Characters evaluated: {report_total_chars}")
         report_lines.append(f"- Overall accuracy: {report_overall_accuracy:.4f}")
         report_lines.append(
@@ -5576,14 +5850,14 @@ def write_report(
 
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(description="Evaluate segmentation model on curated benchmarks.")
-    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.msgpack or Orbax directory).")
+    parser.add_argument("--checkpoint", default=None, help="Path to model checkpoint (.msgpack or Orbax directory).")
     parser.add_argument("--data-root", default=str(REPO_ROOT / "evaluation" / "data"), help="Path to evaluation datasets.")
     parser.add_argument("--manifest", default=None, help="Optional manifest JSON (defaults to <data-root>/manifest.json).")
     parser.add_argument("--tasks", nargs="*", help="Subset of task names to evaluate.")
     parser.add_argument("--device", default="auto", help="Device for accuracy workloads (cpu/gpu/cuda/auto).")
     parser.add_argument("--cpu-device", default="cpu", help="Device name for throughput CPU benchmark.")
     parser.add_argument("--gpu-device", default="cuda", help="Device name for throughput GPU benchmark (ignored if unavailable).")
-    parser.add_argument("--arch", default=None, choices=("unet1d", "mamba"), help="Model architecture (auto if omitted).")
+    parser.add_argument("--arch", default=None, choices=("unet1d", "mamba", "magika"), help="Model architecture (auto if omitted).")
     parser.add_argument("--model-dim", type=int, default=None, help="Model embedding dimension. Defaults to checkpoint config or 256.")
     parser.add_argument("--channels", type=str, default=None, help="Comma-separated channel widths. Defaults to checkpoint config or 96,128,192,256.")
     parser.add_argument("--dtype", type=str, default=None, help="JAX dtype name for inference (e.g. bfloat16). Defaults to checkpoint config or bfloat16.")
@@ -5651,6 +5925,15 @@ def parse_args(argv: Optional[Sequence[str]] = None):
             "monitor evaluation."
         ),
     )
+    parser.add_argument(
+        "--exclude-truth-labels",
+        nargs="*",
+        default=(),
+        help=(
+            "Skip any benchmark sample or full monitor_b file whose ground-truth segments contain "
+            "one of these labels."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -5673,28 +5956,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not data_root.exists() or not data_root.is_dir():
             raise RuntimeError(f"Evaluation data directory not found or not a directory: {data_root}")
 
-        ckpt_path = Path(args.checkpoint).resolve()
-        auto_hparams = _load_checkpoint_hparams(ckpt_path)
-
-        label_names = auto_hparams.get("label_names")
-        if label_names:
-            _apply_label_mapping(label_names)
+        auto_hparams: Dict[str, Any] = {}
+        label_names = None
+        ckpt_path: Optional[Path] = None
+        if args.checkpoint:
+            ckpt_path = Path(args.checkpoint).resolve()
+            auto_hparams = _load_checkpoint_hparams(ckpt_path)
+            label_names = auto_hparams.get("label_names")
+            if label_names:
+                _apply_label_mapping(label_names)
 
         arch = args.arch if args.arch is not None else auto_hparams.get("arch", None)
+        if arch is None and not args.checkpoint:
+            arch = "magika"
         arch = str(arch).lower().strip() if arch else "unet1d"
         args.arch = arch
 
-        model_dim = args.model_dim if args.model_dim is not None else auto_hparams.get("model_dim", 256)
-        dtype = args.dtype if args.dtype is not None else auto_hparams.get("dtype", "bfloat16")
-        dtype = dtype.rsplit(".", 1)[-1]
-        if arch == "unet1d":
-            if args.channels:
-                channels = [int(ch) for ch in args.channels.split(",") if ch.strip()]
-            else:
-                channels_source = auto_hparams.get("channels", DEFAULT_CHANNELS)
-                channels = [int(ch) for ch in channels_source]
+        if arch != "magika" and ckpt_path is None:
+            raise RuntimeError(f"Architecture '{arch}' requires --checkpoint.")
+        if arch == "magika" and not args.checkpoint:
+            args.checkpoint = "magika://default"
+
+        if arch == "magika":
+            model_dim = args.model_dim if args.model_dim is not None else 0
+            dtype = args.dtype if args.dtype is not None else "float32"
+            channels = []
         else:
-            channels = [int(ch) for ch in DEFAULT_CHANNELS]
+            model_dim = args.model_dim if args.model_dim is not None else auto_hparams.get("model_dim", 256)
+            dtype = args.dtype if args.dtype is not None else auto_hparams.get("dtype", "bfloat16")
+            dtype = dtype.rsplit(".", 1)[-1]
+            if arch == "unet1d":
+                if args.channels:
+                    channels = [int(ch) for ch in args.channels.split(",") if ch.strip()]
+                else:
+                    channels_source = auto_hparams.get("channels", DEFAULT_CHANNELS)
+                    channels = [int(ch) for ch in channels_source]
+            else:
+                channels = [int(ch) for ch in DEFAULT_CHANNELS]
 
         if arch == "mamba":
             args.mamba_layers = args.mamba_layers if args.mamba_layers is not None else auto_hparams.get("mamba_layers", 6)
@@ -5711,8 +6009,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.model_dim = model_dim
         args.dtype = dtype
         args.channels = channels
+        args.exclude_truth_labels = [str(label).strip() for label in (args.exclude_truth_labels or []) if str(label).strip()]
 
-        if auto_hparams:
+        if auto_hparams and arch != "magika":
             extra = f", classes={len(label_names)}" if label_names else ""
             if arch == "unet1d":
                 print(
@@ -5746,6 +6045,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             batch_size=args.batch_size,
             inference_backend=args.inference_backend,
         )
+        if arch == "magika":
+            args.magika_module_version = getattr(accuracy_runner, "magika_module_version", None)
+            args.magika_model_name = getattr(accuracy_runner, "magika_model_name", None)
         runner_channels = getattr(accuracy_runner, "channels", None)
         if runner_channels:
             channels = [int(ch) for ch in runner_channels]
@@ -5809,6 +6111,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 accuracy_runner,
                 min_run_chars=args.min_run,
                 other_threshold=args.other_threshold,
+                excluded_truth_labels=args.exclude_truth_labels,
             )
             elapsed = metrics.extras.get("elapsed_seconds", 0.0)
             print(
@@ -5831,6 +6134,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 monitor_root,
                 accuracy_runner,
                 other_threshold=args.other_threshold,
+                excluded_truth_labels=args.exclude_truth_labels,
             )
             print(
                 "    [monitor_b] completed in "
@@ -5888,7 +6192,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 gpu_devices = jax.devices("gpu")
             except Exception:
                 gpu_devices = []
-            if gpu_devices:
+            if arch == "magika":
+                print("ℹ️  Magika throughput is CPU-only; skipping GPU throughput benchmarks.", flush=True)
+            elif gpu_devices:
                 try:
                     gpu_runner = SegmenterRunner(
                         args.checkpoint,

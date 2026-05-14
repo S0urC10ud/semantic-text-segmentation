@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,33 @@ import evaluation.sweep_tau_real_monitor_b as mod
 
 
 class TestSweepTauRealMonitorB(unittest.TestCase):
+    def test_resolve_runner_args_supports_magika_without_checkpoint(self) -> None:
+        args = SimpleNamespace(
+            checkpoint="",
+            arch="magika",
+            model_dim=None,
+            channels=None,
+            dtype=None,
+            chunk=None,
+            device="cpu",
+            batch_size=128,
+            inference_backend="auto",
+            mamba_layers=None,
+            mamba_d_state=None,
+            mamba_expand=None,
+            mamba_dt_rank=None,
+            mamba_conv=None,
+            mamba_bidirectional=None,
+        )
+
+        resolved, runner_kwargs = mod._resolve_runner_args(args)
+
+        self.assertEqual(resolved["checkpoint"], "magika://default")
+        self.assertEqual(resolved["arch"], "magika")
+        self.assertEqual(int(resolved["chunk"]), int(mod.DEFAULT_MAGIKA_CHUNK))
+        self.assertEqual(runner_kwargs["arch"], "magika")
+        self.assertNotIn("checkpoint", runner_kwargs)
+
     def test_select_monitor_file_indices_is_deterministic(self) -> None:
         picked_a = mod.select_monitor_file_indices(10, 4, 17)
         picked_b = mod.select_monitor_file_indices(10, 4, 17)

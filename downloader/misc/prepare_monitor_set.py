@@ -168,7 +168,7 @@ class MagikaFileFilter:
         except Exception as e:  # pragma: no cover - import-time failure is fatal
             raise RuntimeError(
                 "Magika is required for monitor filtering. "
-                "Install magika==0.6.* to run 999_prepare_monitor_set."
+                "Install magika==1.0.* to run 999_prepare_monitor_set."
             ) from e
         self._m = Magika()
         self.score_threshold = float(score_threshold)

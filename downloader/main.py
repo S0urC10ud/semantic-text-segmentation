@@ -33,11 +33,12 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # 3rd-party deps expected:
-#   datasets>=2.14, magika==0.6.*, numpy, tqdm
+#   datasets>=2.14, magika==1.0.*, numpy, tqdm
 from datasets import Dataset, Features, Value, load_dataset, load_from_disk, concatenate_datasets
 from datasets.exceptions import DatasetGenerationError
 from tqdm import tqdm
 import numpy as np
+from magika_label_map import canonical_label, label_matches_target
 
 
 # ============================================================
@@ -55,83 +56,6 @@ def safe_filename(name: str) -> str:
         return "yaml"
     s = s.replace(" ", "_")
     return re.sub(r"[^a-zA-Z0-9._-]", "_", s)
-
-
-def canonical_label(name: str) -> str:
-    s = (name or "").strip().lower().replace(" ", "_")
-    if s in {"c++", "cpp", "c", "c_family", "c-family", "cfamily"}:
-        return "c_family"
-    if s in {"c#", "c-sharp", "csharp", "cs"}:
-        return "csharp"
-    if s in {"javascript_typescript", "javascript-typescript", "js_ts", "js-ts"}:
-        return "javascript_typescript"
-    if s in {"shell_batchfile", "shell-batchfile", "shell_batch"}:
-        return "shell"
-    if s in {"js", "javascript"}:
-        return "javascript"
-    if s in {"ts", "typescript"}:
-        return "typescript"
-    if s in {"yml", "yaml"}:
-        return "yaml"
-    if s in {"vb", "visual-basic", "visualbasic", "vbnet", "vb.net"}:
-        return "visual_basic"
-    if s in {"ps", "ps1", "powershell"}:
-        return "powershell"
-    if s in {"batch", "bat", "cmd", "batchfile"}:
-        return "batchfile"
-    if s in {"docker", "dockerfile"}:
-        return "dockerfile"
-    if s in {"gettext-catalog", "gettext_catalog", "gettext", "po"}:
-        return "gettext_catalog"
-    if s in {"latex"}:
-        return "tex"
-    if s in {"rst", "restructured_text", "restructured-text", "restructuredtext"}:
-        return "restructuredtext"
-    return s
-
-
-# Magika may return different but equivalent labels; accept these as matches.
-LABEL_ACCEPTS: Dict[str, set] = {
-    "text": {"txt", "text"},
-    "c_family": {"c", "cpp", "c++", "c_family"},
-    "csv": {"csv"},
-    "csharp": {"c#", "csharp", "c-sharp", "cs"},
-    "javascript_typescript": {"javascript", "typescript", "js", "ts"},
-    "yaml": {"yaml", "yml"},
-    "php": {"php"},
-    "go": {"go"},
-    "sql": {"sql"},
-    "rust": {"rust"},
-    "ruby": {"ruby"},
-    "python": {"python"},
-    "java": {"java"},
-    "json": {"json"},
-    "css": {"css"},
-    "html": {"html", "xhtml"},
-    "dart": {"dart"},
-    "gettext_catalog": {"gettext-catalog", "gettext_catalog", "gettext", "po"},
-    "kotlin": {"kotlin"},
-    "markdown": {"markdown", "md"},
-    "restructuredtext": {"restructuredtext", "rst"},
-    "scala": {"scala"},
-    "swift": {"swift"},
-    "svg": {"svg"},
-    "tex": {"tex", "latex"},
-    "xml": {"xml"},
-    "shell": {"shell", "bash", "sh", "zsh", "fish", "batchfile", "bat", "cmd", "shell_batchfile"},
-    "powershell": {"powershell", "ps1"},
-    "visual_basic": {"visual_basic", "visual-basic", "vb", "vba", "vb.net", "visualbasic"},
-    "dockerfile": {"dockerfile", "docker"},
-    # derived labels are handled separately (no Magika check)
-}
-
-def label_matches_target(target: str, magika_label: Optional[str], mime: Optional[str]) -> bool:
-    if not magika_label:
-        return False
-    tgt = canonical_label(target)
-    ml = canonical_label(magika_label)
-    accepts = LABEL_ACCEPTS.get(tgt, {tgt})
-    return ml in accepts
 
 MADLAD_REPO_ID = "allenai/MADLAD-400"
 MADLAD_DATA_GLOB = "hf://datasets/allenai/MADLAD-400/data/{lang}/*_clean_*.jsonl.gz"

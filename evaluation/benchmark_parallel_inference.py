@@ -291,8 +291,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark batched byte-level inference throughput on CPU/GPU."
     )
-    parser.add_argument("--checkpoint", required=True, help="Path to checkpoint (.msgpack or Orbax dir).")
-    parser.add_argument("--arch", default="unet1d", choices=("unet1d", "mamba"))
+    parser.add_argument("--checkpoint", default=None, help="Path to checkpoint (.msgpack or Orbax dir).")
+    parser.add_argument("--arch", default="unet1d", choices=("unet1d", "mamba", "magika"))
     parser.add_argument("--model-dim", type=int, default=256)
     parser.add_argument("--channels", default="32,64,64,128,128,128,128,256")
     parser.add_argument("--dtype", default="bfloat16")
@@ -333,9 +333,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    checkpoint_path = Path(args.checkpoint).resolve()
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint_path: Optional[Path]
+    if args.checkpoint:
+        checkpoint_path = Path(args.checkpoint).resolve()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    else:
+        checkpoint_path = None
+        if str(args.arch).lower().strip() != "magika":
+            raise FileNotFoundError("--checkpoint is required unless --arch=magika.")
+        args.checkpoint = "magika://default"
 
     device_names = _parse_csv_strings(args.devices)
     batch_sizes, batch_sizes_auto = _resolve_batch_sizes(
@@ -354,10 +361,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     results: List[BenchmarkResult] = []
     print(
-        f"Benchmarking {checkpoint_path.name} | arch={args.arch} | backend={args.inference_backend}",
+        f"Benchmarking {(checkpoint_path.name if checkpoint_path is not None else 'magika://default')} | arch={args.arch} | backend={args.inference_backend}",
         flush=True,
     )
     for device_name in device_names:
+        if str(args.arch).lower().strip() == "magika" and str(device_name).lower().strip() != "cpu":
+            print(f"SKIP: Magika benchmarking is CPU-only, skipping device '{device_name}'.", flush=True)
+            continue
         if not _device_is_available(device_name):
             print(f"SKIP: device '{device_name}' is not available on this machine.", flush=True)
             continue
@@ -402,7 +412,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_path = Path(args.json_output).resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "checkpoint": str(checkpoint_path),
+            "checkpoint": str(checkpoint_path) if checkpoint_path is not None else str(args.checkpoint),
             "arch": str(args.arch),
             "inference_backend": str(args.inference_backend),
             "devices": device_names,
