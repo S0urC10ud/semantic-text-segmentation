@@ -1,0 +1,295 @@
+{
+  "generated_at": "2026-05-15T11:28:46.632010+00:00",
+  "seed": 219540062,
+  "samples_per_type_target": 50,
+  "max_input_chars": 10000,
+  "arrow_root": "/Users/martindallinger/Documents/msc/text-segmentation/downloader/arrow_out/test",
+  "gemini_root": "/Users/martindallinger/Documents/msc/text-segmentation/gemini_segmentations",
+  "excluded_sha_count": 9902,
+  "lang_order": [
+    "php",
+    "csharp",
+    "javascript_typescript",
+    "go",
+    "sql",
+    "rust",
+    "yaml",
+    "ruby",
+    "python",
+    "java",
+    "c_family",
+    "json",
+    "css",
+    "html",
+    "text",
+    "csv",
+    "shell",
+    "powershell",
+    "visual_basic",
+    "dockerfile",
+    "dart",
+    "gettext_catalog",
+    "kotlin",
+    "markdown",
+    "restructuredtext",
+    "scala",
+    "swift",
+    "tex",
+    "xml",
+    "svg",
+    "encoding_hex",
+    "encoding_base64",
+    "encoding_base32",
+    "encoding_base58",
+    "encoding_base85"
+  ],
+  "per_lang": [
+    {
+      "lang": "php",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9900,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "csharp",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "javascript_typescript",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9900,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "go",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "sql",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "rust",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "yaml",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9899,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "ruby",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "python",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "java",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "c_family",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "json",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "css",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "html",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9898,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "text",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "csv",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "shell",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9900,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "powershell",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9897,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "visual_basic",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "dockerfile",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9900,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "dart",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "gettext_catalog",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "kotlin",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "markdown",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9900,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "restructuredtext",
+      "total_rows": 10000,
+      "after_sha_exclusion": 9899,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "scala",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "swift",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "tex",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "xml",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "svg",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "encoding_hex",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "encoding_base64",
+      "total_rows": 9998,
+      "after_sha_exclusion": 9998,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "encoding_base32",
+      "total_rows": 9998,
+      "after_sha_exclusion": 9998,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "encoding_base58",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    },
+    {
+      "lang": "encoding_base85",
+      "total_rows": 10000,
+      "after_sha_exclusion": 10000,
+      "sampled": 50,
+      "missing_dataset": false
+    }
+  ],
+  "total_samples": 1750,
+  "out_path": "/Users/martindallinger/Documents/msc/text-segmentation/evaluation/llm_benchmark/static_unseen_v1.jsonl"
+}

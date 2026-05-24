@@ -78,6 +78,20 @@ MODEL_PRICING_USD_PER_MTOKENS = {
             {"max_prompt_tokens": None, "rate": 3.00},
         ],
     },
+    "gemini-3.1-pro-preview": {
+        # Placeholder: mirror gemini-2.5-pro tiered pricing pending official rates.
+        # Update once Google publishes Gemini 3.1 Pro pricing at
+        # https://ai.google.dev/gemini-api/docs/pricing.
+        "prompt": [
+            {"max_prompt_tokens": 200_000, "rate": 1.25},
+            {"max_prompt_tokens": None, "rate": 2.50},
+        ],
+        "response": [
+            {"max_prompt_tokens": 200_000, "rate": 10.00},
+            {"max_prompt_tokens": None, "rate": 15.00},
+        ],
+        "notes": "ESTIMATED — mirrors gemini-2.5-pro tiers; verify against official Google pricing before publishing results.",
+    },
 }
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -174,6 +188,7 @@ ALLOWED_TYPE_NAMES = [
     "json",
     "css",
     "html",
+    "text",
     "csv",
     "shell",
     "powershell",
@@ -184,9 +199,11 @@ ALLOWED_TYPE_NAMES = [
     "markdown",
     "svg",
     "gettext-catalog",
+    "gettext_catalog",
     "scala",
     "swift",
     "restructuredtext",
+    "tex",
     "kotlin",
     "dart",
     "encoding_hex",
@@ -206,6 +223,14 @@ _CONTENT_BLOCK_RE = re.compile(
 )
 _EMBEDDED_MARKER_PATTERN = re.compile(
     r"<CONTENT-TYPE:[A-Za-z0-9_\-+.]+>(?:\r?\n)?"
+)
+# Matches an outer triple-backtick fence wrapping the *entire* response,
+# e.g. ``` followed by an optional language hint then the body then a closing
+# ```. Only used to peel the outer shell; inner fences inside SOURCE_TEXT
+# remain untouched.
+_OUTER_CODE_FENCE_RE = re.compile(
+    r"\A\s*```[A-Za-z0-9_\-+.]*\r?\n(?P<body>.*?)(?:\r?\n)?```\s*\Z",
+    re.DOTALL,
 )
 
 
@@ -1681,12 +1706,15 @@ def extract_segments_from_content_blocks(model_text: str) -> list[dict[str, str]
     Returns a list of {type, content} dictionaries or None when parsing fails.
     """
     cleaned_text = _strip_markdown_code_fences(model_text)
+    # Peel any <OUTPUT>...</OUTPUT> wrapper before searching for CONTENT-TYPE
+    # markers; the prompt asks the model not to wrap responses, but Gemini Pro
+    # sometimes does anyway. Doing this unconditionally (not only when no
+    # matches were found) lets us handle wrapped responses that still contain
+    # CONTENT-TYPE markers inside the wrapper.
+    unwrapped = _strip_optional_output_wrapper(cleaned_text)
+    if unwrapped != cleaned_text:
+        cleaned_text = unwrapped
     matches = list(_CONTENT_BLOCK_RE.finditer(cleaned_text))
-    if not matches:
-        wrapped_text = _strip_optional_output_wrapper(cleaned_text)
-        if wrapped_text != cleaned_text:
-            cleaned_text = wrapped_text
-            matches = list(_CONTENT_BLOCK_RE.finditer(cleaned_text))
     if not matches:
         return None
     prefix = cleaned_text[: matches[0].start()]

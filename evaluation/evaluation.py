@@ -59,12 +59,26 @@ if str(TRAIN_ROOT) not in sys.path:
 
 MARKDOWN_FENCED_LABEL = r"\`\`\` fenced \`\`\`"
 MARKDOWN_INLINE_LABEL = r"inline code (\`...\`)"
+POSTPROCESS_PROFILE_OFF = "off"
+POSTPROCESS_PROFILE_THESIS = "thesis"
+POSTPROCESS_PROFILE_CHOICES = (POSTPROCESS_PROFILE_OFF, POSTPROCESS_PROFILE_THESIS)
 
 import datasets as hfds  # noqa: E402
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import flax.serialization as serialization  # noqa: E402
 from flax.errors import ScopeParamShapeError  # noqa: E402
+
+# Compat shim: orbax-checkpoint >=0.11 references
+# `jax.experimental.layout.DeviceLocalLayout`, which was renamed to `Layout`
+# in jax >=0.8. Alias before orbax import so the loader works on jax 0.8.1.
+try:
+    import jax.experimental.layout as _jax_layout  # noqa: E402
+    if not hasattr(_jax_layout, "DeviceLocalLayout") and hasattr(_jax_layout, "Layout"):
+        _jax_layout.DeviceLocalLayout = _jax_layout.Layout
+except Exception:  # pragma: no cover
+    pass
+
 try:
     import orbax.checkpoint as ocp  # noqa: E402
 except Exception:  # pragma: no cover - environment-dependent optional import
@@ -260,9 +274,9 @@ def _load_params_from_any(ckpt_path: str, params_template):
         )
 
     step_dir_str = step_dir.resolve().as_posix()
-    checkpointer = ocp.StandardCheckpointer()
+    standard = ocp.StandardCheckpointer()
     try:
-        restored = checkpointer.restore(step_dir_str)
+        restored = standard.restore(step_dir_str)
         params, _ = merge_compatible_state(
             params_template,
             checkpoint_params_subtree(_extract_params_tree(restored)),
@@ -273,7 +287,7 @@ def _load_params_from_any(ckpt_path: str, params_template):
 
     try:
         template = {"params": params_template}
-        restored = checkpointer.restore(step_dir_str, target=template, strict=False)
+        restored = standard.restore(step_dir_str, target=template, strict=False)
         params, _ = merge_compatible_state(
             params_template,
             checkpoint_params_subtree(_extract_params_tree(restored)),
@@ -288,10 +302,40 @@ def _load_params_from_any(ckpt_path: str, params_template):
 
         tx = optax.identity()
         dummy = ts.TrainState.create(apply_fn=lambda *a, **k: None, params=params_template, tx=tx)
-        restored = checkpointer.restore(step_dir_str, target=dummy, strict=False)
+        restored = standard.restore(step_dir_str, target=dummy, strict=False)
         params, _ = merge_compatible_state(
             params_template,
             checkpoint_params_subtree(restored),
+        )
+        return params
+    except Exception:
+        pass
+
+    # Final fallback: untargeted PyTree restore that materialises every leaf as
+    # a numpy ndarray. Works when the checkpoint's recorded sharding (e.g.
+    # cuda:0 from the training environment) is not available on the current
+    # host (Apple Metal / CPU). Extracts the ``params`` subtree afterwards.
+    try:
+        import numpy as _np
+        handler = ocp.PyTreeCheckpointHandler()
+        ptree_checkpointer = ocp.Checkpointer(handler)
+        metadata = ptree_checkpointer.metadata(step_dir_str)
+
+        def _to_args(node):
+            if hasattr(node, "items"):
+                return {k: _to_args(v) for k, v in node.items()}
+            if isinstance(node, (list, tuple)):
+                try:
+                    return [_to_args(x) for x in node]
+                except Exception:
+                    return ocp.ArrayRestoreArgs(restore_type=_np.ndarray)
+            return ocp.ArrayRestoreArgs(restore_type=_np.ndarray)
+
+        restore_args = _to_args(metadata)
+        restored = ptree_checkpointer.restore(step_dir_str, restore_args=restore_args)
+        params, _ = merge_compatible_state(
+            params_template,
+            checkpoint_params_subtree(_extract_params_tree(restored)),
         )
         return params
     except Exception as exc:
@@ -587,18 +631,34 @@ def _byte_labels_to_char_labels_only(
     return _relabel_whitespace_labels_from_neighbors(text, labels)
 
 
+_INLINE_WHITESPACE_SET = frozenset((" ", "\t"))
+_THESIS_BOUNDARY_DELIMITER_CHARS = frozenset(
+    ("<", ">", "/", "\\", '"', "'", "`", "(", ")", "[", "]", "{", "}", ",", ";", ":", "=")
+)
+_THESIS_BOUNDARY_ADJACENT_CHARS = _THESIS_BOUNDARY_DELIMITER_CHARS | _INLINE_WHITESPACE_SET
+_THESIS_BOUNDARY_MIN_IMPROVEMENT = 0.75
+
+
+def _build_label_runs(labels: Sequence[int]) -> List[Tuple[int, int, int]]:
+    if not labels:
+        return []
+    runs: List[Tuple[int, int, int]] = []
+    current = int(labels[0])
+    start = 0
+    for idx in range(1, len(labels)):
+        label = int(labels[idx])
+        if label != current:
+            runs.append((start, idx, current))
+            start = idx
+            current = label
+    runs.append((start, len(labels), current))
+    return runs
+
+
 def _smooth_min_run(labels: List[int], min_run: int) -> List[int]:
     if min_run <= 1 or len(labels) == 0:
         return labels
-    runs = []
-    current = labels[0]
-    start = 0
-    for i in range(1, len(labels)):
-        if labels[i] != current:
-            runs.append((start, i, current))
-            start = i
-            current = labels[i]
-    runs.append((start, len(labels), current))
+    runs = _build_label_runs(labels)
     if len(runs) <= 2:
         return labels
     arr = labels[:]
@@ -614,6 +674,370 @@ def _smooth_min_run(labels: List[int], min_run: int) -> List[int]:
         for i in range(s, e):
             arr[i] = new_lbl
     return arr
+
+
+def _char_prob_value(char_probs: Sequence[Any], pos: int, label: int) -> float:
+    if pos < 0 or pos >= len(char_probs):
+        return 0.0
+    row = char_probs[pos]
+    try:
+        if isinstance(row, Mapping):
+            value = row.get(str(int(label)), row.get(int(label), 0.0))
+            return float(value)
+        arr = np.asarray(row, dtype=np.float32)
+        label_idx = int(label)
+        if label_idx < 0 or label_idx >= arr.size:
+            return 0.0
+        return float(arr[label_idx])
+    except Exception:
+        return 0.0
+
+
+def _mean_label_support(
+    char_probs: Sequence[Any],
+    start: int,
+    end: int,
+    label: int,
+) -> float:
+    lo = max(0, int(start))
+    hi = max(lo, min(int(end), len(char_probs)))
+    if hi <= lo:
+        return 0.0
+    total = 0.0
+    count = 0
+    for pos in range(lo, hi):
+        total += _char_prob_value(char_probs, pos, int(label))
+        count += 1
+    return total / max(count, 1)
+
+
+def _is_identifier_like_char(ch: str) -> bool:
+    return bool(ch) and (ch.isalnum() or ch in ("_", "$", "-"))
+
+
+def _thesis_boundary_local_score(text: str, boundary: int) -> float:
+    if boundary < 0 or boundary > len(text):
+        return float("-inf")
+    left = text[boundary - 1] if boundary > 0 else ""
+    right = text[boundary] if boundary < len(text) else ""
+    score = 0.0
+    if left in _THESIS_BOUNDARY_DELIMITER_CHARS:
+        score += 1.25
+    elif left in _INLINE_WHITESPACE_SET:
+        score += 0.20
+    if right in _THESIS_BOUNDARY_DELIMITER_CHARS:
+        score += 1.25
+    elif right in _INLINE_WHITESPACE_SET:
+        score += 0.20
+    if left in _THESIS_BOUNDARY_DELIMITER_CHARS and right in _THESIS_BOUNDARY_DELIMITER_CHARS:
+        score += 0.35
+    if left in _INLINE_WHITESPACE_SET and right in _INLINE_WHITESPACE_SET:
+        score -= 0.25
+    if left in ("<", "(", "[", "{") and _is_identifier_like_char(right):
+        score += 0.35
+    if right in (">", ")", "]", "}") and _is_identifier_like_char(left):
+        score += 0.35
+    if _is_identifier_like_char(left) and _is_identifier_like_char(right):
+        score -= 1.5
+    return score
+
+
+def _apply_boundary_shift(
+    labels: List[int],
+    current: int,
+    boundary: int,
+    left_label: int,
+    right_label: int,
+) -> List[int]:
+    out = labels[:]
+    if boundary < current:
+        for pos in range(boundary, current):
+            out[pos] = int(right_label)
+    elif boundary > current:
+        for pos in range(current, boundary):
+            out[pos] = int(left_label)
+    return out
+
+
+def _score_thesis_boundary_candidate(
+    text: str,
+    labels: Sequence[int],
+    char_probs: Sequence[Any],
+    left_run: Tuple[int, int, int],
+    right_run: Tuple[int, int, int],
+    boundary: int,
+) -> Optional[float]:
+    del labels
+    current = int(left_run[1])
+    left_start, _, left_label = left_run
+    _, right_end, right_label = right_run
+    if boundary < int(left_start) or boundary > int(right_end):
+        return None
+    left_adjacent = text[boundary - 1] if boundary > 0 else ""
+    right_adjacent = text[boundary] if boundary < len(text) else ""
+    if left_adjacent == "\n" or right_adjacent == "\n":
+        return None
+    if boundary != current and (
+        left_adjacent not in _THESIS_BOUNDARY_ADJACENT_CHARS
+        and right_adjacent not in _THESIS_BOUNDARY_ADJACENT_CHARS
+    ):
+        return None
+
+    if boundary < current:
+        moved_positions = range(boundary, current)
+        src_label = int(left_label)
+        dest_label = int(right_label)
+    else:
+        moved_positions = range(current, boundary)
+        src_label = int(right_label)
+        dest_label = int(left_label)
+
+    score = _thesis_boundary_local_score(text, boundary)
+    for pos in moved_positions:
+        ch = text[pos]
+        if ch == "\n":
+            return None
+        src_prob = _char_prob_value(char_probs, pos, src_label)
+        dest_prob = _char_prob_value(char_probs, pos, dest_label)
+        if ch not in _THESIS_BOUNDARY_DELIMITER_CHARS and dest_prob < (0.5 * src_prob):
+            return None
+        score += 0.5 * (dest_prob - src_prob)
+        if ch in _THESIS_BOUNDARY_DELIMITER_CHARS:
+            score += 0.15
+        elif ch in _INLINE_WHITESPACE_SET:
+            score += 0.02
+    return score
+
+
+def _snap_thesis_boundaries_to_delimiters(
+    text: str,
+    labels: List[int],
+    char_probs: Sequence[Any],
+    *,
+    max_shift: int,
+) -> List[int]:
+    if int(max_shift) <= 0 or len(labels) <= 1:
+        return labels
+    out = [int(label) for label in labels]
+    max_passes = max(1, len(out) * 2)
+    for _ in range(max_passes):
+        runs = _build_label_runs(out)
+        if len(runs) <= 1:
+            break
+        changed = False
+        for idx in range(len(runs) - 1):
+            left_run = runs[idx]
+            right_run = runs[idx + 1]
+            current = int(left_run[1])
+            current_score = _score_thesis_boundary_candidate(
+                text,
+                out,
+                char_probs,
+                left_run,
+                right_run,
+                current,
+            )
+            if current_score is None:
+                current_score = _thesis_boundary_local_score(text, current)
+            best_boundary = current
+            best_score = current_score
+            for shift in range(-int(max_shift), int(max_shift) + 1):
+                if shift == 0:
+                    continue
+                candidate = current + shift
+                score = _score_thesis_boundary_candidate(
+                    text,
+                    out,
+                    char_probs,
+                    left_run,
+                    right_run,
+                    candidate,
+                )
+                if score is None:
+                    continue
+                if score > (best_score + 1e-6):
+                    best_boundary = candidate
+                    best_score = score
+            if best_boundary != current and best_score >= (current_score + _THESIS_BOUNDARY_MIN_IMPROVEMENT):
+                out = _apply_boundary_shift(out, current, best_boundary, left_run[2], right_run[2])
+                changed = True
+                break
+        if not changed:
+            break
+    return out
+
+
+def _choose_thesis_min_run_target(
+    labels: Sequence[int],
+    char_probs: Sequence[Any],
+    run: Tuple[int, int, int],
+    left_run: Tuple[int, int, int],
+    right_run: Tuple[int, int, int],
+) -> int:
+    del labels
+    start, end, _label = run
+    left_start, left_end, left_label = left_run
+    right_start, right_end, right_label = right_run
+    left_label = int(left_label)
+    right_label = int(right_label)
+    if left_label == right_label:
+        return left_label
+
+    left_len = int(left_end - left_start)
+    right_len = int(right_end - right_start)
+    if left_len > 10 and right_len > 10:
+        window_start = max(0, int(start) - 10)
+        window_end = min(len(char_probs), int(end) + 10)
+        left_support = _mean_label_support(char_probs, window_start, window_end, left_label)
+        right_support = _mean_label_support(char_probs, window_start, window_end, right_label)
+        return left_label if left_support >= right_support else right_label
+
+    if left_len != right_len:
+        return left_label if left_len > right_len else right_label
+
+    left_support = _mean_label_support(char_probs, max(int(left_end) - 10, int(left_start)), int(end), left_label)
+    right_support = _mean_label_support(char_probs, int(start), min(int(right_start) + 10, int(right_end)), right_label)
+    return left_label if left_support >= right_support else right_label
+
+
+def _normalize_thesis_min_runs(
+    labels: List[int],
+    char_probs: Sequence[Any],
+    *,
+    min_run_chars: int,
+) -> List[int]:
+    if int(min_run_chars) <= 1 or len(labels) <= 2:
+        return labels
+    out = [int(label) for label in labels]
+    max_passes = max(1, len(out))
+    for _ in range(max_passes):
+        runs = _build_label_runs(out)
+        changed = False
+        for idx in range(1, len(runs) - 1):
+            start, end, _label = runs[idx]
+            if (end - start) >= int(min_run_chars):
+                continue
+            target = _choose_thesis_min_run_target(out, char_probs, runs[idx], runs[idx - 1], runs[idx + 1])
+            for pos in range(start, end):
+                out[pos] = int(target)
+            changed = True
+            break
+        if not changed:
+            break
+    return out
+
+
+def _apply_thesis_other_threshold(
+    labels: List[int],
+    char_probs: Sequence[Any],
+    *,
+    threshold: float,
+    other_id: Optional[int],
+) -> Tuple[List[int], int]:
+    if other_id is None or threshold <= 0.0:
+        return labels, 0
+    out = [int(label) for label in labels]
+    changed = 0
+    for pos in range(len(out)):
+        if pos >= len(char_probs):
+            continue
+        try:
+            row = np.asarray(char_probs[pos], dtype=np.float32)
+            max_prob = float(row.max()) if row.size else None
+        except Exception:
+            max_prob = None
+        if max_prob is not None and max_prob < float(threshold) and out[pos] != int(other_id):
+            out[pos] = int(other_id)
+            changed += 1
+    return out, changed
+
+
+def _count_label_changes(before: Sequence[int], after: Sequence[int]) -> int:
+    return sum(1 for left, right in zip(before, after) if int(left) != int(right))
+
+
+def _labels_to_segments(labels: Sequence[int]) -> List[Tuple[int, int, int]]:
+    segments: List[Tuple[int, int, int]] = []
+    if labels:
+        cur = int(labels[0])
+        start = 0
+        for idx in range(1, len(labels)):
+            label = int(labels[idx])
+            if label != cur:
+                segments.append((start, idx, cur))
+                start = idx
+                cur = label
+        segments.append((start, len(labels), cur))
+    return segments
+
+
+def _apply_thesis_postprocess(
+    text: str,
+    labels: List[int],
+    char_probs: Sequence[Any],
+    *,
+    other_threshold: float,
+    other_id: Optional[int],
+    min_run_chars: int,
+    boundary_snap_max_shift: int,
+) -> Tuple[List[int], Dict[str, Any]]:
+    original = [int(label) for label in labels]
+    current = original[:]
+    stats: Dict[str, Any] = {
+        "profile": POSTPROCESS_PROFILE_THESIS,
+        "settings": {
+            "other_threshold": float(other_threshold),
+            "min_run_chars": int(min_run_chars),
+            "boundary_snap_max_shift": int(boundary_snap_max_shift),
+            "stages": [
+                "whitespace_relabel",
+                "other_gating",
+                "boundary_snap",
+                "min_run",
+            ],
+            "excluded_viewer_stages": [
+                "markdown_structure_fill",
+                "paired_delimiter_fill",
+                "local_host_fill",
+                "newline_snap",
+            ],
+        },
+        "processed_chars": int(len(current)),
+        "other_thresholded_chars": 0,
+        "boundary_snap_changed_chars": 0,
+        "min_run_changed_chars": 0,
+        "changed_chars": 0,
+    }
+    if not current:
+        return current, stats
+
+    gated, thresholded = _apply_thesis_other_threshold(
+        current,
+        char_probs,
+        threshold=float(other_threshold),
+        other_id=other_id,
+    )
+    current = gated
+    stats["other_thresholded_chars"] = int(thresholded)
+
+    before_boundary = current[:]
+    current = _snap_thesis_boundaries_to_delimiters(
+        text,
+        current,
+        char_probs,
+        max_shift=int(boundary_snap_max_shift),
+    )
+    stats["boundary_snap_changed_chars"] = int(_count_label_changes(before_boundary, current))
+
+    before_min_run = current[:]
+    current = _normalize_thesis_min_runs(
+        current,
+        char_probs,
+        min_run_chars=int(min_run_chars),
+    )
+    stats["min_run_changed_chars"] = int(_count_label_changes(before_min_run, current))
+    stats["changed_chars"] = int(_count_label_changes(original, current))
+    return current, stats
 
 
 class SegmenterRunner:
@@ -671,6 +1095,7 @@ class SegmenterRunner:
             if self.arch == "magika"
             else int(cfg.NUM_CLASSES)
         )
+        self.last_postprocess_stats: Dict[str, Any] = {"profile": POSTPROCESS_PROFILE_OFF}
         if self.arch == "magika":
             self._weight_cache = {}
             self.model = None
@@ -1037,22 +1462,38 @@ class SegmenterRunner:
             return []
         return list(self._fast_engine.execution_history)
 
-    def segment_text(self, text: str, *, min_run_chars: int = 1) -> Tuple[List[Tuple[int, int, int]], List[int], List[np.ndarray]]:
+    def segment_text(
+        self,
+        text: str,
+        *,
+        min_run_chars: int = 1,
+        postprocess_profile: str = POSTPROCESS_PROFILE_OFF,
+        other_threshold: float = 0.0,
+        postprocess_min_run_chars: int = 5,
+        postprocess_boundary_snap_max_shift: int = 2,
+    ) -> Tuple[List[Tuple[int, int, int]], List[int], List[np.ndarray]]:
         text = normalize_eval_text(text)
         byte_arr = np.frombuffer(text.encode("utf-8", "ignore"), dtype=np.uint8)
         byte_labels, byte_probs = self._segment_bytes(byte_arr)
         char_labels, char_probs = _byte_labels_to_char_labels(text, byte_labels, byte_probs, self.num_classes)
-        char_labels = _smooth_min_run(char_labels, min_run_chars)
-        segments: List[Tuple[int, int, int]] = []
-        if char_labels:
-            cur = char_labels[0]
-            start = 0
-            for idx in range(1, len(char_labels)):
-                if char_labels[idx] != cur:
-                    segments.append((start, idx, cur))
-                    start = idx
-                    cur = char_labels[idx]
-            segments.append((start, len(char_labels), cur))
+        profile = str(postprocess_profile or POSTPROCESS_PROFILE_OFF).lower().strip()
+        if profile == POSTPROCESS_PROFILE_THESIS:
+            char_labels, stats = _apply_thesis_postprocess(
+                text,
+                char_labels,
+                char_probs,
+                other_threshold=float(other_threshold or 0.0),
+                other_id=getattr(cfg, "OTHER_CLASS_INDEX", None),
+                min_run_chars=int(postprocess_min_run_chars),
+                boundary_snap_max_shift=int(postprocess_boundary_snap_max_shift),
+            )
+            self.last_postprocess_stats = stats
+        elif profile == POSTPROCESS_PROFILE_OFF:
+            char_labels = _smooth_min_run(char_labels, min_run_chars)
+            self.last_postprocess_stats = {"profile": POSTPROCESS_PROFILE_OFF}
+        else:
+            raise ValueError(f"Unknown postprocess profile: {postprocess_profile!r}")
+        segments = _labels_to_segments(char_labels)
         return segments, char_labels, char_probs
 
     def segment_text_labels_only(self, text: str, *, min_run_chars: int = 1) -> Tuple[List[Tuple[int, int, int]], List[int]]:
@@ -1061,17 +1502,220 @@ class SegmenterRunner:
         byte_labels = self._segment_bytes_labels_only(byte_arr)
         char_labels = _byte_labels_to_char_labels_only(text, byte_labels)
         char_labels = _smooth_min_run(char_labels, min_run_chars)
-        segments: List[Tuple[int, int, int]] = []
-        if char_labels:
-            cur = char_labels[0]
-            start = 0
-            for idx in range(1, len(char_labels)):
-                if char_labels[idx] != cur:
-                    segments.append((start, idx, cur))
-                    start = idx
-                    cur = char_labels[idx]
-            segments.append((start, len(char_labels), cur))
+        segments = _labels_to_segments(char_labels)
         return segments, char_labels
+
+
+class _PredictionCacheTaskState:
+    __slots__ = ("labels", "probs")
+
+    def __init__(self) -> None:
+        self.labels: List[np.ndarray] = []
+        self.probs: List[np.ndarray] = []
+
+
+class PredictionCache:
+    """Per-task cache of raw model outputs.
+
+    Format per task: ``<root>/<task>__raw.npz`` containing flattened ``labels``
+    (int16) and full per-character probability vectors ``probs`` (float16,
+    shape ``[total_chars, num_classes]``) plus an ``offsets`` int64 array of
+    length ``N_samples + 1``. Storing the full distribution is required
+    because the thesis post-processing reads the probability of arbitrary
+    classes via ``_char_prob_value`` (e.g. for boundary snap and minimum-run
+    label selection), not only the per-position argmax.
+    """
+
+    def __init__(self, root: Path, mode: str) -> None:
+        assert mode in {"read", "write"}, f"Unsupported cache mode {mode!r}"
+        self.root = Path(root)
+        self.mode = mode
+        self._write_state: Dict[str, _PredictionCacheTaskState] = {}
+        self._read_state: Dict[str, Dict[str, np.ndarray]] = {}
+        if mode == "write":
+            self.root.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, task: str) -> Path:
+        return self.root / f"{task}__raw.npz"
+
+    def begin_task(self, task: str) -> None:
+        if self.mode == "write":
+            self._write_state.setdefault(task, _PredictionCacheTaskState())
+            return
+        if task in self._read_state:
+            return
+        data = np.load(self._path(task), allow_pickle=False)
+        self._read_state[task] = {
+            "labels": data["labels"],
+            "probs": data["probs"],
+            "offsets": data["offsets"],
+        }
+
+    def end_task(self, task: str) -> None:
+        if self.mode != "write":
+            return
+        st = self._write_state.pop(task, None)
+        if st is None or not st.labels:
+            return
+        labels_concat = np.concatenate(st.labels).astype(np.int16, copy=False)
+        probs_concat = np.concatenate(st.probs, axis=0).astype(np.float16, copy=False)
+        offsets = np.zeros(len(st.labels) + 1, dtype=np.int64)
+        cum = 0
+        for i, arr in enumerate(st.labels):
+            cum += len(arr)
+            offsets[i + 1] = cum
+        np.savez_compressed(
+            self._path(task),
+            labels=labels_concat,
+            probs=probs_concat,
+            offsets=offsets,
+        )
+
+    def write_sample(self, task: str, labels: np.ndarray, probs: np.ndarray) -> None:
+        st = self._write_state[task]
+        st.labels.append(np.asarray(labels, dtype=np.int16))
+        probs_arr = np.asarray(probs, dtype=np.float16)
+        if probs_arr.ndim != 2:
+            raise ValueError(f"Expected 2-D probs matrix, got shape {probs_arr.shape}")
+        st.probs.append(probs_arr)
+
+    def read_sample(self, task: str, sample_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        rs = self._read_state[task]
+        off = rs["offsets"]
+        s, e = int(off[sample_idx]), int(off[sample_idx + 1])
+        return (
+            rs["labels"][s:e].astype(np.int64, copy=False),
+            rs["probs"][s:e].astype(np.float32, copy=False),
+        )
+
+
+class _RunnerCacheAdapter:
+    """Wraps a ``SegmenterRunner`` to either cache raw outputs (write mode)
+    or substitute cached outputs in place of model inference (read mode).
+
+    The adapter mirrors the public ``segment_text`` surface used by the
+    evaluation loop. In write mode it forwards to the inner runner with
+    post-processing disabled, caches the raw labels + per-char max-probability,
+    and then applies the requested post-processing locally. In read mode the
+    inner runner is not required and the model is not loaded at all.
+    """
+
+    def __init__(
+        self,
+        inner: Optional["SegmenterRunner"],
+        cache: PredictionCache,
+        *,
+        fallback_arch: Optional[str] = None,
+        fallback_chunk: Optional[int] = None,
+        fallback_batch_size: Optional[int] = None,
+    ) -> None:
+        self.inner = inner
+        self.cache = cache
+        self.arch = inner.arch if inner is not None else str(fallback_arch or "cached")
+        self.chunk = int(inner.chunk if inner is not None else (fallback_chunk or 0))
+        self.batch_size = int(inner.batch_size if inner is not None else (fallback_batch_size or 0))
+        self.num_classes = int(getattr(inner, "num_classes", cfg.NUM_CLASSES))
+        self.magika_module_version = getattr(inner, "magika_module_version", None)
+        self.magika_model_name = getattr(inner, "magika_model_name", None)
+        self.last_postprocess_stats: Dict[str, Any] = {"profile": POSTPROCESS_PROFILE_OFF}
+        self._task: Optional[str] = None
+        self._sample_idx: int = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle hooks driven by the evaluation loop.
+    def begin_task(self, task: str) -> None:
+        self._task = task
+        self._sample_idx = 0
+        self.cache.begin_task(task)
+
+    def end_task(self) -> None:
+        if self._task is not None:
+            self.cache.end_task(self._task)
+        self._task = None
+        self._sample_idx = 0
+
+    # ------------------------------------------------------------------
+    # Pass-through helpers required by the evaluation pipeline.
+    def clear_fast_execution_history(self) -> None:
+        if self.inner is not None and hasattr(self.inner, "clear_fast_execution_history"):
+            self.inner.clear_fast_execution_history()
+
+    def get_fast_execution_history(self) -> List[Any]:
+        if self.inner is not None and hasattr(self.inner, "get_fast_execution_history"):
+            return self.inner.get_fast_execution_history()
+        return []
+
+    def segment_byte_arrays_batch_labels_only(self, *args, **kwargs):
+        if self.inner is None:
+            raise RuntimeError("Cached runner cannot serve raw byte-batch inference.")
+        return self.inner.segment_byte_arrays_batch_labels_only(*args, **kwargs)
+
+    def segment_text_labels_only(self, *args, **kwargs):
+        if self.inner is None:
+            raise RuntimeError("Cached runner cannot serve labels-only inference.")
+        return self.inner.segment_text_labels_only(*args, **kwargs)
+
+    def segment_text(
+        self,
+        text: str,
+        *,
+        min_run_chars: int = 1,
+        postprocess_profile: str = POSTPROCESS_PROFILE_OFF,
+        other_threshold: float = 0.0,
+        postprocess_min_run_chars: int = 5,
+        postprocess_boundary_snap_max_shift: int = 2,
+    ) -> Tuple[List[Tuple[int, int, int]], List[int], List[np.ndarray]]:
+        if self._task is None:
+            raise RuntimeError(
+                "RunnerCacheAdapter.segment_text called before begin_task(); "
+                "the evaluation loop must announce the current task name."
+            )
+        norm_text = normalize_eval_text(text)
+        if self.cache.mode == "read":
+            labels_arr, probs_matrix = self.cache.read_sample(self._task, self._sample_idx)
+            char_labels: List[int] = labels_arr.tolist()
+            char_probs: List[np.ndarray] = [np.asarray(row, dtype=np.float32) for row in probs_matrix]
+        else:
+            if self.inner is None:
+                raise RuntimeError("Cache write mode requires a backing SegmenterRunner.")
+            _, char_labels, char_probs = self.inner.segment_text(
+                norm_text,
+                min_run_chars=1,
+                postprocess_profile=POSTPROCESS_PROFILE_OFF,
+            )
+            if char_probs:
+                probs_matrix = np.stack(
+                    [np.asarray(p, dtype=np.float32) for p in char_probs], axis=0
+                )
+            else:
+                probs_matrix = np.zeros((0, self.num_classes), dtype=np.float32)
+            self.cache.write_sample(
+                self._task,
+                np.asarray(char_labels, dtype=np.int16),
+                probs_matrix.astype(np.float16, copy=False),
+            )
+        self._sample_idx += 1
+
+        profile = str(postprocess_profile or POSTPROCESS_PROFILE_OFF).lower().strip()
+        if profile == POSTPROCESS_PROFILE_THESIS:
+            char_labels, stats = _apply_thesis_postprocess(
+                norm_text,
+                char_labels,
+                char_probs,
+                other_threshold=float(other_threshold or 0.0),
+                other_id=getattr(cfg, "OTHER_CLASS_INDEX", None),
+                min_run_chars=int(postprocess_min_run_chars),
+                boundary_snap_max_shift=int(postprocess_boundary_snap_max_shift),
+            )
+            self.last_postprocess_stats = stats
+        elif profile == POSTPROCESS_PROFILE_OFF:
+            char_labels = _smooth_min_run(char_labels, int(min_run_chars))
+            self.last_postprocess_stats = {"profile": POSTPROCESS_PROFILE_OFF}
+        else:
+            raise ValueError(f"Unknown postprocess profile: {postprocess_profile!r}")
+
+        segments = _labels_to_segments(char_labels)
+        return segments, char_labels, char_probs
 
 
 # ---------------------------------------------------------------------------
@@ -2005,7 +2649,12 @@ def _default_monitor_b_root() -> Path:
 
 def _configure_evaluation_mode(args) -> Dict[str, Any]:
     default_eval_root = (REPO_ROOT / "evaluation" / "data").resolve()
-    fine_tune_eval_root = (REPO_ROOT / "evaluation" / "data_b").resolve()
+    # New default: the thesis-aligned dense/test set built from the Gemini-Pro
+    # labels under evaluation/test/. The previous data_b root was sampled from
+    # the monitor split (which is consumed by active learning at training time)
+    # and is therefore NOT a true held-out test set.
+    thesis_test_root = (REPO_ROOT / "evaluation" / "test").resolve()
+    legacy_monitor_b_root = (REPO_ROOT / "evaluation" / "data_b").resolve()
     requested_root = Path(args.data_root).resolve()
     fine_tuned_mode = not bool(getattr(args, "non_fine_tuned", False))
     messages: List[str] = []
@@ -2015,11 +2664,23 @@ def _configure_evaluation_mode(args) -> Dict[str, Any]:
             "⚠️  --fine-tuned is deprecated; fine-tuned evaluation is now the default."
         )
     if fine_tuned_mode:
+        # If the caller passed the historical default (evaluation/data) AND the
+        # new thesis test root exists, redirect to it. If the new root is not
+        # present yet, fall back to the legacy data_b root with a loud warning
+        # so the user knows they are running on a monitor-derived set.
         if requested_root == default_eval_root:
-            args.data_root = str(fine_tune_eval_root)
-            messages.append(
-                f"ℹ️  Fine-tuned mode (default): using evaluation data root {args.data_root}"
-            )
+            if thesis_test_root.exists():
+                args.data_root = str(thesis_test_root)
+                messages.append(
+                    f"ℹ️  Fine-tuned mode (default): using thesis dense/test root {args.data_root}"
+                )
+            else:
+                args.data_root = str(legacy_monitor_b_root)
+                messages.append(
+                    "⚠️  Thesis dense/test root evaluation/test/ not found; falling "
+                    "back to evaluation/data_b (monitor-derived; NOT a true held-out "
+                    "test set). Re-run build_thesis_test_set.py to produce the new root."
+                )
         else:
             args.data_root = str(requested_root)
             messages.append(
@@ -2037,7 +2698,8 @@ def _configure_evaluation_mode(args) -> Dict[str, Any]:
         "fine_tuned_mode": bool(fine_tuned_mode),
         "messages": messages,
         "default_eval_root": str(default_eval_root),
-        "fine_tune_eval_root": str(fine_tune_eval_root),
+        "thesis_test_root": str(thesis_test_root),
+        "legacy_monitor_b_root": str(legacy_monitor_b_root),
     }
 
 
@@ -2343,9 +3005,13 @@ def evaluate_task(
     *,
     min_run_chars: int,
     other_threshold: float = 0.0,
+    postprocess_profile: str = POSTPROCESS_PROFILE_OFF,
+    postprocess_min_run_chars: int = 5,
+    postprocess_boundary_snap_max_shift: int = 2,
     excluded_truth_labels: Optional[Sequence[str]] = None,
 ) -> TaskMetrics:
     total_samples = len(dataset)
+    postprocess_profile_norm = str(postprocess_profile or POSTPROCESS_PROFILE_OFF).lower().strip()
     excluded_truth_label_set = _normalize_truth_label_exclusions(excluded_truth_labels)
     truth_label_exclusions = _truth_label_exclusion_payload(
         requested_total=total_samples,
@@ -2377,9 +3043,38 @@ def evaluate_task(
     counted_samples = 0
     if truth_label_exclusions is not None:
         extra_payload["truth_label_exclusions"] = truth_label_exclusions
+    postprocess_stats: Optional[Dict[str, Any]] = None
+    if postprocess_profile_norm == POSTPROCESS_PROFILE_THESIS:
+        postprocess_stats = {
+            "profile": POSTPROCESS_PROFILE_THESIS,
+            "settings": {
+                "other_threshold": float(other_threshold or 0.0),
+                "min_run_chars": int(postprocess_min_run_chars),
+                "boundary_snap_max_shift": int(postprocess_boundary_snap_max_shift),
+                "stages": [
+                    "whitespace_relabel",
+                    "other_gating",
+                    "boundary_snap",
+                    "min_run",
+                ],
+                "excluded_viewer_stages": [
+                    "markdown_structure_fill",
+                    "paired_delimiter_fill",
+                    "local_host_fill",
+                    "newline_snap",
+                ],
+            },
+            "samples": 0,
+            "processed_chars": 0,
+            "other_thresholded_chars": 0,
+            "boundary_snap_changed_chars": 0,
+            "min_run_changed_chars": 0,
+            "changed_chars": 0,
+        }
+        extra_payload["postprocess"] = postprocess_stats
 
     pure_stats: Optional[Dict[str, int]] = None
-    if name == "pure_fragments":
+    if name in ("pure_fragments", "near_pure"):
         pure_stats = {
             "total": 0,
             "perfect": 0,
@@ -2540,6 +3235,18 @@ def evaluate_task(
 
     payload_model_eval_idx = _build_model_eval_idx_lookup(label_to_idx) if payload_stats is not None else np.zeros((0,), dtype=np.int32)
 
+    realistic_stats: Optional[Dict[str, Any]] = None
+    if name == "realistic":
+        realistic_stats = {
+            "boundary_region": {
+                "window_radius_tokens": NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                "samples": 0,
+                "boundaries": 0,
+                "confusion": np.zeros((len(label_names), len(label_names)), dtype=np.int64),
+            },
+        }
+        extra_payload["realistic_stats"] = realistic_stats
+
     sequence_stats: Optional[Dict[str, Any]] = None
     if name == "sequence_pair":
         sequence_stats = {
@@ -2597,11 +3304,42 @@ def evaluate_task(
             label_to_idx=label_to_idx,
             declared_host_label=declared_host_label,
         )
-        segments, pred_labels, pred_probs = runner.segment_text(content, min_run_chars=min_run_chars)
+        if postprocess_profile_norm == POSTPROCESS_PROFILE_THESIS:
+            segments, pred_labels, pred_probs = runner.segment_text(
+                content,
+                min_run_chars=min_run_chars,
+                postprocess_profile=POSTPROCESS_PROFILE_THESIS,
+                other_threshold=float(other_threshold or 0.0),
+                postprocess_min_run_chars=int(postprocess_min_run_chars),
+                postprocess_boundary_snap_max_shift=int(postprocess_boundary_snap_max_shift),
+            )
+        elif postprocess_profile_norm == POSTPROCESS_PROFILE_OFF:
+            segments, pred_labels, pred_probs = runner.segment_text(content, min_run_chars=min_run_chars)
+        else:
+            raise ValueError(f"Unknown postprocess profile: {postprocess_profile!r}")
+        if postprocess_stats is not None:
+            sample_postprocess_stats = getattr(runner, "last_postprocess_stats", None)
+            postprocess_stats["samples"] = int(postprocess_stats.get("samples", 0)) + 1
+            if isinstance(sample_postprocess_stats, Mapping):
+                for key in (
+                    "processed_chars",
+                    "other_thresholded_chars",
+                    "boundary_snap_changed_chars",
+                    "min_run_changed_chars",
+                    "changed_chars",
+                ):
+                    postprocess_stats[key] = int(postprocess_stats.get(key, 0)) + int(
+                        sample_postprocess_stats.get(key, 0) or 0
+                    )
         pred_idx_array = np.full((len(pred_labels),), -1, dtype=np.int32)
         prob_rows: Optional[List[Optional[np.ndarray]]] = [None] * len(pred_labels) if payload_stats is not None else None
         other_idx_eval = label_to_idx.get("other")
-        use_other_threshold = other_threshold is not None and float(other_threshold) > 0.0 and other_idx_eval is not None
+        use_other_threshold = (
+            postprocess_profile_norm != POSTPROCESS_PROFILE_THESIS
+            and other_threshold is not None
+            and float(other_threshold) > 0.0
+            and other_idx_eval is not None
+        )
         for i, lbl_id in enumerate(pred_labels):
             label_name = cfg.ID2LANG.get(int(lbl_id), None)
             if label_name is not None:
@@ -2735,8 +3473,14 @@ def evaluate_task(
                 host_label = normalized_segments[0].get("label")
             host_idx = label_to_idx.get(host_label) if host_label else None
             threshold = float(needle_stats.get("threshold", NEEDLE_COVERAGE_THRESHOLD))
-            region_start = metadata.get("inserted_char_start", metadata.get("needle_char_start"))
-            region_end = metadata.get("inserted_char_end", metadata.get("needle_char_end"))
+            region_start = metadata.get(
+                "inserted_char_start",
+                metadata.get("needle_char_start", metadata.get("injection_char_start")),
+            )
+            region_end = metadata.get(
+                "inserted_char_end",
+                metadata.get("needle_char_end", metadata.get("injection_char_end")),
+            )
             boundary_entry = needle_stats.get("boundary_region")
             if isinstance(boundary_entry, dict):
                 boundary_mask_valid = _boundary_region_valid_mask(
@@ -2941,6 +3685,7 @@ def evaluate_task(
             if is_monitor_markdown and blocks_meta:
                 inferred_host_lang = _infer_markdown_host_lang(blocks_meta)
 
+            inline_blocks_from_main: List[Mapping[str, Any]] = []
             for block in blocks_meta:
                 start = int(block.get("char_start", 0))
                 end = int(block.get("char_end", start))
@@ -2952,6 +3697,15 @@ def evaluate_task(
                 actual_idx = label_to_idx.get(actual_label)
                 if actual_idx is None or end <= start:
                     continue
+                # New test-split schema: every block contributes a boundary at its
+                # start and end. The legacy exact_region path appends below as well,
+                # so guard with a list-id check to avoid double-counting.
+                boundary_positions.extend((start, end))
+                # Inline blocks (wrapper == 'inline') are accumulated into the
+                # inline_stats payload below instead of the block-level stats.
+                if block.get("wrapper") == "inline":
+                    inline_blocks_from_main.append(block)
+                    continue
                 if block.get("truth_mode") == "exact_region":
                     region_valid_mask = _region_mask_valid(len(content), valid_mask, start, end)
                     if region_valid_mask is None:
@@ -2959,7 +3713,6 @@ def evaluate_task(
                     block_len = int(region_valid_mask.sum())
                     if block_len <= 0:
                         continue
-                    boundary_positions.extend((start, end))
                     pred_slice = pred_valid[region_valid_mask]
                     exact = _exact_region_stats(truth_valid, pred_valid, region_valid_mask)
                     correct_chars = int(exact["correct_chars"])
@@ -3010,7 +3763,8 @@ def evaluate_task(
                     text_chars = intersection_text
 
                 # Recover wrapper/role semantics for monitor-based markdown docs.
-                wrapped_flag = bool(block.get("wrapped"))
+                # New test-split schema uses block['wrapper'] ∈ {'fenced','plain','inline'}.
+                wrapped_flag = bool(block.get("wrapped")) or block.get("wrapper") == "fenced"
                 if is_monitor_markdown and not wrapped_flag:
                     if _is_fenced_markdown_block(content, start, end):
                         wrapped_flag = True
@@ -3077,7 +3831,11 @@ def evaluate_task(
                         if fooled:
                             group["wrong_label_fooled"] += 1
 
-            inline_meta = metadata.get("inline_blocks") or []
+            inline_meta = list(metadata.get("inline_blocks") or [])
+            # New test-split schema embeds inline blocks inside markdown_blocks
+            # with wrapper == "inline" rather than a separate inline_blocks list.
+            if inline_blocks_from_main:
+                inline_meta = inline_meta + inline_blocks_from_main
             inline_stats = markdown_stats["inline"]
             inline_stats.setdefault("per_language", {})
             inline_threshold = float(inline_stats.get("threshold", MARKDOWN_IOU_THRESHOLD))
@@ -3450,6 +4208,40 @@ def evaluate_task(
                                     coverage_threshold=coverage_threshold,
                                 )
 
+        if realistic_stats is not None:
+            boundary_entry = realistic_stats.get("boundary_region")
+            if isinstance(boundary_entry, dict):
+                # Detect truth-label transitions in the valid (non-whitespace)
+                # truth sequence and accumulate confusion in a window around each.
+                valid_positions = np.flatnonzero(valid_mask)
+                if valid_positions.size > 1:
+                    transition_mask = truth_valid[1:] != truth_valid[:-1]
+                    if np.any(transition_mask):
+                        boundary_positions = valid_positions[1:][transition_mask].tolist()
+                        boundary_mask_valid = _boundary_positions_valid_mask(
+                            len(content),
+                            valid_mask,
+                            boundary_positions,
+                            radius_tokens=int(
+                                boundary_entry.get(
+                                    "window_radius_tokens",
+                                    NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                                )
+                            ),
+                        )
+                        if boundary_mask_valid is not None:
+                            boundary_entry["samples"] += 1
+                            boundary_entry["boundaries"] += len(boundary_positions)
+                            boundary_truth = truth_valid[boundary_mask_valid]
+                            boundary_pred = pred_valid[boundary_mask_valid]
+                            boundary_valid_pred = boundary_pred >= 0
+                            if np.any(boundary_valid_pred):
+                                np.add.at(
+                                    boundary_entry["confusion"],
+                                    (boundary_truth[boundary_valid_pred], boundary_pred[boundary_valid_pred]),
+                                    1,
+                                )
+
         if sequence_stats is not None:
             segments_info = sequence_stats["segments"]
             region_meta = metadata.get("sequence_regions")
@@ -3503,6 +4295,44 @@ def evaluate_task(
                     segments_info[pos_key]["total"] += int(exact["truth_chars"])
                     segments_info[pos_key]["correct"] += int(exact["correct_chars"])
             else:
+                # Derive boundary positions from anchor_chars when sequence_regions
+                # are not provided (new test-split schema).
+                anchor = metadata.get("anchor_chars")
+                if (
+                    isinstance(anchor, int)
+                    and anchor > 0
+                    and "first_lang" in metadata
+                    and "second_lang" in metadata
+                ):
+                    boundary_entry = sequence_stats.get("boundary_region")
+                    if isinstance(boundary_entry, dict):
+                        boundary_positions = [anchor]
+                        if "third_lang" in metadata:
+                            boundary_positions.append(2 * anchor)
+                        boundary_mask_valid = _boundary_positions_valid_mask(
+                            len(content),
+                            valid_mask,
+                            boundary_positions,
+                            radius_tokens=int(
+                                boundary_entry.get(
+                                    "window_radius_tokens",
+                                    NEEDLE_BOUNDARY_WINDOW_TOKENS,
+                                )
+                            ),
+                        )
+                        if boundary_mask_valid is not None:
+                            boundary_entry["samples"] += 1
+                            boundary_entry["boundaries"] += len(boundary_positions)
+                            boundary_truth = truth_valid[boundary_mask_valid]
+                            boundary_pred = pred_valid[boundary_mask_valid]
+                            boundary_valid_pred = boundary_pred >= 0
+                            if np.any(boundary_valid_pred):
+                                np.add.at(
+                                    boundary_entry["confusion"],
+                                    (boundary_truth[boundary_valid_pred], boundary_pred[boundary_valid_pred]),
+                                    1,
+                                )
+
                 pairs: List[Tuple[str, Optional[str]]] = []
                 if "first" in segments_info:
                     pairs.append(("first", metadata.get("first_lang")))
@@ -4747,6 +5577,31 @@ def _collect_comparison_metrics(
             "dtype": args.dtype,
             "sample_seed": args.sample_seed,
             "other_threshold": _float_or_none(getattr(args, "other_threshold", 0.0)),
+            "postprocess_profile": getattr(args, "postprocess_profile", POSTPROCESS_PROFILE_OFF),
+            "postprocess_min_run": int(getattr(args, "postprocess_min_run", 5)),
+            "postprocess_boundary_snap_max_shift": int(
+                getattr(args, "postprocess_boundary_snap_max_shift", 2)
+            ),
+            "postprocess_stages": (
+                [
+                    "whitespace_relabel",
+                    "other_gating",
+                    "boundary_snap",
+                    "min_run",
+                ]
+                if getattr(args, "postprocess_profile", POSTPROCESS_PROFILE_OFF) == POSTPROCESS_PROFILE_THESIS
+                else []
+            ),
+            "postprocess_excluded_viewer_stages": (
+                [
+                    "markdown_structure_fill",
+                    "paired_delimiter_fill",
+                    "local_host_fill",
+                    "newline_snap",
+                ]
+                if getattr(args, "postprocess_profile", POSTPROCESS_PROFILE_OFF) == POSTPROCESS_PROFILE_THESIS
+                else []
+            ),
             "excluded_truth_labels": list(getattr(args, "exclude_truth_labels", []) or []),
             "truth_label_exclusion_note": exclusion_note,
             "magika_module_version": getattr(args, "magika_module_version", None),
@@ -4758,6 +5613,23 @@ def _collect_comparison_metrics(
         },
         "tasks": {},
     }
+
+    postprocess_summary: Dict[str, Any] = {}
+    for metrics in task_metrics:
+        stats = metrics.extras.get("postprocess") if metrics.extras else None
+        if not isinstance(stats, Mapping):
+            continue
+        postprocess_summary[metrics.name] = {
+            "profile": stats.get("profile"),
+            "samples": int(stats.get("samples", 0) or 0),
+            "processed_chars": int(stats.get("processed_chars", 0) or 0),
+            "other_thresholded_chars": int(stats.get("other_thresholded_chars", 0) or 0),
+            "boundary_snap_changed_chars": int(stats.get("boundary_snap_changed_chars", 0) or 0),
+            "min_run_changed_chars": int(stats.get("min_run_changed_chars", 0) or 0),
+            "changed_chars": int(stats.get("changed_chars", 0) or 0),
+        }
+    if postprocess_summary:
+        data["summary"]["postprocess"] = postprocess_summary
 
     # Malicious injections -------------------------------------------------
     mal_metrics = metrics_by_name.get("mal_injection")
@@ -5040,12 +5912,14 @@ def _collect_comparison_metrics(
         if rst_data:
             data["tasks"]["restructuredtext_mix"] = rst_data
 
-    # Pure fragments -------------------------------------------------------
-    pure_metrics = metrics_by_name.get("pure_fragments")
-    if pure_metrics and pure_metrics.extras:
+    # Pure fragments / near_pure -------------------------------------------
+    for pure_name in ("pure_fragments", "near_pure"):
+        pure_metrics = metrics_by_name.get(pure_name)
+        if not pure_metrics or not pure_metrics.extras:
+            continue
         pure_stats = pure_metrics.extras.get("pure_fragments_purity", {})
         per_label = pure_stats.get("per_label", {})
-        per_language = {}
+        per_language: Dict[str, Any] = {}
         for lang, entry in per_label.items():
             total = int(entry.get("total", 0))
             if total <= 0:
@@ -5055,8 +5929,61 @@ def _collect_comparison_metrics(
                 "within_threshold_rate": _float_or_none(_safe_ratio(entry.get("within", 0), total)),
                 "support": total,
             }
+        overall_total = int(pure_stats.get("total", 0))
+        task_payload: Dict[str, Any] = {}
         if per_language:
-            data["tasks"]["pure_fragments"] = {"per_language": per_language}
+            task_payload["per_language"] = per_language
+        if overall_total > 0:
+            task_payload["overall"] = {
+                "fully_pure_rate": _float_or_none(_safe_ratio(pure_stats.get("perfect", 0), overall_total)),
+                "within_threshold_rate": _float_or_none(_safe_ratio(pure_stats.get("within_threshold", 0), overall_total)),
+                "support": overall_total,
+            }
+        if task_payload:
+            data["tasks"][pure_name] = task_payload
+
+    # Realistic ------------------------------------------------------------
+    realistic_metrics = metrics_by_name.get("realistic")
+    if realistic_metrics is not None:
+        confusion_mat = np.asarray(realistic_metrics.confusion, dtype=np.int64)
+        support_total = int(confusion_mat.sum()) if confusion_mat.size else 0
+        if support_total > 0:
+            id2label = {idx: str(label) for idx, label in enumerate(realistic_metrics.label_names)}
+            metrics_payload = _metrics_payload_from_confusion(
+                confusion_mat,
+                id2label=id2label,
+                num_classes=int(confusion_mat.shape[0]),
+                ignore_class=None,
+            )
+            aggregates = metrics_payload.get("aggregates", {})
+            task_payload = {
+                "overall_accuracy": _float_or_none(realistic_metrics.overall_accuracy()),
+                "macro_f1": _float_or_none(aggregates.get("macro_f1")),
+                "macro_precision": _float_or_none(aggregates.get("macro_precision")),
+                "macro_recall": _float_or_none(aggregates.get("macro_recall")),
+                "weighted_f1": _float_or_none(aggregates.get("weighted_f1")),
+                "support": support_total,
+                "per_label": dict(metrics_payload.get("by_label", {})),
+            }
+            extras = realistic_metrics.extras or {}
+            realistic_extras = extras.get("realistic_stats", {})
+            boundary_payload = _sequence_boundary_metrics_payload(
+                realistic_extras.get("boundary_region", {}),
+                label_names=realistic_metrics.label_names,
+            )
+            if boundary_payload is not None:
+                task_payload["boundary_region"] = {
+                    "window_radius_tokens": int(
+                        boundary_payload.get("window_radius_tokens", NEEDLE_BOUNDARY_WINDOW_TOKENS)
+                    ),
+                    "support_chars": int(boundary_payload.get("support_chars", 0)),
+                    "samples": int(boundary_payload.get("samples", 0)),
+                    "boundaries": int(boundary_payload.get("boundaries", 0)),
+                    "aggregates": dict(boundary_payload.get("aggregates", {})),
+                    "rows": list(boundary_payload.get("rows", [])),
+                    "by_label": dict(boundary_payload.get("by_label", {})),
+                }
+            data["tasks"]["realistic"] = task_payload
 
     # Sequence tasks -------------------------------------------------------
     for name in ("sequence_pair", "sequence_triplet"):
@@ -5297,6 +6224,21 @@ def write_report(
     report_lines.append(f"- Chunk: {args.chunk}")
     report_lines.append(f"- Batch size: {args.batch_size}")
     report_lines.append(f"- Other threshold: {float(getattr(args, 'other_threshold', 0.0)):.4f}")
+    report_lines.append(f"- Minimum run smoothing: {int(getattr(args, 'min_run', 1))}")
+    report_lines.append(f"- Postprocess profile: {getattr(args, 'postprocess_profile', POSTPROCESS_PROFILE_OFF)}")
+    if getattr(args, "postprocess_profile", POSTPROCESS_PROFILE_OFF) == POSTPROCESS_PROFILE_THESIS:
+        report_lines.append(f"- Postprocess minimum run: {int(getattr(args, 'postprocess_min_run', 5))}")
+        report_lines.append(
+            "- Postprocess boundary snap max shift: "
+            f"{int(getattr(args, 'postprocess_boundary_snap_max_shift', 2))}"
+        )
+        report_lines.append(
+            "- Postprocess stages: whitespace_relabel, other_gating, boundary_snap, min_run"
+        )
+        report_lines.append(
+            "- Excluded viewer-only stages: markdown_structure_fill, paired_delimiter_fill, "
+            "local_host_fill, newline_snap"
+        )
     report_lines.append(f"- Max samples per task: {'all' if args.max_samples <= 0 else args.max_samples}")
     report_lines.append(f"- Sample seed: {args.sample_seed}")
     excluded_truth_labels = list(getattr(args, "exclude_truth_labels", []) or [])
@@ -5879,6 +6821,44 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         ),
     )
     parser.add_argument(
+        "--postprocess-profile",
+        choices=POSTPROCESS_PROFILE_CHOICES,
+        default=POSTPROCESS_PROFILE_OFF,
+        help=(
+            "Character-level post-processing profile. 'off' preserves baseline behavior; "
+            "'thesis' applies the thesis-only whitespace/other/boundary/min-run sequence."
+        ),
+    )
+    parser.add_argument(
+        "--postprocess-min-run",
+        type=int,
+        default=5,
+        help="Minimum interior run length for --postprocess-profile thesis.",
+    )
+    parser.add_argument(
+        "--postprocess-boundary-snap-max-shift",
+        type=int,
+        default=2,
+        help="Maximum boundary movement in characters for --postprocess-profile thesis.",
+    )
+    parser.add_argument(
+        "--cache-predictions-dir",
+        default=None,
+        help=(
+            "Directory to dump per-task raw model outputs (labels + per-char max prob) "
+            "during this run. Enables later --rescore-from-cache sweeps without re-inference."
+        ),
+    )
+    parser.add_argument(
+        "--rescore-from-cache",
+        default=None,
+        help=(
+            "Directory previously populated with --cache-predictions-dir. When set, the "
+            "model checkpoint is not loaded and all task scoring uses the cached raw "
+            "outputs combined with the requested --postprocess-* settings."
+        ),
+    )
+    parser.add_argument(
         "--report-path",
         default=None,
         help=(
@@ -5943,6 +6923,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for message in mode_info.get("messages", []):
         print(message, flush=True)
 
+    rescore_mode = bool(getattr(args, "rescore_from_cache", None))
+    cache_write_mode = bool(getattr(args, "cache_predictions_dir", None))
+    if rescore_mode and cache_write_mode:
+        raise RuntimeError("--cache-predictions-dir and --rescore-from-cache are mutually exclusive.")
+
     data_root = Path(args.data_root).resolve()
     manifest_path = Path(args.manifest) if args.manifest else data_root / "manifest.json"
     overall_start = time.perf_counter()
@@ -5959,7 +6944,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         auto_hparams: Dict[str, Any] = {}
         label_names = None
         ckpt_path: Optional[Path] = None
-        if args.checkpoint:
+        if args.checkpoint and not rescore_mode:
             ckpt_path = Path(args.checkpoint).resolve()
             auto_hparams = _load_checkpoint_hparams(ckpt_path)
             label_names = auto_hparams.get("label_names")
@@ -5967,15 +6952,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _apply_label_mapping(label_names)
 
         arch = args.arch if args.arch is not None else auto_hparams.get("arch", None)
-        if arch is None and not args.checkpoint:
+        if arch is None and not args.checkpoint and not rescore_mode:
             arch = "magika"
         arch = str(arch).lower().strip() if arch else "unet1d"
         args.arch = arch
 
-        if arch != "magika" and ckpt_path is None:
-            raise RuntimeError(f"Architecture '{arch}' requires --checkpoint.")
-        if arch == "magika" and not args.checkpoint:
-            args.checkpoint = "magika://default"
+        if not rescore_mode:
+            if arch != "magika" and ckpt_path is None:
+                raise RuntimeError(f"Architecture '{arch}' requires --checkpoint.")
+            if arch == "magika" and not args.checkpoint:
+                args.checkpoint = "magika://default"
 
         if arch == "magika":
             model_dim = args.model_dim if args.model_dim is not None else 0
@@ -6010,6 +6996,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.dtype = dtype
         args.channels = channels
         args.exclude_truth_labels = [str(label).strip() for label in (args.exclude_truth_labels or []) if str(label).strip()]
+        args.postprocess_profile = str(getattr(args, "postprocess_profile", POSTPROCESS_PROFILE_OFF)).lower().strip()
+        if args.postprocess_profile not in POSTPROCESS_PROFILE_CHOICES:
+            raise RuntimeError(f"Unknown postprocess profile: {args.postprocess_profile!r}")
+        args.postprocess_min_run = max(1, int(getattr(args, "postprocess_min_run", 5)))
+        args.postprocess_boundary_snap_max_shift = max(
+            0,
+            int(getattr(args, "postprocess_boundary_snap_max_shift", 2)),
+        )
+        if args.postprocess_profile == POSTPROCESS_PROFILE_THESIS:
+            print(
+                "ℹ️  Thesis post-processing enabled: "
+                f"tau={float(args.other_threshold):.4f}, "
+                f"boundary_shift<={int(args.postprocess_boundary_snap_max_shift)}, "
+                f"min_run={int(args.postprocess_min_run)}",
+                flush=True,
+            )
 
         if auto_hparams and arch != "magika":
             extra = f", classes={len(label_names)}" if label_names else ""
@@ -6028,30 +7030,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     flush=True,
                 )
 
-        accuracy_runner = SegmenterRunner(
-            args.checkpoint,
-            arch=arch,
-            model_dim=model_dim,
-            channels=channels,
-            mamba_layers=int(getattr(args, "mamba_layers", 6) or 6),
-            mamba_d_state=int(getattr(args, "mamba_d_state", 8) or 8),
-            mamba_expand=int(getattr(args, "mamba_expand", 1) or 1),
-            mamba_dt_rank=int(getattr(args, "mamba_dt_rank", 16) or 16),
-            mamba_conv=int(getattr(args, "mamba_conv", 4) or 4),
-            mamba_bidirectional=bool(getattr(args, "mamba_bidirectional", True)),
-            dtype=dtype,
-            chunk=args.chunk,
-            device=args.device,
-            batch_size=args.batch_size,
-            inference_backend=args.inference_backend,
-        )
-        if arch == "magika":
-            args.magika_module_version = getattr(accuracy_runner, "magika_module_version", None)
-            args.magika_model_name = getattr(accuracy_runner, "magika_model_name", None)
-        runner_channels = getattr(accuracy_runner, "channels", None)
-        if runner_channels:
-            channels = [int(ch) for ch in runner_channels]
-            args.channels = channels
+        cache_adapter: Optional[_RunnerCacheAdapter] = None
+        if rescore_mode:
+            cache = PredictionCache(Path(args.rescore_from_cache).resolve(), mode="read")
+            cache_adapter = _RunnerCacheAdapter(
+                inner=None,
+                cache=cache,
+                fallback_arch=arch,
+                fallback_chunk=int(args.chunk),
+                fallback_batch_size=int(args.batch_size),
+            )
+            accuracy_runner = cache_adapter
+            print(
+                f"ℹ️  Rescore-from-cache mode: model load skipped, reading raw predictions from {args.rescore_from_cache}",
+                flush=True,
+            )
+        else:
+            real_runner = SegmenterRunner(
+                args.checkpoint,
+                arch=arch,
+                model_dim=model_dim,
+                channels=channels,
+                mamba_layers=int(getattr(args, "mamba_layers", 6) or 6),
+                mamba_d_state=int(getattr(args, "mamba_d_state", 8) or 8),
+                mamba_expand=int(getattr(args, "mamba_expand", 1) or 1),
+                mamba_dt_rank=int(getattr(args, "mamba_dt_rank", 16) or 16),
+                mamba_conv=int(getattr(args, "mamba_conv", 4) or 4),
+                mamba_bidirectional=bool(getattr(args, "mamba_bidirectional", True)),
+                dtype=dtype,
+                chunk=args.chunk,
+                device=args.device,
+                batch_size=args.batch_size,
+                inference_backend=args.inference_backend,
+            )
+            if cache_write_mode:
+                cache = PredictionCache(Path(args.cache_predictions_dir).resolve(), mode="write")
+                cache_adapter = _RunnerCacheAdapter(inner=real_runner, cache=cache)
+                accuracy_runner = cache_adapter
+                print(
+                    f"ℹ️  Caching raw predictions to {args.cache_predictions_dir}",
+                    flush=True,
+                )
+            else:
+                accuracy_runner = real_runner
+            if arch == "magika":
+                args.magika_module_version = getattr(real_runner, "magika_module_version", None)
+                args.magika_model_name = getattr(real_runner, "magika_model_name", None)
+            runner_channels = getattr(real_runner, "channels", None)
+            if runner_channels:
+                channels = [int(ch) for ch in runner_channels]
+                args.channels = channels
 
         datasets = _collect_datasets(data_root, args.tasks)
         if not datasets:
@@ -6104,15 +7132,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"▶️  Evaluating task '{name}' [{meta['selected']}/{meta['original']} samples{sample_note}]",
                 flush=True,
             )
-            metrics = evaluate_task(
-                name,
-                meta["description"],
-                ds,
-                accuracy_runner,
-                min_run_chars=args.min_run,
-                other_threshold=args.other_threshold,
-                excluded_truth_labels=args.exclude_truth_labels,
-            )
+            if cache_adapter is not None:
+                cache_adapter.begin_task(name)
+            try:
+                metrics = evaluate_task(
+                    name,
+                    meta["description"],
+                    ds,
+                    accuracy_runner,
+                    min_run_chars=args.min_run,
+                    other_threshold=args.other_threshold,
+                    postprocess_profile=args.postprocess_profile,
+                    postprocess_min_run_chars=args.postprocess_min_run,
+                    postprocess_boundary_snap_max_shift=args.postprocess_boundary_snap_max_shift,
+                    excluded_truth_labels=args.exclude_truth_labels,
+                )
+            finally:
+                if cache_adapter is not None:
+                    cache_adapter.end_task()
             elapsed = metrics.extras.get("elapsed_seconds", 0.0)
             print(
                 f"    [{name}] completed in {elapsed:.1f}s • char_acc={metrics.overall_accuracy():.4f}",
