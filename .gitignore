@@ -34,6 +34,8 @@ evaluation/data_b/**
 active_learning/benchmark_data/**
 active_learning/benchmark_results/**
 checkpoints/**
+!checkpoints/unet_al.msgpack
+!checkpoints/mamba_al.msgpack
 confusion_images/**
 start_stuff.md
 uv.lock
