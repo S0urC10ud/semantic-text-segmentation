@@ -1473,6 +1473,19 @@ def _snap_boundaries_to_delimiters(
             left_run = runs[idx]
             right_run = runs[idx + 1]
             current = int(left_run[1])
+            # Skip snapping when the current boundary already sits adjacent to
+            # a delimiter or to whitespace. The raw model has then already
+            # found a natural seam and a short snap onto a different delimiter
+            # would relabel a syntactic character (for example the closing
+            # quote of an HTML attribute) without evidence that the model was
+            # wrong. This mirrors the gate used by the evaluation harness.
+            left_curr = text[current - 1] if current > 0 else ""
+            right_curr = text[current] if current < len(text) else ""
+            if (
+                left_curr in _BOUNDARY_SNAP_ADJACENT_CHARS
+                or right_curr in _BOUNDARY_SNAP_ADJACENT_CHARS
+            ):
+                continue
             window_start = int(runs[idx - 1][0]) if idx > 0 else int(left_run[0])
             window_end = int(runs[idx + 2][1]) if (idx + 2) < len(runs) else int(right_run[1])
             current_short_count, current_min_len = _count_local_submin_interior_runs(

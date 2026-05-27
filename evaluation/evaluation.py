@@ -829,6 +829,19 @@ def _snap_thesis_boundaries_to_delimiters(
             left_run = runs[idx]
             right_run = runs[idx + 1]
             current = int(left_run[1])
+            # Only snap when the current boundary cuts through identifier-like
+            # content on both sides. If either neighbor is already a delimiter
+            # or whitespace, the boundary is on a natural seam and snapping a
+            # short distance onto a different delimiter would relabel a
+            # syntactic character (for example the closing quote of an HTML
+            # attribute) without evidence that the model was wrong.
+            left_curr = text[current - 1] if current > 0 else ""
+            right_curr = text[current] if current < len(text) else ""
+            if (
+                left_curr in _THESIS_BOUNDARY_ADJACENT_CHARS
+                or right_curr in _THESIS_BOUNDARY_ADJACENT_CHARS
+            ):
+                continue
             current_score = _score_thesis_boundary_candidate(
                 text,
                 out,
