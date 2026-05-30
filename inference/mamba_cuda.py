@@ -89,43 +89,43 @@ def _selective_scan_kernel(
     chan_mask = chan_idx < x_ref.shape[2]
     state_idx = jnp.arange(d_state)
 
-    A_block = plgpu.load(
-        A_ref.at[chan_idx[:, None], state_idx[None, :]],
+    A_block = pl.load(
+        A_ref.at[chan_idx[:, None], state_idx[None, :]], (),
         mask=chan_mask[:, None],
         other=0.0,
     ).astype(jnp.float32)
-    D_block = plgpu.load(
-        D_ref.at[chan_idx],
+    D_block = pl.load(
+        D_ref.at[chan_idx], (),
         mask=chan_mask,
         other=0.0,
     ).astype(jnp.float32)
 
     def body(t: int, state: jnp.ndarray) -> jnp.ndarray:
-        x_t = plgpu.load(
-            x_ref.at[batch_idx, t, chan_idx],
+        x_t = pl.load(
+            x_ref.at[batch_idx, t, chan_idx], (),
             mask=chan_mask,
             other=0.0,
         ).astype(jnp.float32)
-        dt_t = plgpu.load(
-            dt_ref.at[batch_idx, t, chan_idx],
+        dt_t = pl.load(
+            dt_ref.at[batch_idx, t, chan_idx], (),
             mask=chan_mask,
             other=0.0,
         ).astype(jnp.float32)
-        B_t = plgpu.load(
-            B_ref.at[batch_idx, t, state_idx],
+        B_t = pl.load(
+            B_ref.at[batch_idx, t, state_idx], (),
             mask=state_idx < B_ref.shape[2],
             other=0.0,
         ).astype(jnp.float32)
-        C_t = plgpu.load(
-            C_ref.at[batch_idx, t, state_idx],
+        C_t = pl.load(
+            C_ref.at[batch_idx, t, state_idx], (),
             mask=state_idx < C_ref.shape[2],
             other=0.0,
         ).astype(jnp.float32)
         a_t = jnp.exp(dt_t[:, None] * A_block)
         state = a_t * state + x_t[:, None] * (dt_t[:, None] * B_t[None, :])
         y_t = jnp.sum(state * C_t[None, :], axis=-1) + x_t * D_block
-        plgpu.store(
-            y_ref.at[batch_idx, t, chan_idx],
+        pl.store(
+            y_ref.at[batch_idx, t, chan_idx], (),
             y_t.astype(y_ref.dtype),
             mask=chan_mask,
         )
@@ -178,7 +178,7 @@ def selective_scan_cuda(
         kernel,
         out_shape=out_shape,
         grid=(int(x_in.shape[0]), pl.cdiv(d_inner, block_channels)),
-        compiler_params=plgpu.CompilerParams(
+        compiler_params=getattr(plgpu, "CompilerParams", getattr(plgpu, "TritonCompilerParams", dict))(
             num_warps=num_warps,
             num_stages=int(num_stages),
         ),

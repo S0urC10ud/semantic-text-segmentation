@@ -7,21 +7,21 @@ requires-python = "~=3.11.0"
 
 dependencies = [
     "datasets==3.6.0",      # uses map/filter/shuffle with num_proc
-    "flax>=0.11.2",
-    "optax>=0.2.5",
-    "numpy>=1.26",          # JAX works well with >=1.26; NumPy 2.x also fine on recent JAX
+    "flax",
+    "optax",
+    "numpy>=1.26,<2.0",          # JAX works well with >=1.26; NumPy 2.x also fine on recent JAX
     "pyarrow>=12",          # datasets backend
     "msgpack>=1.0.5",
     # --- JAX setup ---
     # Cross-platform CPU JAX:
     #   - On all platforms, install JAX 0.8.1 (has wheels on Windows, Linux, macOS).
     #   - jaxlib is pinned to the same version; wheels exist for win_amd64 + manylinux.
-    "jax==0.8.1",
-    "jaxlib==0.8.1",
+    "jax>=0.4.30,<0.5.0",
+    "jaxlib>=0.4.30,<0.5.0",
     # Extra GPU support only on Linux (CUDA 13):
     # These wheels are Linux-only (manylinux_x86_64/aarch64), so we guard them.
-    'jax-cuda13-plugin[with-cuda]==0.8.1; platform_system == "Linux"',
-    'jax-cuda13-pjrt==0.8.1; platform_system == "Linux"',
+    'jax-cuda12-plugin[with-cuda]>=0.4.30,<0.5.0; platform_system == "Linux"',
+    'jax-cuda12-pjrt>=0.4.30,<0.5.0; platform_system == "Linux"',
     "orbax-checkpoint>=0.6.0",
     "tensorstore>=0.1.67",
     "wandb>=0.21.5",

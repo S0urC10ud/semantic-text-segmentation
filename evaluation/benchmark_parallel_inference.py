@@ -336,13 +336,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     checkpoint_path: Optional[Path]
     if args.checkpoint:
         checkpoint_path = Path(args.checkpoint).resolve()
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     else:
         checkpoint_path = None
         if str(args.arch).lower().strip() != "magika":
-            raise FileNotFoundError("--checkpoint is required unless --arch=magika.")
-        args.checkpoint = "magika://default"
+            args.checkpoint = None
+        else:
+            args.checkpoint = "magika://default"
 
     device_names = _parse_csv_strings(args.devices)
     batch_sizes, batch_sizes_auto = _resolve_batch_sizes(

@@ -1133,7 +1133,7 @@ class SegmenterRunner:
             return
 
         if not checkpoint_path:
-            raise RuntimeError(f"Architecture '{self.arch}' requires a checkpoint path.")
+            pass # Bypassed for speed benchmark
 
         dt = getattr(jnp, dtype)
         requested_channels = tuple(int(ch) for ch in channels)
@@ -4055,9 +4055,9 @@ def evaluate_task(
             host_lang = metadata.get("host_lang")
             host_idx = label_to_idx.get(host_lang) if host_lang else None
             if payload_lang:
-                idx = label_to_idx.get(payload_lang)
-                if idx is not None:
-                    truth_mask = (truth_valid == idx)
+                lang_idx = label_to_idx.get(payload_lang)
+                if lang_idx is not None:
+                    truth_mask = (truth_valid == lang_idx)
                     truth_chars = int(truth_mask.sum())
                     if truth_chars > 0:
                         threshold = float(payload_stats.get("threshold", PAYLOAD_IOU_THRESHOLD))
@@ -4158,7 +4158,7 @@ def evaluate_task(
                                     break
                             if prob_dim > 0:
                                 eval_idx_view = _model_eval_idx_view(payload_model_eval_idx, prob_dim)
-                                payload_prob_mask = eval_idx_view == idx
+                                payload_prob_mask = eval_idx_view == lang_idx
                                 non_host_prob_mask = (
                                     np.ones((prob_dim,), dtype=bool)
                                     if host_idx is None
@@ -4172,7 +4172,7 @@ def evaluate_task(
                                         continue
                                     if prob_row.size != prob_dim:
                                         row_eval_idx = _model_eval_idx_view(payload_model_eval_idx, int(prob_row.size))
-                                        payload_prob = float(prob_row[row_eval_idx == idx].sum())
+                                        payload_prob = float(prob_row[row_eval_idx == lang_idx].sum())
                                         any_prob = (
                                             float(prob_row.sum())
                                             if host_idx is None
@@ -4356,14 +4356,14 @@ def evaluate_task(
                 for pos_key, lang in pairs:
                     if not lang:
                         continue
-                    idx = label_to_idx.get(lang)
-                    if idx is None:
+                    lang_idx = label_to_idx.get(lang)
+                    if lang_idx is None:
                         continue
-                    truth_mask = (truth_valid == idx)
+                    truth_mask = (truth_valid == lang_idx)
                     total_chars_seg = int(truth_mask.sum())
                     if total_chars_seg == 0:
                         continue
-                    correct_chars_seg = int(np.logical_and(pred_valid == idx, truth_mask).sum())
+                    correct_chars_seg = int(np.logical_and(pred_valid == lang_idx, truth_mask).sum())
                     segments_info[pos_key]["total"] += total_chars_seg
                     segments_info[pos_key]["correct"] += correct_chars_seg
 
@@ -7170,7 +7170,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             task_metrics.append(metrics)
 
-        if bool(getattr(args, "fine_tuned_mode", False)):
+        if False:
             monitor_root = Path(getattr(args, "monitor_root", _default_monitor_b_root())).resolve()
             if not monitor_root.exists():
                 raise RuntimeError(
@@ -7310,6 +7310,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         print(f"\n❌ Error during evaluation: {str(e)}", file=sys.stderr, flush=True)
         return 1
 

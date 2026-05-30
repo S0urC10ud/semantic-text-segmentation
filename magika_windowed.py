@@ -7,7 +7,10 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 from magika import Magika
-from magika.types.seekable import Seekable
+try:
+    from magika.types.seekable import Seekable
+except ImportError:
+    Seekable = None
 
 from inference.backend import FastExecutionRecord, build_window_spans, window_weights
 from magika_label_map import (
@@ -75,15 +78,46 @@ class SlidingWindowMagikaSegmenter:
         return cached
 
     def _extract_features(self, window_bytes: np.ndarray):
-        seekable = Seekable(io.BytesIO(np.asarray(window_bytes, dtype=np.uint8).tobytes()))
+        content = np.asarray(window_bytes, dtype=np.uint8).tobytes()
+        
+        cfg = self._model_config
+        is_dict = isinstance(cfg, dict)
+        if is_dict:
+            inner_cfg = cfg.get("cfg", {})
+            sizes = inner_cfg.get("input_sizes", {})
+            beg_size = int(sizes.get("beg", 512))
+            mid_size = int(sizes.get("mid", 512))
+            end_size = int(sizes.get("end", 512))
+            padding_token = int(inner_cfg.get("dense_v4.padding_byte", 256))
+            block_size = 4096
+            use_inputs = False
+        else:
+            beg_size = int(cfg.beg_size)
+            mid_size = int(cfg.mid_size)
+            end_size = int(cfg.end_size)
+            padding_token = int(cfg.padding_token)
+            block_size = int(cfg.block_size)
+            use_inputs = bool(cfg.use_inputs_at_offsets)
+
+        if Seekable is None:
+            return self.detector._extract_features_from_bytes(
+                content,
+                beg_size,
+                mid_size,
+                end_size,
+                padding_token,
+                block_size,
+            )
+        
+        seekable = Seekable(io.BytesIO(content))
         return self.detector._extract_features_from_seekable(
             seekable,
-            int(self._model_config.beg_size),
-            int(self._model_config.mid_size),
-            int(self._model_config.end_size),
-            int(self._model_config.padding_token),
-            int(self._model_config.block_size),
-            bool(self._model_config.use_inputs_at_offsets),
+            beg_size,
+            mid_size,
+            end_size,
+            padding_token,
+            block_size,
+            use_inputs,
         )
 
     def _prediction_from_output(self, raw_label: str, score: float) -> MagikaWindowPrediction:
@@ -126,7 +160,10 @@ class SlidingWindowMagikaSegmenter:
             )
         )
         return [
-            self._prediction_from_output(str(output.label), float(output.score))
+            self._prediction_from_output(
+                str(getattr(output, "ct_label", getattr(output, "label", "txt"))), 
+                float(output.score)
+            )
             for _, output in outputs
         ]
 
