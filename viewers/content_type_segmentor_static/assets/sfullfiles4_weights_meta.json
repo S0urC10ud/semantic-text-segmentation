@@ -1,0 +1,663 @@
+{
+  "embed/embedding": {
+    "offset": 0,
+    "length": 65792,
+    "shape": [
+      257,
+      256
+    ]
+  },
+  "final/ln_scale": {
+    "offset": 65792,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "final/ln_bias": {
+    "offset": 66048,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "final/dense_kernel": {
+    "offset": 66304,
+    "length": 8960,
+    "shape": [
+      256,
+      35
+    ]
+  },
+  "final/dense_bias": {
+    "offset": 75264,
+    "length": 35,
+    "shape": [
+      35
+    ]
+  },
+  "blocks/0/ln_scale": {
+    "offset": 75299,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/0/ln_bias": {
+    "offset": 75555,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/0/in_proj_kernel": {
+    "offset": 75811,
+    "length": 131072,
+    "shape": [
+      256,
+      512
+    ]
+  },
+  "blocks/0/in_proj_bias": {
+    "offset": 206883,
+    "length": 512,
+    "shape": [
+      512
+    ]
+  },
+  "blocks/0/conv_kernel": {
+    "offset": 207395,
+    "length": 1024,
+    "shape": [
+      4,
+      256
+    ]
+  },
+  "blocks/0/conv_bias": {
+    "offset": 208419,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/0/x_proj_kernel": {
+    "offset": 208675,
+    "length": 12288,
+    "shape": [
+      256,
+      48
+    ]
+  },
+  "blocks/0/x_proj_bias": {
+    "offset": 220963,
+    "length": 48,
+    "shape": [
+      48
+    ]
+  },
+  "blocks/0/dt_proj_kernel": {
+    "offset": 221011,
+    "length": 4096,
+    "shape": [
+      16,
+      256
+    ]
+  },
+  "blocks/0/dt_proj_bias": {
+    "offset": 225107,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/0/out_proj_kernel": {
+    "offset": 225363,
+    "length": 65536,
+    "shape": [
+      256,
+      256
+    ]
+  },
+  "blocks/0/out_proj_bias": {
+    "offset": 290899,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/0/a_log": {
+    "offset": 291155,
+    "length": 4096,
+    "shape": [
+      256,
+      16
+    ]
+  },
+  "blocks/0/d": {
+    "offset": 295251,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/1/ln_scale": {
+    "offset": 295507,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/1/ln_bias": {
+    "offset": 295763,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/1/in_proj_kernel": {
+    "offset": 296019,
+    "length": 131072,
+    "shape": [
+      256,
+      512
+    ]
+  },
+  "blocks/1/in_proj_bias": {
+    "offset": 427091,
+    "length": 512,
+    "shape": [
+      512
+    ]
+  },
+  "blocks/1/conv_kernel": {
+    "offset": 427603,
+    "length": 1024,
+    "shape": [
+      4,
+      256
+    ]
+  },
+  "blocks/1/conv_bias": {
+    "offset": 428627,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/1/x_proj_kernel": {
+    "offset": 428883,
+    "length": 12288,
+    "shape": [
+      256,
+      48
+    ]
+  },
+  "blocks/1/x_proj_bias": {
+    "offset": 441171,
+    "length": 48,
+    "shape": [
+      48
+    ]
+  },
+  "blocks/1/dt_proj_kernel": {
+    "offset": 441219,
+    "length": 4096,
+    "shape": [
+      16,
+      256
+    ]
+  },
+  "blocks/1/dt_proj_bias": {
+    "offset": 445315,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/1/out_proj_kernel": {
+    "offset": 445571,
+    "length": 65536,
+    "shape": [
+      256,
+      256
+    ]
+  },
+  "blocks/1/out_proj_bias": {
+    "offset": 511107,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/1/a_log": {
+    "offset": 511363,
+    "length": 4096,
+    "shape": [
+      256,
+      16
+    ]
+  },
+  "blocks/1/d": {
+    "offset": 515459,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/2/ln_scale": {
+    "offset": 515715,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/2/ln_bias": {
+    "offset": 515971,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/2/in_proj_kernel": {
+    "offset": 516227,
+    "length": 131072,
+    "shape": [
+      256,
+      512
+    ]
+  },
+  "blocks/2/in_proj_bias": {
+    "offset": 647299,
+    "length": 512,
+    "shape": [
+      512
+    ]
+  },
+  "blocks/2/conv_kernel": {
+    "offset": 647811,
+    "length": 1024,
+    "shape": [
+      4,
+      256
+    ]
+  },
+  "blocks/2/conv_bias": {
+    "offset": 648835,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/2/x_proj_kernel": {
+    "offset": 649091,
+    "length": 12288,
+    "shape": [
+      256,
+      48
+    ]
+  },
+  "blocks/2/x_proj_bias": {
+    "offset": 661379,
+    "length": 48,
+    "shape": [
+      48
+    ]
+  },
+  "blocks/2/dt_proj_kernel": {
+    "offset": 661427,
+    "length": 4096,
+    "shape": [
+      16,
+      256
+    ]
+  },
+  "blocks/2/dt_proj_bias": {
+    "offset": 665523,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/2/out_proj_kernel": {
+    "offset": 665779,
+    "length": 65536,
+    "shape": [
+      256,
+      256
+    ]
+  },
+  "blocks/2/out_proj_bias": {
+    "offset": 731315,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/2/a_log": {
+    "offset": 731571,
+    "length": 4096,
+    "shape": [
+      256,
+      16
+    ]
+  },
+  "blocks/2/d": {
+    "offset": 735667,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/3/ln_scale": {
+    "offset": 735923,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/3/ln_bias": {
+    "offset": 736179,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/3/in_proj_kernel": {
+    "offset": 736435,
+    "length": 131072,
+    "shape": [
+      256,
+      512
+    ]
+  },
+  "blocks/3/in_proj_bias": {
+    "offset": 867507,
+    "length": 512,
+    "shape": [
+      512
+    ]
+  },
+  "blocks/3/conv_kernel": {
+    "offset": 868019,
+    "length": 1024,
+    "shape": [
+      4,
+      256
+    ]
+  },
+  "blocks/3/conv_bias": {
+    "offset": 869043,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/3/x_proj_kernel": {
+    "offset": 869299,
+    "length": 12288,
+    "shape": [
+      256,
+      48
+    ]
+  },
+  "blocks/3/x_proj_bias": {
+    "offset": 881587,
+    "length": 48,
+    "shape": [
+      48
+    ]
+  },
+  "blocks/3/dt_proj_kernel": {
+    "offset": 881635,
+    "length": 4096,
+    "shape": [
+      16,
+      256
+    ]
+  },
+  "blocks/3/dt_proj_bias": {
+    "offset": 885731,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/3/out_proj_kernel": {
+    "offset": 885987,
+    "length": 65536,
+    "shape": [
+      256,
+      256
+    ]
+  },
+  "blocks/3/out_proj_bias": {
+    "offset": 951523,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/3/a_log": {
+    "offset": 951779,
+    "length": 4096,
+    "shape": [
+      256,
+      16
+    ]
+  },
+  "blocks/3/d": {
+    "offset": 955875,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/4/ln_scale": {
+    "offset": 956131,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/4/ln_bias": {
+    "offset": 956387,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/4/in_proj_kernel": {
+    "offset": 956643,
+    "length": 131072,
+    "shape": [
+      256,
+      512
+    ]
+  },
+  "blocks/4/in_proj_bias": {
+    "offset": 1087715,
+    "length": 512,
+    "shape": [
+      512
+    ]
+  },
+  "blocks/4/conv_kernel": {
+    "offset": 1088227,
+    "length": 1024,
+    "shape": [
+      4,
+      256
+    ]
+  },
+  "blocks/4/conv_bias": {
+    "offset": 1089251,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/4/x_proj_kernel": {
+    "offset": 1089507,
+    "length": 12288,
+    "shape": [
+      256,
+      48
+    ]
+  },
+  "blocks/4/x_proj_bias": {
+    "offset": 1101795,
+    "length": 48,
+    "shape": [
+      48
+    ]
+  },
+  "blocks/4/dt_proj_kernel": {
+    "offset": 1101843,
+    "length": 4096,
+    "shape": [
+      16,
+      256
+    ]
+  },
+  "blocks/4/dt_proj_bias": {
+    "offset": 1105939,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/4/out_proj_kernel": {
+    "offset": 1106195,
+    "length": 65536,
+    "shape": [
+      256,
+      256
+    ]
+  },
+  "blocks/4/out_proj_bias": {
+    "offset": 1171731,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/4/a_log": {
+    "offset": 1171987,
+    "length": 4096,
+    "shape": [
+      256,
+      16
+    ]
+  },
+  "blocks/4/d": {
+    "offset": 1176083,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/5/ln_scale": {
+    "offset": 1176339,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/5/ln_bias": {
+    "offset": 1176595,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/5/in_proj_kernel": {
+    "offset": 1176851,
+    "length": 131072,
+    "shape": [
+      256,
+      512
+    ]
+  },
+  "blocks/5/in_proj_bias": {
+    "offset": 1307923,
+    "length": 512,
+    "shape": [
+      512
+    ]
+  },
+  "blocks/5/conv_kernel": {
+    "offset": 1308435,
+    "length": 1024,
+    "shape": [
+      4,
+      256
+    ]
+  },
+  "blocks/5/conv_bias": {
+    "offset": 1309459,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/5/x_proj_kernel": {
+    "offset": 1309715,
+    "length": 12288,
+    "shape": [
+      256,
+      48
+    ]
+  },
+  "blocks/5/x_proj_bias": {
+    "offset": 1322003,
+    "length": 48,
+    "shape": [
+      48
+    ]
+  },
+  "blocks/5/dt_proj_kernel": {
+    "offset": 1322051,
+    "length": 4096,
+    "shape": [
+      16,
+      256
+    ]
+  },
+  "blocks/5/dt_proj_bias": {
+    "offset": 1326147,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/5/out_proj_kernel": {
+    "offset": 1326403,
+    "length": 65536,
+    "shape": [
+      256,
+      256
+    ]
+  },
+  "blocks/5/out_proj_bias": {
+    "offset": 1391939,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  },
+  "blocks/5/a_log": {
+    "offset": 1392195,
+    "length": 4096,
+    "shape": [
+      256,
+      16
+    ]
+  },
+  "blocks/5/d": {
+    "offset": 1396291,
+    "length": 256,
+    "shape": [
+      256
+    ]
+  }
+}

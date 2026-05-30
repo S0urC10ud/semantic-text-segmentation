@@ -492,3 +492,107 @@ body{
     justify-content:flex-start;
   }
 }
+
+/* ── Examples Section ── */
+@property --gradient-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes spin-gradient {
+  to { --gradient-angle: 360deg; }
+}
+
+.examples-section {
+  margin-top: 12px;
+  text-align: center;
+}
+
+.examples-heading {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0 0 6px 0;
+  background: linear-gradient(135deg, var(--accent), #8b5cf6, #ec4899);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.examples-subtext {
+  color: var(--subtle);
+  font-size: 0.875rem;
+  margin: 0 0 20px 0;
+}
+
+.examples-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.example-card {
+  position: relative;
+  border-radius: 14px;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--gradient-angle),
+    #0b5ed7 0%,
+    #8b5cf6 25%,
+    #ec4899 50%,
+    #f59e0b 75%,
+    #0b5ed7 100%
+  );
+  animation: spin-gradient 3s linear infinite;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.example-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 8px 30px rgba(139, 92, 246, 0.25);
+}
+
+.example-card-inner {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 16px;
+  height: 100%;
+  text-align: left;
+}
+
+.example-card-title {
+  font-weight: 700;
+  font-size: 0.95rem;
+  margin: 0 0 6px 0;
+  color: var(--text);
+}
+
+.example-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.example-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: var(--muted);
+  color: var(--subtle);
+}
+
+.example-card-preview {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--subtle);
+  white-space: pre-wrap;
+  overflow: hidden;
+  max-height: 72px;
+  mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
+}
