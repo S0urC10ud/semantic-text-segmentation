@@ -1,0 +1,69 @@
+{
+  "generated_at": "2026-05-15T14:10:49.334559+00:00",
+  "cache": "evaluation/llm_benchmark/runs/gemini-3.1-pro-preview__20260515T131145Z.jsonl",
+  "seed": 12648430,
+  "anchor_chars": {
+    "sequence_pair": 768,
+    "sequence_triplet": 512
+  },
+  "near_pure_cap_chars": 1536,
+  "pair_per_first_lang": 50,
+  "triplet_per_first_lang": 50,
+  "needle_per_host": 30,
+  "needle_visible_token_ranges": {
+    "32_63": [
+      32,
+      63
+    ],
+    "64_plus": [
+      64,
+      200
+    ]
+  },
+  "markdown": {
+    "modes": [
+      "fenced",
+      "plain",
+      "inline"
+    ],
+    "mismatch_fraction": 0.33
+  },
+  "pool_size": 1746,
+  "tasks": [
+    {
+      "task": "realistic",
+      "count": 1746,
+      "path": "evaluation/test/realistic/dataset"
+    },
+    {
+      "task": "near_pure",
+      "count": 1477,
+      "path": "evaluation/test/near_pure/dataset"
+    },
+    {
+      "task": "sequence_pair",
+      "count": 1750,
+      "path": "evaluation/test/sequence_pair/dataset"
+    },
+    {
+      "task": "sequence_triplet",
+      "count": 1750,
+      "path": "evaluation/test/sequence_triplet/dataset"
+    },
+    {
+      "task": "needle_32_63",
+      "count": 870,
+      "path": "evaluation/test/needle_32_63/dataset"
+    },
+    {
+      "task": "needle_64_plus",
+      "count": 870,
+      "path": "evaluation/test/needle_64_plus/dataset"
+    },
+    {
+      "task": "markdown_mix",
+      "count": 145,
+      "path": "evaluation/test/markdown_mix/dataset"
+    }
+  ]
+}

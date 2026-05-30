@@ -1,0 +1,48 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "task": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "example_id": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "content": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "segments": {
+      "feature": {
+        "label": {
+          "dtype": "string",
+          "_type": "Value"
+        },
+        "char_start": {
+          "dtype": "int32",
+          "_type": "Value"
+        },
+        "char_end": {
+          "dtype": "int32",
+          "_type": "Value"
+        }
+      },
+      "_type": "Sequence"
+    },
+    "source_langs": {
+      "feature": {
+        "dtype": "string",
+        "_type": "Value"
+      },
+      "_type": "Sequence"
+    },
+    "metadata_json": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}

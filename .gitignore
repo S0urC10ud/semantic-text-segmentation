@@ -112,5 +112,4 @@ evaluation/reports_distributed/20260404_062007/model_report_matrix__data_b__tau0
 evaluation/llm_benchmark/runs/**
 evaluation/llm_benchmark/test_runs/**
 evaluation/prediction_cache/**
-evaluation/test/**
 local_runs/**
