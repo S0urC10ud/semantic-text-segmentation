@@ -15,6 +15,12 @@ scripts/*
 !scripts/analyze_active_learning_confusion.py
 !scripts/launch_distributed_eval.sh
 !scripts/run_tune_tau_sfullfiles3_monitor_b.sh
+# Build + verification helpers shipped with the public repo
+!scripts/export_textseg_weights.py
+!scripts/export_textseg_onnx.py
+!scripts/export_unet_weights.py
+!scripts/verify_textseg_backend.py
+!scripts/verify_unet.py
 *.sqlite
 downloader/mon_preprocessed_before_relabeling/*
 comparisons/
@@ -113,3 +119,46 @@ evaluation/llm_benchmark/runs/**
 evaluation/llm_benchmark/test_runs/**
 evaluation/prediction_cache/**
 local_runs/**
+
+# ----------------------------------------
+# Vendored toolchains & scratch artifacts (hygiene before going public)
+# ----------------------------------------
+# Vendored Node.js toolchain (used only for browser-viewer benchmarking)
+node-v*-linux-x64/
+node-v*-linux-x64.tar.xz
+node-v*.tar.gz
+
+# Throwaway checkpoints (the two released checkpoints are .msgpack, kept above)
+*.ckpt
+
+# Local benchmark result dumps
+*_speed.txt
+
+# Editor/agent local state
+.antigravitycli/
+
+# Root-level scratch / throwaway scripts and prompts
+/temp_prompt.txt
+/scratch_mamba.py
+/test_prompts.py
+/test_prompts.js
+/test_mamba_shapes.py
+/test_unet_js.js
+/prompt_test.py
+/run_benchmarks.sh
+/benchmark_browser.py
+/benchmark_models.js
+/benchmark_node.js
+
+# ----------------------------------------
+# textseg PyPI package
+# ----------------------------------------
+# The broad `data/` rule above also matches packages/textseg/textseg/data/.
+# Re-include that dir but keep only the source config (manifest.json); the
+# weight blobs are generated from the committed checkpoints via
+# `export_textseg_weights.py` + `export_textseg_onnx.py`.
+!packages/textseg/textseg/data/
+packages/textseg/textseg/data/*.npz
+packages/textseg/textseg/data/*.onnx
+packages/textseg/dist/
+packages/textseg/build/

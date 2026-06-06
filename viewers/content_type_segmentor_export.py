@@ -18,7 +18,7 @@ STATIC_ROOT = REPO_ROOT / "viewers" / "content_type_segmentor_static"
 DEFAULT_OUTPUT_DIR = STATIC_ROOT / "assets"
 DEFAULT_CHECKPOINT = REPO_ROOT / "checkpoints" / "sweeps" / "sfullfiles4.msgpack"
 DEFAULT_DEMO_TEXT_PATH = DEFAULT_OUTPUT_DIR / "demo_input.txt"
-DEFAULT_POSTPROCESS_MIN_RUN_CHARS = 5
+DEFAULT_POSTPROCESS_MIN_RUN_CHARS = 3
 DEFAULT_POSTPROCESS_BOUNDARY_SNAP_MAX_SHIFT = 2
 
 if str(REPO_ROOT) not in sys.path:

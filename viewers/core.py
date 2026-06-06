@@ -828,6 +828,46 @@ _ALLOWED_MODEL_TOKEN_VALUES = np.array(
     dtype=np.int32,
 )
 
+# ---------------------------------------------------------------------------
+# Compact vocabulary (slimmed checkpoints)
+# ---------------------------------------------------------------------------
+# Released checkpoints may carry a slimmed 130-row embedding instead of the full
+# 257-row table. The mapping is lossless: every input token is first sanitized
+# into {9, 10, 13, 32..126, 164 (=0xA4), 256 (=PAD)}, so only those rows are ever
+# read. The compact layout keeps embedding rows 0..127 as-is, folds the currency
+# placeholder (0xA4 = 164) into row 128, and the pad (256) into row 129. The
+# table below maps the full 257-id space into that compact space and is applied
+# inside the model immediately before the embedding lookup, so all sanitization,
+# padding and masking elsewhere keep operating in the original 257-id space.
+COMPACT_NUM_TOKEN_EMBEDDINGS = 130
+
+
+def _build_compact_token_table() -> np.ndarray:
+    table = np.empty(NUM_TOKEN_EMBEDDINGS, dtype=np.int32)  # indices 0..256
+    table[:128] = np.arange(128, dtype=np.int32)
+    table[128:256] = 128  # all non-ASCII / disallowed bytes sanitize to 0xA4 -> row 128
+    table[256] = 129  # PAD_BYTE_ID -> row 129
+    return table
+
+
+_COMPACT_TOKEN_TABLE = _build_compact_token_table()
+
+
+def _peek_checkpoint_vocab_size(ckpt_path: Any) -> int:
+    """Return the embedding row count of a checkpoint (257 legacy, 130 slimmed)."""
+    try:
+        p = Path(ckpt_path)
+        if not p.is_file():
+            return NUM_TOKEN_EMBEDDINGS
+        tree = serialization.msgpack_restore(p.read_bytes())
+        if isinstance(tree, Mapping) and "params" in tree and "Embed_0" not in tree:
+            tree = tree["params"]
+        rows = int(np.asarray(tree["Embed_0"]["embedding"]).shape[0])
+        return rows if rows > 0 else NUM_TOKEN_EMBEDDINGS
+    except Exception:
+        return NUM_TOKEN_EMBEDDINGS
+
+
 _PLACEHOLDER_CHAR = "\u00A4"
 _ALLOWED_TEXT_CHARS = {chr(b) for b in _VISIBLE_ASCII_BYTES}
 _ALLOWED_TEXT_CHARS.update({" ", "\n", "\t", _PLACEHOLDER_CHAR})
@@ -2084,12 +2124,15 @@ class UNet1D(nn.Module):
     channels: Tuple[int, ...] = (128, 256, 384, 512)
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
+    num_token_embeddings: int = NUM_TOKEN_EMBEDDINGS
 
     @nn.compact
     def __call__(self, tokens: jnp.ndarray, train: bool = False):
         # tokens are int32 with possible PAD_BYTE_ID=256
         tok_i32 = tokens.astype(jnp.int32)
-        h = nn.Embed(num_embeddings=NUM_TOKEN_EMBEDDINGS, features=self.emb_dim,
+        if int(self.num_token_embeddings) != NUM_TOKEN_EMBEDDINGS:
+            tok_i32 = jnp.asarray(_COMPACT_TOKEN_TABLE)[jnp.clip(tok_i32, 0, NUM_TOKEN_EMBEDDINGS - 1)]
+        h = nn.Embed(num_embeddings=self.num_token_embeddings, features=self.emb_dim,
                      embedding_init=nn.initializers.normal(stddev=0.02),
                      dtype=self.dtype, param_dtype=self.dtype)(tok_i32)
 
@@ -2232,12 +2275,15 @@ class Mamba1D(nn.Module):
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
     inference_kernel: str = "default"
+    num_token_embeddings: int = NUM_TOKEN_EMBEDDINGS
 
     @nn.compact
     def __call__(self, tokens: jnp.ndarray, train: bool = False):
         tok_i32 = tokens.astype(jnp.int32)
+        if int(self.num_token_embeddings) != NUM_TOKEN_EMBEDDINGS:
+            tok_i32 = jnp.asarray(_COMPACT_TOKEN_TABLE)[jnp.clip(tok_i32, 0, NUM_TOKEN_EMBEDDINGS - 1)]
         h = nn.Embed(
-            num_embeddings=NUM_TOKEN_EMBEDDINGS,
+            num_embeddings=self.num_token_embeddings,
             features=int(self.d_model),
             embedding_init=nn.initializers.normal(stddev=0.02),
             dtype=self.dtype,
@@ -2300,6 +2346,7 @@ class Predictor:
     ):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        num_token_embeddings = _peek_checkpoint_vocab_size(ckpt_path)
         backend = resolve_backend(device)
         available = available_backends()
         if backend is not None and backend not in available:
@@ -2333,6 +2380,7 @@ class Predictor:
                 d_conv=int(mamba_conv),
                 bidirectional=bool(mamba_bidirectional),
                 dtype=self.dtype,
+                num_token_embeddings=num_token_embeddings,
             )
         else:
             self.model = UNet1D(
@@ -2340,6 +2388,7 @@ class Predictor:
                 emb_dim=int(model_dim),
                 channels=tuple(channels),
                 dtype=self.dtype,
+                num_token_embeddings=num_token_embeddings,
             )
         # Init with dummy to create param structure (int32 tokens to allow PAD_BYTE_ID=256)
         dummy_tokens = jnp.full((1, self.chunk), PAD_BYTE_ID, dtype=jnp.int32)
@@ -2367,6 +2416,7 @@ class Predictor:
                 bidirectional=bool(self.model.bidirectional),
                 dtype=self.model.dtype,
                 inference_kernel="cuda_fast",
+                num_token_embeddings=num_token_embeddings,
             )
             cuda_kernel_available = True
 

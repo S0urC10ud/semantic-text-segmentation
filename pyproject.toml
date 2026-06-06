@@ -1,9 +1,10 @@
 [project]
 name = "text-segmenter"
 version = "0.1.0"
-description = "Byte-wise HTML/CSS/JS segmentation with JAX/Flax"
+description = "Research code for fine-grained, character-level content-type segmentation (U-Net + Mamba, JAX/Flax). The minimal inference-only package is published separately as `textseg`."
 readme = "README.md"
 requires-python = "~=3.11.0"
+license = "Apache-2.0"
 
 dependencies = [
     "datasets==3.6.0",      # uses map/filter/shuffle with num_proc
@@ -32,6 +33,9 @@ dependencies = [
     "psutil==7.1.3",
     "google-genai>=1.64.0",
     "python-dotenv>=1.2.1",
+    "tf2onnx",
+    "onnx",
+    "tensorflow",
 ]
 
 [project.optional-dependencies]
@@ -39,15 +43,11 @@ gpu = [
     "jax[cuda12]>=0.4.30",
 ]
 
-[project.scripts]
-seg-train = "u_net:main"
-
+# This repository is a collection of research scripts run via `uv run python <path>`,
+# not an installable library. `uv sync` manages the environment; the published
+# inference package lives separately under `textseg/`.
 [tool.uv]
-package = true
-
-[tool.setuptools.packages.find]
-where = ["."] 
-include = ["activate", "segment_viewer"]
+package = false
 
 [dependency-groups]
 dev = [

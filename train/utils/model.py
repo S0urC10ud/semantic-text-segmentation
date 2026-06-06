@@ -11,6 +11,7 @@ import numpy as np
 import optax
 from inference.mamba_cuda import selective_scan_inference
 import utils.config as cfg
+from utils.token_utils import COMPACT_TOKEN_TABLE
 from flax import linen as nn
 from flax import serialization
 from flax.training import train_state
@@ -65,6 +66,7 @@ class UNet1D(nn.Module):
     aux_offsets: Tuple[int, ...] = cfg.AUX_NEIGHBOR_OFFSETS
     dropout_rate: float = 0.0
     dtype: jnp.dtype = jnp.bfloat16
+    num_token_embeddings: int = cfg.NUM_TOKEN_EMBEDDINGS
 
     @nn.compact
     def __call__(
@@ -73,9 +75,12 @@ class UNet1D(nn.Module):
         train: bool = True,
         return_auxiliary: bool = False,
     ):
-        h = nn.Embed(num_embeddings=cfg.NUM_TOKEN_EMBEDDINGS, features=self.emb_dim,
+        tok = tokens.astype(jnp.int32)
+        if int(self.num_token_embeddings) != cfg.NUM_TOKEN_EMBEDDINGS:
+            tok = jnp.asarray(COMPACT_TOKEN_TABLE)[jnp.clip(tok, 0, cfg.NUM_TOKEN_EMBEDDINGS - 1)]
+        h = nn.Embed(num_embeddings=self.num_token_embeddings, features=self.emb_dim,
                      embedding_init=nn.initializers.normal(stddev=0.02),
-                     dtype=self.dtype, param_dtype=jnp.float32)(tokens)
+                     dtype=self.dtype, param_dtype=jnp.float32)(tok)
 
         skips = []
         # Down-sampling path
@@ -247,6 +252,7 @@ class Mamba1D(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     inference_kernel: str = "default"
     use_remat: bool = True
+    num_token_embeddings: int = cfg.NUM_TOKEN_EMBEDDINGS
 
     @nn.compact
     def __call__(
@@ -255,13 +261,16 @@ class Mamba1D(nn.Module):
         train: bool = True,
         return_auxiliary: bool = False,
     ):
+        tok = tokens.astype(jnp.int32)
+        if int(self.num_token_embeddings) != cfg.NUM_TOKEN_EMBEDDINGS:
+            tok = jnp.asarray(COMPACT_TOKEN_TABLE)[jnp.clip(tok, 0, cfg.NUM_TOKEN_EMBEDDINGS - 1)]
         h = nn.Embed(
-            num_embeddings=cfg.NUM_TOKEN_EMBEDDINGS,
+            num_embeddings=self.num_token_embeddings,
             features=int(self.d_model),
             embedding_init=nn.initializers.normal(stddev=0.02),
             dtype=self.dtype,
             param_dtype=jnp.float32,
-        )(tokens)
+        )(tok)
 
         if self.dropout_rate and float(self.dropout_rate) > 0.0:
             h = nn.Dropout(rate=float(self.dropout_rate), deterministic=not train)(h)

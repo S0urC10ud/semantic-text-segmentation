@@ -1,6 +1,6 @@
 # textseg
 
-**Fine-grained, character-level content-type segmentation for textual inputs.**
+**Fine-grained, character-level content-type segmentation for textual (arbitrarily mangled) inputs.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/textseg.svg)](https://pypi.org/project/textseg/)
@@ -18,7 +18,7 @@ or a Base64 payload pasted into an LLM prompt.
   <img src="./images/llm_segmentation.png" alt="Correct model output on a heavily mangled HTML input with a hidden shell payload" width="460">
 </p>
 <p align="center">
-  <em>Segmentation of a heavily mangled input: the script/style tags are missing and a reverse shell
+  <em>Model's output on a heavily mangled input (stress-test): the script/style tags are missing and a reverse shell
   targeting an LLM is hidden inside an HTML comment, yet the embedded <code>shell</code> region is
   recovered correctly. Color saturation reflects per-character confidence.</em>
 </p>
@@ -31,40 +31,28 @@ or a Base64 payload pasted into an LLM prompt.
   can land between any two adjacent characters. Subword tokenizers cannot represent such boundaries —
   on `IgnoreAbovecG93ZXJzaGVsbA==`, a BPE vocabulary merges `IgnoreAbove` with the start of the
   Base64 payload, contaminating the transition; `textseg` does not.
-- **Two models, one API.** A fast, heavily parallelizable **U-Net** for piecewise-constant
-  segmentation, and a long-context bidirectional **Mamba** state-space model for segment-heavy and
-  long inputs.
+- **Two models, one API.** A long-context bidirectional **Mamba** state-space model is the
+  recommended default for the best segmentation quality; a fast, heavily parallelizable **U-Net**
+  trades some quality for much higher throughput on near-pure inputs.
 - **Best-effort on broken inputs.** Designed for mangled, truncated, or weakly-delimited text mixed
   with natural language — no delimiters or grammars required.
 - **Open-set aware.** Out-of-distribution regions are routed to an auxiliary `other` label instead of
   being misclassified into a known type.
 - **Fast and portable.** GPU when available, but easily installable and quick on CPU. The inference
   package depends only on `numpy` and `onnxruntime`.
+- **Engineered for runtime.** GPU Mamba runs on a custom CUDA scan kernel (one thread per
+  channel, single launch) that **beats the ONNX `Scan` op by ~100×** and edges out the research JAX
+  `associative_scan` at ~58,000 tok/s. The browser demo reimplements the same model in JavaScript +
+  **WebGPU**, fully client-side at arbitrary input length.
 - **Per-character confidence.** Every position carries a confidence score, exposed alongside the
   merged segments.
 
-## Use cases
-
-<p align="center">
-  <img src="./images/use_cases.png" alt="Representative use cases for granular content-type segmentation" width="820">
-</p>
-
-- **Content-aware routing & LLM-agent guardrails.** Move the routing decision from the whole file
-  (as in Magika) down to individual spans: send `shell`, `powershell`, `json`, or `yaml` regions to
-  type-specific checks while surrounding prose is skipped. A useful first layer in a defense-in-depth
-  pipeline for flagging command-like or encoded regions before they reach a tool or interpreter.
-- **Upload hardening & polyglot-style bypass resistance.** Make script-like regions hidden inside
-  benign-looking carriers inspectable, even when they are short, malformed, or weakly delimited.
-- **Digital forensics on damaged or metadata-free data.** Infer type from content alone and return
-  precise span boundaries instead of coarse, block-level ones — useful for recovered text where the
-  exact span of a foreign-typed region matters.
-- **Repository, document & stream inspection.** Provide content-type hints (e.g. for syntax
-  highlighting) when a file extension or declared media type is missing, conflicting, or incomplete.
 
 ## Table of contents
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Use cases](#use-cases)
 - [Options](#options)
 - [Live demo](#live-demo)
 - [Supported content types](#supported-content-types)
@@ -104,11 +92,11 @@ import textseg
 
 text = "<html><body>IgnoreAbovecG93ZXJzaGVsbA==</body></html>"
 
-# Fast, piecewise-constant segmentation (U-Net).
-result = textseg.fast(text)
-
-# Higher-quality, long-context segmentation (Mamba).
+# Recommended: highest-quality, long-context segmentation (Mamba).
 result = textseg.precise(text)
+
+# Faster alternative, when throughput matters more than quality (U-Net).
+result = textseg.fast(text)
 
 for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} conf={seg.confidence:.2f}")
@@ -127,15 +115,16 @@ Both functions return a `Segmentation` with:
 - `char_labels` — the per-character label,
 - `char_confidence` — the per-character confidence.
 
-Use `fast()` for throughput and near-pure host windows; use `precise()` for heavily segmented or
-long inputs where far-reaching context matters.
+**Use `precise()` (Mamba) by default** — it gives the best segmentation quality and handles heavily
+segmented or long inputs where far-reaching context matters. Reach for `fast()` (U-Net) only when you
+need maximum throughput and the input is near-pure, where the quality gap is small.
 
 ## Options
 
 Post-processing mirrors the interactive viewer and is controlled through an `Options` object:
 
 ```python
-from textseg import fast, Options
+from textseg import precise, Options
 
 opts = Options(
     other_threshold=0.30,          # route positions below this confidence to `other`
@@ -149,16 +138,39 @@ opts = Options(
     paired_delimiter_fill=True,    # snap delimiter-wrapped runs inside their pair
 )
 
-result = fast(text, opts)
+result = precise(text, opts)
 ```
 
 Each step and its provenance (which of the thesis's four steps, which are viewer extras)
 is documented in [`packages/textseg/README.md`](packages/textseg/README.md#post-processing-methods).
 
+## Use cases
+
+<p align="center">
+  <img src="./images/use_cases.png" alt="Representative use cases for granular content-type segmentation" width="820">
+</p>
+
+- **Content-aware routing & LLM-agent guardrails.** Move the routing decision from the whole file
+  (as in Magika) down to individual spans: send `shell`, `powershell`, `json`, or `yaml` regions to
+  type-specific checks while surrounding prose is skipped. A useful first layer in a defense-in-depth
+  pipeline for flagging command-like or encoded regions before they reach a tool or interpreter.
+- **Upload hardening & polyglot-style bypass resistance.** Make script-like regions hidden inside
+  benign-looking carriers inspectable, even when they are short, malformed, or weakly delimited.
+- **Digital forensics on damaged or metadata-free data.** Infer type from content alone and return
+  precise span boundaries instead of coarse, block-level ones — useful for recovered text where the
+  exact span of a foreign-typed region matters.
+- **Repository, document & stream inspection.** Provide content-type hints (e.g. for syntax
+  highlighting) when a file extension or declared media type is missing, conflicting, or incomplete.
+
+
 ## Live demo
 
-A fully client-side viewer (WebGPU/WASM, no server) runs the Mamba model directly in your browser:
-**[textseg.martin-dallinger.me](https://textseg.martin-dallinger.me)**.
+A fully client-side viewer runs the Mamba model **directly in your browser** — no server, no upload,
+no ONNX runtime: **[textseg.martin-dallinger.me](https://textseg.martin-dallinger.me)**. The model is
+reimplemented from scratch in JavaScript, with the heavy dense projections **offloaded to WebGPU** (a
+custom WGSL matmul) and the selective-scan recurrence streamed over the full input. It runs at
+**arbitrary input length entirely on the client GPU** — the same variable-length segmentation as the
+Python package, with zero backend.
 
 ## Supported content types
 
@@ -180,13 +192,13 @@ content type (e.g. an unseen language or a random character sequence), not natur
 Both models are small (roughly 1.5M parameters) and operate on ASCII; non-ASCII characters are
 redirected to a dedicated placeholder so the model can still react to them.
 
-| | `fast()` — **U-Net** | `precise()` — **Mamba** |
+| | `precise()` — **Mamba** *(recommended)* | `fast()` — **U-Net** |
 |---|---|---|
-| Architecture | 1D U-Net over character tokens | Bidirectional selective state-space (Mamba) |
-| Context | Fixed window (1536), sliding | Long-context, arbitrary length |
+| Architecture | Bidirectional selective state-space (Mamba) | 1D U-Net over character tokens |
+| Context | Long-context, arbitrary length | Fixed window (1536), sliding |
 | Output | Piecewise-constant | Piecewise-constant |
-| Strongest on | Near-pure host windows, throughput | Heavily segmented / long-context inputs |
-| Trade-off | Fastest; limited far-reaching dependencies | Higher quality; lower throughput |
+| Strongest on | Highest quality; heavily segmented / long-context inputs | Throughput; near-pure host windows |
+| Trade-off | Best quality; lower throughput (GPU recommended) | Fastest; weaker on far-reaching dependencies |
 
 Both are trained in stages: weak-label pretraining on coarsely labeled files, dense fine-tuning on
 LLM-assisted segmentations that are validated and repaired, and uncertainty-driven active-learning
@@ -198,15 +210,39 @@ The Mamba model reaches a **macro F₁ of 0.951** over the 35 supervised content
 GitHub files, and tops transition, needle-in-a-haystack, and Markdown-mixture benchmarks. The U-Net
 is strongest on near-pure host windows and is by far the faster model.
 
-Throughput on 10 KB inputs (tokens/s; higher is better):
+**Reference model throughput** (the research JAX/Flax models — raw forward pass on 10 KB inputs,
+tokens/s; higher is better):
 
 | Model | GPU (notebook-class) | CPU |
 |---|---:|---:|
-| `fast()` — U-Net | 4,825,475 | 291,560 |
-| `precise()` — Mamba | 54,892 | 2,248 |
+| U-Net (`fast`) | 4,825,475 | 291,560 |
+| Mamba (`precise`) | 54,892 | 2,248 |
 | Magika (file-level, reference) | — | 196,897 |
 
-The U-Net comfortably clears the design criterion of processing 100,000 characters per second.
+The research U-Net comfortably clears the design criterion of 100,000 characters per second.
+
+**`textseg` package throughput.** The pip package is a dependency-light deployment wrapper
+(numpy/ONNX/CuPy inference + sliding-window tiling + character-level post-processing), so it runs
+slower than the raw research model above. Measured end-to-end, warm (a laptop RTX 5070 for GPU):
+
+| Entry point | CPU (onnxruntime) | GPU (`textseg[gpu]`) | Notes |
+|---|---:|---:|---|
+| `fast()` — U-Net | ~75,000 chars/s | ~140,000 chars/s | piecewise-constant; clears the 100k criterion on GPU |
+| `precise()` — Mamba | ~2,000 chars/s | ~25,000–35,000 chars/s | raw model ~58,000 tok/s (see below) |
+
+The two models take different GPU routes (see [Backends](packages/textseg/README.md#backends)):
+the U-Net runs on **onnxruntime-gpu**, while the Mamba selective-scan runs through a **custom
+CUDA scan kernel** (a CuPy `RawKernel`). The selective-scan is a first-order linear — and therefore
+*associative* — recurrence; the stock ONNX `Scan` op evaluates it one timestep per kernel launch and
+ends up *slower* on GPU than on CPU. Our kernel instead assigns **one GPU thread per inner channel**:
+each thread keeps its own state vector in registers and sweeps the entire sequence in a single launch,
+so the whole forward is one launch of fully parallel work — touching each state element exactly once.
+It reaches **~58,000 tokens/s** for the raw Mamba forward, **edging out the research model's JAX
+`associative_scan`** (54,892 tok/s) and beating the ONNX `Scan` path by **~100×**. End-to-end
+`precise()` is lower because it shares the
+character-level post-processing, which is linear in input length (a few hundred milliseconds on a
+200 KB input). The **first** CUDA call pays a one-time kernel-compilation warmup (seconds, longer on
+brand-new GPU architectures) — keep a process warm for repeated calls.
 
 ## How it works
 
@@ -273,8 +309,8 @@ A good reading path is `downloader/main.py` → `train/utils/window_generator.py
 The package's bundled weights are regenerated from the released checkpoints (they are not committed):
 
 ```bash
-python export_textseg_weights.py   # checkpoints/*.msgpack -> packages/textseg/textseg/data/*.npz
-python export_textseg_onnx.py      # *.npz                 -> dynamic-length *.onnx graphs
+python scripts/export_textseg_weights.py   # checkpoints/*.msgpack -> packages/textseg/textseg/data/*.npz
+python scripts/export_textseg_onnx.py      # *.npz                 -> dynamic-length *.onnx graphs
 uv build packages/textseg          # -> packages/textseg/dist/*.whl
 ```
 
@@ -301,10 +337,12 @@ If you use `textseg` in your research, please cite the thesis:
 
 ```bibtex
 @mastersthesis{dallinger2026textseg,
-  author = {Dallinger, Martin},
-  title  = {Fine-Grained Content-Type Segmentation for Textual Inputs},
-  school = {Johannes Kepler University Linz},
-  year   = {2026}
+  author  = {Dallinger, Martin},
+  title   = {Fine-Grained Content-Type Segmentation of Mixed Text Using Deep Learning},
+  school  = {Johannes Kepler University Linz},
+  address = {Linz, Austria},
+  type    = {Master's thesis},
+  year    = {2026}
 }
 ```
 
@@ -315,8 +353,5 @@ If you use `textseg` in your research, please cite the thesis:
 ## Acknowledgments
 
 This work was carried out with extensive technical feedback from and many informative discussions with
-Dr. Yanick Fratantonio and Dr. Luca Invernizzi from **Google Security Research** (authors of
-[Magika](https://github.com/google/magika)), who also provided generous access to Google Cloud compute
-resources. **Gemini** models were used to create and refine the dense segment annotations and to act as
-the active-learning oracle. Thanks also go to Univ.-Prof. Stefan Rass (JKU Secure Systems Group) and
-Univ.-Prof. Sepp Hochreiter for their guidance.
+Dr. Yanick Fratantonio and Dr. Luca Invernizzi from Google Security Research (authors of
+[Magika](https://github.com/google/magika)), who also provided generous access to Google Cloud compute resources. Gemini models were used to create and refine the dense segment annotations and to act as the active-learning oracle. Thanks also go to Univ.-Prof. Stefan Rass (JKU Secure Systems Group) for his guidance, especially regarding aspects concering parsing and classical computer-science approaches.
