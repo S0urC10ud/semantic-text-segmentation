@@ -111,9 +111,16 @@ The bundled `examples/segcat.py` renders the result in the terminal:
 
 Both functions return a `Segmentation` with:
 
-- `segments` — merged runs as `(start, end, label, confidence)`,
+- `segments` — merged runs as `Segment(start, end, label, confidence, text)`,
 - `char_labels` — the per-character label,
-- `char_confidence` — the per-character confidence.
+- `char_confidence` — the per-character confidence,
+- `char_probs` — the full per-character probability distribution (`float32`,
+  shape `(len(text), len(labels))`, rows sum to ~1) — the raw model output before
+  post-processing; columns follow `labels`. `other` is open-set and not a column.
+- `labels` — the class names, in `char_probs` column order.
+
+Printed in a terminal, a `Segment` shows a colour-tinted chip of its text (auto-detected:
+TTY only, honours `NO_COLOR`; force with `TEXTSEG_COLOR=always`).
 
 **Use `precise()` (Mamba) by default** — it gives the best segmentation quality and handles heavily
 segmented or long inputs where far-reaching context matters. Reach for `fast()` (U-Net) only when you

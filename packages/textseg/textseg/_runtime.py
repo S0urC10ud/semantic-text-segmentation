@@ -151,11 +151,15 @@ def _assemble(text: str, byte_probs: np.ndarray, options: Options) -> Segmentati
     segments, char_label_names, char_conf = build_segments(
         text, labels, char_probs, labels_names, other_index, other_label
     )
-    return Segmentation(text=text, segments=segments, char_labels=char_label_names, char_confidence=char_conf)
+    return Segmentation(text=text, segments=segments, char_labels=char_label_names,
+                        char_confidence=char_conf, char_probs=char_probs, labels=labels_names)
 
 
 def _empty(text: str) -> Segmentation:
-    return Segmentation(text=text, segments=[], char_labels=[], char_confidence=[])
+    man = _manifest()
+    char_probs = np.zeros((0, int(man["num_classes"])), dtype=np.float32)
+    return Segmentation(text=text, segments=[], char_labels=[], char_confidence=[],
+                        char_probs=char_probs, labels=list(man["labels"]))
 
 
 def run(model: str, text: str, options: Optional[Options]) -> Segmentation:

@@ -15,40 +15,16 @@ import sys
 
 import textseg
 
-# 24-bit accent colour per label (close to the interactive viewer).
-PALETTE = {
-    "html": (231, 76, 60), "css": (46, 204, 113), "javascript_typescript": (190, 200, 40),
-    "sql": (52, 152, 219), "shell": (155, 89, 182), "powershell": (125, 95, 200),
-    "python": (53, 114, 165), "json": (230, 126, 34), "yaml": (241, 196, 15),
-    "xml": (211, 84, 0), "svg": (192, 57, 43), "markdown": (127, 140, 141),
-    "c_family": (52, 73, 94), "java": (192, 57, 43), "go": (0, 173, 216),
-    "rust": (183, 65, 14), "text": (149, 165, 166), "other": (120, 120, 120),
-    "encoding_base64": (26, 188, 156), "encoding_hex": (22, 160, 133),
-}
-
-
-def _accent(label: str):
-    if label in PALETTE:
-        return PALETTE[label]
-    h = sum(ord(c) * 131 for c in label)
-    return (80 + h % 150, 80 + (h // 7) % 150, 80 + (h // 53) % 150)
-
-
-def _tint(rgb, f=0.78):
-    return tuple(int(c + (255 - c) * f) for c in rgb)
-
-
-def _bg(rgb):
-    return f"\x1b[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
-
-
-def _fg(rgb):
-    return f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
-
-
-RESET = "\x1b[0m"
-BOLD = "\x1b[1m"
-DIM = "\x1b[2m"
+# Shared palette / ANSI helpers (single source in textseg._color).
+from textseg._color import (  # noqa: E402
+    BOLD,
+    DIM,
+    RESET,
+    accent as _accent,
+    bg as _bg,
+    fg as _fg,
+    tint as _tint,
+)
 
 
 def render_body(text, char_labels):

@@ -461,5 +461,5 @@ def build_segments(text: str, labels: List[int], char_probs: np.ndarray,
     for s, e, lab in _runs(labels):
         name = other_label if lab == other_index else label_names[lab]
         conf = float(np.mean(char_conf[s:e])) if e > s else 0.0
-        segments.append(Segment(start=s, end=e, label=name, confidence=conf))
+        segments.append(Segment(start=s, end=e, label=name, confidence=conf, text=text[s:e]))
     return segments, char_label_names, char_conf

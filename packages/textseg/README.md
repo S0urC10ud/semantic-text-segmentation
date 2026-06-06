@@ -25,8 +25,28 @@ for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} {seg.confidence:.2f}")
 ```
 
-A `Segmentation` exposes `segments` (`Segment(start, end, label, confidence)`),
-`char_labels` (per-character label) and `char_confidence` (per-character confidence).
+A `Segmentation` exposes:
+
+- `segments` — merged runs as `Segment(start, end, label, confidence, text)`,
+- `char_labels` — per-character label (length `len(text)`),
+- `char_confidence` — per-character confidence in `[0, 1]`,
+- `char_probs` — the full per-character probability distribution, a float32 array of
+  shape `(len(text), len(labels))` whose rows sum to ~1. This is the **raw model
+  output** (before post-processing relabelling); columns follow `labels`. The open-set
+  `other` class is *not* a column — it is derived by confidence gating, so a character
+  routed to `other` still keeps its distribution over the known classes here.
+- `labels` — the class names, in `char_probs` column order.
+
+```python
+r = textseg.precise("SELECT 1")
+r.char_probs.shape            # (8, 35)
+r.char_distribution(0)        # {'sql': 0.99, 'text': 0.001, ...} for char 0
+```
+
+When printed to a terminal, a `Segment` renders as a colour-tinted chip of its text
+(matching the interactive viewer). Colour is auto-detected: it is emitted only to a TTY
+and honours `NO_COLOR`; force it with `TEXTSEG_COLOR=always` or disable with
+`TEXTSEG_COLOR=never`.
 
 ### Backends
 
