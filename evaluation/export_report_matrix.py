@@ -106,7 +106,7 @@ def _markdown_boundary_metric(payload: Mapping[str, Any], metric_name: str) -> f
 
 
 def _pure_fragments_total(payload: Mapping[str, Any], rate_key: str) -> tuple[float, float]:
-    per_language = _required_mapping(payload, "tasks", "pure_fragments", "per_language")
+    per_language = _required_mapping(payload, "tasks", "near_pure", "per_language")
     support_total = 0.0
     hits_total = 0.0
     for entry in per_language.values():
@@ -154,11 +154,11 @@ def _needle_boundary_metric(payload: Mapping[str, Any], bucket: str, metric_name
 
 
 def _monitor_metric(payload: Mapping[str, Any], metric_name: str) -> float:
-    return _required_float(payload, "monitor_b", "aggregates", metric_name)
+    return _required_float(payload, "tasks", "realistic", metric_name)
 
 
 def _monitor_boundary_metric(payload: Mapping[str, Any], metric_name: str) -> float:
-    return _required_float(payload, "monitor_b", "boundary_region", "aggregates", metric_name)
+    return _required_float(payload, "tasks", "realistic", "boundary_region", "aggregates", metric_name)
 
 
 _NEEDLE_BOUNDARY_BUCKETS: tuple[str, ...] = (
@@ -227,12 +227,12 @@ METRIC_SPECS: tuple[MetricSpec, ...] = (
         for public_name, aggregate_name in _NEEDLE_BOUNDARY_METRICS
     ),
     MetricSpec(
-        "pure_fragments.no_misclassified_host_label_bytes",
+        "near_pure.no_misclassified_host_label_bytes",
         lambda payload: _pure_fragments_hits(payload, "fully_pure_rate"),
         lambda payload: _pure_fragments_support(payload, "fully_pure_rate"),
     ),
     MetricSpec(
-        "pure_fragments.within_50pct_host_byte_error",
+        "near_pure.within_50pct_host_byte_error",
         lambda payload: _pure_fragments_hits(payload, "within_threshold_rate"),
         lambda payload: _pure_fragments_support(payload, "within_threshold_rate"),
     ),
@@ -308,28 +308,28 @@ METRIC_SPECS: tuple[MetricSpec, ...] = (
         for public_name, aggregate_name in _NEEDLE_BOUNDARY_METRICS
     ),
     MetricSpec(
-        "monitor_b.acc",
-        lambda payload: _monitor_metric(payload, "micro_acc"),
+        "realistic.acc",
+        lambda payload: _monitor_metric(payload, "overall_accuracy"),
         lambda payload: 1.0,
     ),
     MetricSpec(
-        "monitor_b.precision",
+        "realistic.precision",
         lambda payload: _monitor_metric(payload, "macro_precision"),
         lambda payload: 1.0,
     ),
     MetricSpec(
-        "monitor_b.recall",
+        "realistic.recall",
         lambda payload: _monitor_metric(payload, "macro_recall"),
         lambda payload: 1.0,
     ),
     MetricSpec(
-        "monitor_b.f1",
+        "realistic.f1",
         lambda payload: _monitor_metric(payload, "macro_f1"),
         lambda payload: 1.0,
     ),
     *tuple(
         MetricSpec(
-            f"monitor_b.boundary_pm4.{public_name}",
+            f"realistic.boundary_pm4.{public_name}",
             lambda payload, aggregate_name=aggregate_name: _monitor_boundary_metric(
                 payload,
                 aggregate_name,

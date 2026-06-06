@@ -100,6 +100,7 @@ from utils.model import (  # noqa: E402
     checkpoint_params_subtree,
     merge_compatible_state,
 )
+from utils.token_utils import peek_checkpoint_vocab_size  # noqa: E402
 from utils.metrics_helper import (  # noqa: E402
     _valid_metric_mask,
     accumulate_confusion,
@@ -1137,6 +1138,7 @@ class SegmenterRunner:
 
         dt = getattr(jnp, dtype)
         requested_channels = tuple(int(ch) for ch in channels)
+        num_token_embeddings = peek_checkpoint_vocab_size(checkpoint_path)
         self._weight_cache: Dict[int, np.ndarray] = {}
         execution_backend = str(backend or jax.default_backend()).lower().strip()
         self._apply_legacy = None
@@ -1149,6 +1151,7 @@ class SegmenterRunner:
                 emb_dim=model_dim,
                 channels=tuple(int(ch) for ch in channel_values),
                 dtype=dt,
+                num_token_embeddings=num_token_embeddings,
             )
             dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
             variables = model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
@@ -1179,6 +1182,7 @@ class SegmenterRunner:
                 dtype=dt,
                 inference_kernel=str(inference_kernel),
                 use_remat=bool(use_remat),
+                num_token_embeddings=num_token_embeddings,
             )
             dummy_tokens = jnp.full((1, self.chunk), cfg.PAD_BYTE_ID, dtype=jnp.int32)
             variables = model.init({"params": jax.random.PRNGKey(0)}, dummy_tokens, train=False)
@@ -1221,6 +1225,7 @@ class SegmenterRunner:
                     dtype=model.dtype,
                     inference_kernel="cuda_fast",
                     use_remat=False,
+                    num_token_embeddings=num_token_embeddings,
                 )
                 cuda_kernel_available = True
         else:
