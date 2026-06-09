@@ -6,17 +6,17 @@
     python segcat.py --demo          # built-in mixed/injection sample
 
 Renders the input tinted by predicted content type, a legend, and a segment table
-with per-segment confidence bars. Uses the textseg package (numpy or ONNX backend).
+with per-segment confidence bars. Uses the typeseg package (numpy or ONNX backend).
 """
 from __future__ import annotations
 
 import argparse
 import sys
 
-import textseg
+import typeseg
 
-# Shared palette / ANSI helpers (single source in textseg._color).
-from textseg._color import (  # noqa: E402
+# Shared palette / ANSI helpers (single source in typeseg._color).
+from typeseg._color import (  # noqa: E402
     BOLD,
     DIM,
     RESET,
@@ -68,11 +68,11 @@ def main():
     else:
         text = sys.stdin.read()
 
-    fn = textseg.fast if args.model == "fast" else textseg.precise
+    fn = typeseg.fast if args.model == "fast" else typeseg.precise
     result = fn(text)
-    info = textseg.backend_info()
+    info = typeseg.backend_info()
 
-    print(f"\n{BOLD}textseg.{args.model}{RESET}  "
+    print(f"\n{BOLD}typeseg.{args.model}{RESET}  "
           f"{DIM}backend={info['backend']} gpu={info['gpu']}  "
           f"{len(text)} chars  {len(result.segments)} segments{RESET}\n")
 

@@ -33,12 +33,12 @@ DEFAULT_CHUNK = 1536
 
 @lru_cache(maxsize=1)
 def _manifest() -> dict:
-    return json.loads((_files("textseg") / "data" / "manifest.json").read_text())
+    return json.loads((_files("typeseg") / "data" / "manifest.json").read_text())
 
 
 @lru_cache(maxsize=4)
 def _weights(npz_name: str) -> Weights:
-    with (_files("textseg") / "data" / npz_name).open("rb") as fh:
+    with (_files("typeseg") / "data" / npz_name).open("rb") as fh:
         data = np.load(fh)
         flat = {k.replace("__", "/"): np.asarray(data[k], dtype=np.float32) for k in data.files}
     return Weights(flat)

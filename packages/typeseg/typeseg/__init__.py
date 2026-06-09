@@ -1,10 +1,10 @@
-"""textseg — fine-grained, character-level content-type segmentation.
+"""typeseg — fine-grained, character-level content-type segmentation.
 
 Two entry points mirror the two models:
 
-    >>> import textseg
-    >>> result = textseg.fast("<html>...</html>")     # U-Net, piecewise-constant
-    >>> result = textseg.precise("...")               # Mamba, long-context
+    >>> import typeseg
+    >>> result = typeseg.fast("<html>...</html>")     # U-Net, piecewise-constant
+    >>> result = typeseg.precise("...")               # Mamba, long-context
     >>> for seg in result.segments:
     ...     print(seg.start, seg.end, seg.label, seg.confidence)
 """

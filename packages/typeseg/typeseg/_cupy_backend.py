@@ -7,7 +7,7 @@ CPU). This backend runs the shared ``_mamba_kernel`` with ``xp=cupy`` and the
 parallel scan, loading the bundled ``mamba_al.npz`` weights onto the device once.
 
 Used automatically when ``cupy`` imports and a CUDA device is present; otherwise
-the ONNX (CPU) or pure-numpy backend handles ``precise()``. ``TEXTSEG_BACKEND``
+the ONNX (CPU) or pure-numpy backend handles ``precise()``. ``TYPESEG_BACKEND``
 follows the same contract as ``_onnx_backend``: ``numpy`` forces it off,
 ``gpu``/``cuda`` force it on and fail fast if CuPy or a device is missing.
 """
@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
 
 
 def _data(name: str):
-    return _files("textseg") / "data" / name
+    return _files("typeseg") / "data" / name
 
 
 @lru_cache(maxsize=1)
@@ -125,8 +125,8 @@ def available() -> bool:
     """True if the CuPy GPU Mamba path should be used.
 
     Auto mode: True when cupy imports and a CUDA device is present. With
-    ``TEXTSEG_BACKEND=gpu``/``cuda`` a missing CuPy or device is a hard error.
-    With ``TEXTSEG_BACKEND=numpy`` this is always off.
+    ``TYPESEG_BACKEND=gpu``/``cuda`` a missing CuPy or device is a hard error.
+    With ``TYPESEG_BACKEND=numpy`` this is always off.
     """
     mode = _mode()
     if mode == "numpy":
@@ -137,8 +137,8 @@ def available() -> bool:
     except Exception as exc:
         if _require_gpu():
             raise RuntimeError(
-                f"TEXTSEG_BACKEND={mode} requires the GPU backend, but CuPy could not "
-                f"initialise a CUDA device ({exc}). Install with: pip install \"textseg[gpu]\" "
+                f"TYPESEG_BACKEND={mode} requires the GPU backend, but CuPy could not "
+                f"initialise a CUDA device ({exc}). Install with: pip install \"typeseg[gpu]\" "
                 "and ensure CUDA 12.x is on the library path."
             ) from exc
         return False

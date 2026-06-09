@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "textseg"
+name = "typeseg"
 version = "0.1.0"
 description = "Fine-grained, character-level content-type segmentation for textual inputs (U-Net + Mamba)."
 readme = "README.md"
@@ -21,7 +21,7 @@ dependencies = ["numpy>=1.21"]
 
 [project.urls]
 Homepage = "https://github.com/s0urc10ud/semantic-text-segmentation"
-Demo = "https://textseg.martin-dallinger.me"
+Demo = "https://typeseg.martin-dallinger.me"
 
 [project.optional-dependencies]
 # Faster, dynamic-length inference. numpy alone already runs both models at
@@ -33,7 +33,7 @@ onnx = ["onnxruntime>=1.17"]      # CPU acceleration
 gpu = ["onnxruntime-gpu>=1.17", "cupy-cuda12x>=13"]
 
 [tool.setuptools]
-packages = ["textseg"]
+packages = ["typeseg"]
 
 [tool.setuptools.package-data]
-textseg = ["data/*.npz", "data/*.json", "data/*.onnx"]
+typeseg = ["data/*.npz", "data/*.json", "data/*.onnx"]

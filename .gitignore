@@ -16,10 +16,10 @@ scripts/*
 !scripts/launch_distributed_eval.sh
 !scripts/run_tune_tau_sfullfiles3_monitor_b.sh
 # Build + verification helpers shipped with the public repo
-!scripts/export_textseg_weights.py
-!scripts/export_textseg_onnx.py
+!scripts/export_typeseg_weights.py
+!scripts/export_typeseg_onnx.py
 !scripts/export_unet_weights.py
-!scripts/verify_textseg_backend.py
+!scripts/verify_typeseg_backend.py
 !scripts/verify_unet.py
 *.sqlite
 downloader/mon_preprocessed_before_relabeling/*
@@ -151,14 +151,14 @@ node-v*.tar.gz
 /benchmark_node.js
 
 # ----------------------------------------
-# textseg PyPI package
+# typeseg PyPI package
 # ----------------------------------------
-# The broad `data/` rule above also matches packages/textseg/textseg/data/.
+# The broad `data/` rule above also matches packages/typeseg/typeseg/data/.
 # Re-include that dir but keep only the source config (manifest.json); the
 # weight blobs are generated from the committed checkpoints via
-# `export_textseg_weights.py` + `export_textseg_onnx.py`.
-!packages/textseg/textseg/data/
-packages/textseg/textseg/data/*.npz
-packages/textseg/textseg/data/*.onnx
-packages/textseg/dist/
-packages/textseg/build/
+# `export_typeseg_weights.py` + `export_typeseg_onnx.py`.
+!packages/typeseg/typeseg/data/
+packages/typeseg/typeseg/data/*.npz
+packages/typeseg/typeseg/data/*.onnx
+packages/typeseg/dist/
+packages/typeseg/build/

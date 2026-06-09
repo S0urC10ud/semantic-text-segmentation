@@ -2,7 +2,7 @@
 
 Used automatically when ``onnxruntime`` (or ``onnxruntime-gpu``) is installed and
 the bundled ``*.onnx`` graphs are present; otherwise the pure-numpy backend runs.
-Set ``TEXTSEG_BACKEND=numpy`` to force the numpy path.
+Set ``TYPESEG_BACKEND=numpy`` to force the numpy path.
 
 The graphs consume *compact* token ids (0..129); the compact remap is applied
 here before the session runs. Math is verified bit-close to ``_numpy_backend``.
@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
 
 
 def _data(name: str):
-    return _files("textseg") / "data" / name
+    return _files("typeseg") / "data" / name
 
 
 def _compact_ids(tokens: np.ndarray) -> np.ndarray:
@@ -33,9 +33,9 @@ def _compact_ids(tokens: np.ndarray) -> np.ndarray:
 
 
 def _mode() -> str:
-    """TEXTSEG_BACKEND: '' / 'onnx' / 'cpu' (auto), 'numpy' (force numpy),
+    """TYPESEG_BACKEND: '' / 'onnx' / 'cpu' (auto), 'numpy' (force numpy),
     'gpu' / 'cuda' (force CUDA, fail fast if it cannot initialise)."""
-    return os.environ.get("TEXTSEG_BACKEND", "").strip().lower()
+    return os.environ.get("TYPESEG_BACKEND", "").strip().lower()
 
 
 def _require_gpu() -> bool:
@@ -49,8 +49,8 @@ def _providers(model: str = "unet"):
     if _require_gpu():
         if "CUDAExecutionProvider" not in avail:
             raise RuntimeError(
-                f"TEXTSEG_BACKEND={_mode()} requested but CUDAExecutionProvider is not "
-                "available. Install the GPU backend: pip install \"textseg[gpu]\"."
+                f"TYPESEG_BACKEND={_mode()} requested but CUDAExecutionProvider is not "
+                "available. Install the GPU backend: pip install \"typeseg[gpu]\"."
             )
         return ["CUDAExecutionProvider"]  # no CPU fallback -> session creation fails fast
     # Auto: U-Net (conv/matmul) benefits from CUDA, but Mamba's selective scan is
@@ -69,7 +69,7 @@ def _providers(model: str = "unet"):
 def available() -> bool:
     """True if the ONNX backend should be used (onnxruntime imports + graphs bundled).
 
-    With ``TEXTSEG_BACKEND=gpu``/``cuda`` a missing onnxruntime or missing graphs is a
+    With ``TYPESEG_BACKEND=gpu``/``cuda`` a missing onnxruntime or missing graphs is a
     hard error (fail fast) rather than a silent numpy fallback.
     """
     mode = _mode()
@@ -80,8 +80,8 @@ def available() -> bool:
     except Exception as exc:
         if _require_gpu():
             raise RuntimeError(
-                f"TEXTSEG_BACKEND={mode} requires the ONNX GPU backend, but onnxruntime "
-                "is not installed. Install with: pip install \"textseg[gpu]\"."
+                f"TYPESEG_BACKEND={mode} requires the ONNX GPU backend, but onnxruntime "
+                "is not installed. Install with: pip install \"typeseg[gpu]\"."
             ) from exc
         return False
     try:
@@ -89,7 +89,7 @@ def available() -> bool:
     except Exception:
         ok = False
     if not ok and _require_gpu():
-        raise RuntimeError(f"TEXTSEG_BACKEND={mode} requested but the bundled ONNX graphs are missing.")
+        raise RuntimeError(f"TYPESEG_BACKEND={mode} requested but the bundled ONNX graphs are missing.")
     return ok
 
 
@@ -126,7 +126,7 @@ def _session(name: str):
     except Exception as exc:
         if _require_gpu():
             raise RuntimeError(
-                f"TEXTSEG_BACKEND={_mode()}: the CUDA execution provider failed to "
+                f"TYPESEG_BACKEND={_mode()}: the CUDA execution provider failed to "
                 f"initialise ({exc}). Ensure CUDA 12.x + cuDNN 9.x are installed and on "
                 "the library path (LD_LIBRARY_PATH)."
             ) from exc
@@ -134,7 +134,7 @@ def _session(name: str):
     if _require_gpu() and "CUDAExecutionProvider" not in sess.get_providers():
         # Provider was requested but silently dropped to CPU at init.
         raise RuntimeError(
-            f"TEXTSEG_BACKEND={_mode()}: CUDA was requested but the session loaded only "
+            f"TYPESEG_BACKEND={_mode()}: CUDA was requested but the session loaded only "
             f"{sess.get_providers()}. Check CUDA 12.x / cuDNN 9.x install and your GPU's "
             "compute-capability support in this onnxruntime build."
         )

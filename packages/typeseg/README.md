@@ -1,25 +1,25 @@
-# textseg
+# TypeSeg
 
 **Fine-grained, character-level content-type segmentation for textual inputs.**
 
-`textseg` labels every character position of a text with one of 35 content types
+`typeseg` labels every character position of a text with one of 35 content types
 (`html`, `css`, `javascript_typescript`, `python`, `powershell`, `encoding_base64`, …),
 recovering the internal structure of mixed, malformed, or convention-breaking inputs.
 The only runtime dependency is `numpy`.
 
 ```bash
-pip install textseg              # CPU, numpy only
-pip install "textseg[onnx]"      # + ONNX Runtime (faster CPU)
-pip install "textseg[gpu]"       # + CUDA: onnxruntime-gpu (U-Net) and cupy (Mamba scan)
+pip install typeseg              # CPU, numpy only
+pip install "typeseg[onnx]"      # + ONNX Runtime (faster CPU)
+pip install "typeseg[gpu]"       # + CUDA: onnxruntime-gpu (U-Net) and cupy (Mamba scan)
 ```
 
 ```python
-import textseg
+import typeseg
 
 text = "<html><body>IgnoreAbovecG93ZXJzaGVsbA==</body></html>"
 
-result = textseg.precise(text)   # Mamba: highest quality, long-context  (recommended)
-result = textseg.fast(text)      # U-Net: faster, when throughput matters more than quality
+result = typeseg.precise(text)   # Mamba: highest quality, long-context  (recommended)
+result = typeseg.fast(text)      # U-Net: faster, when throughput matters more than quality
 
 for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} {seg.confidence:.2f}")
@@ -38,15 +38,15 @@ A `Segmentation` exposes:
 - `labels` — the class names, in `char_probs` column order.
 
 ```python
-r = textseg.precise("SELECT 1")
+r = typeseg.precise("SELECT 1")
 r.char_probs.shape            # (8, 35)
 r.char_distribution(0)        # {'sql': 0.99, 'text': 0.001, ...} for char 0
 ```
 
 When printed to a terminal, a `Segment` renders as a colour-tinted chip of its text
 (matching the interactive viewer). Colour is auto-detected: it is emitted only to a TTY
-and honours `NO_COLOR`; force it with `TEXTSEG_COLOR=always` or disable with
-`TEXTSEG_COLOR=never`.
+and honours `NO_COLOR`; force it with `TYPESEG_COLOR=always` or disable with
+`TYPESEG_COLOR=never`.
 
 ### Backends
 
@@ -55,8 +55,8 @@ length** on it. The `onnx`/`gpu` extras transparently swap in faster backends �
 API and output are identical (verified bit-close). Inspect the active backend:
 
 ```python
-import textseg
-textseg.backend_info()
+import typeseg
+typeseg.backend_info()
 # {'backend': 'onnx', 'gpu': True, 'precise_gpu': True,
 #  'fast_providers': ['CUDAExecutionProvider', 'CPUExecutionProvider'],
 #  'precise_providers': ['CuPyCUDA:NVIDIA GeForce RTX 5070 Laptop GPU']}
@@ -79,9 +79,9 @@ honestly.
   path always stays on CPU and CuPy carries the GPU acceleration instead (~100× over the
   ONNX `Scan` path). When CuPy/GPU is absent, `precise()` falls back to ONNX (or numpy) on CPU.
 
-Select the backend with the `TEXTSEG_BACKEND` environment variable:
+Select the backend with the `TYPESEG_BACKEND` environment variable:
 
-| `TEXTSEG_BACKEND` | behaviour |
+| `TYPESEG_BACKEND` | behaviour |
 |---|---|
 | *(unset)* / `onnx` / `cpu` | auto: U-Net on CUDA (onnxruntime) when it loads, Mamba on CuPy CUDA when present; otherwise CPU/numpy |
 | `numpy` | force the pure-numpy backend |
@@ -89,7 +89,7 @@ Select the backend with the `TEXTSEG_BACKEND` environment variable:
 
 `gpu`/`cuda` is the "fail fast" mode: rather than silently running on CPU it errors if
 the GPU backends are missing, the CUDA provider is absent, or CUDA fails to load. GPU
-needs `pip install "textseg[gpu]"` (onnxruntime-gpu for the U-Net, CuPy for the Mamba
+needs `pip install "typeseg[gpu]"` (onnxruntime-gpu for the U-Net, CuPy for the Mamba
 scan) plus CUDA 12.x + cuDNN 9.x on the library path.
 
 #### Running on GPU
@@ -99,7 +99,7 @@ pulls the CUDA libraries as pip wheels so nothing has to be installed system-wid
 
 ```bash
 # 1. The GPU extra: onnxruntime-gpu (U-Net) + cupy-cuda12x (Mamba scan)
-pip install "textseg[gpu]"
+pip install "typeseg[gpu]"
 
 # 2. CUDA 12 + cuDNN 9 libraries that onnxruntime-gpu needs (CuPy bundles its own).
 #    Skip any you already have system-wide.
@@ -119,18 +119,18 @@ PY
 Verify both models are on the GPU:
 
 ```python
-import textseg
-textseg.backend_info()
+import typeseg
+typeseg.backend_info()
 # {'backend': 'onnx', 'gpu': True, 'precise_gpu': True,
 #  'fast_providers': ['CUDAExecutionProvider', 'CPUExecutionProvider'],
 #  'precise_providers': ['CuPyCUDA:NVIDIA GeForce RTX 5070 Laptop GPU']}
 
-textseg.fast(text)      # U-Net on onnxruntime-gpu  (~140k chars/s)
-textseg.precise(text)   # Mamba on the CuPy scan    (~58k tokens/s raw forward)
+typeseg.fast(text)      # U-Net on onnxruntime-gpu  (~140k chars/s)
+typeseg.precise(text)   # Mamba on the CuPy scan    (~58k tokens/s raw forward)
 ```
 
 To make GPU mandatory (raise instead of silently using CPU), set
-`TEXTSEG_BACKEND=gpu`. Notes:
+`TYPESEG_BACKEND=gpu`. Notes:
 
 - The **first** CUDA call compiles kernels — a one-time warmup of seconds (longer on
   brand-new GPU architectures, e.g. Blackwell `sm_120`). Keep the process warm.
@@ -143,7 +143,7 @@ Post-processing mirrors the interactive viewer via an `Options` object; every st
 can be tuned or disabled:
 
 ```python
-from textseg import precise, Options
+from typeseg import precise, Options
 
 result = precise(text, Options(other_threshold=0.30, min_run_chars=3))
 result = precise(text, Options(paired_delimiter_fill=False))   # disable one step
@@ -151,13 +151,13 @@ result = precise(text, Options(paired_delimiter_fill=False))   # disable one ste
 
 ### Building from source
 
-The model weights (`textseg/data/*.npz`, `*.onnx`) are generated from the released
+The model weights (`typeseg/data/*.npz`, `*.onnx`) are generated from the released
 checkpoints and are not checked in. From the repository root:
 
 ```bash
-python scripts/export_textseg_weights.py   # checkpoints -> data/*.npz + manifest.json
-python scripts/export_textseg_onnx.py      # data/*.npz   -> data/*.onnx
-python -m build packages/textseg   # or: uv build packages/textseg
+python scripts/export_typeseg_weights.py   # checkpoints -> data/*.npz + manifest.json
+python scripts/export_typeseg_onnx.py      # data/*.npz   -> data/*.onnx
+python -m build packages/typeseg   # or: uv build packages/typeseg
 ```
 
 See the project repository and the accompanying MSc thesis for methodology, models,
@@ -167,7 +167,7 @@ and benchmarks. Licensed under Apache-2.0.
 
 The raw model gives a probability vector per character. Post-processing applies a few
 cheap local passes (each `O(n)`, no parsing) before segments are exposed. They run in
-the order below; toggle each via `Options`. Implementation: `textseg/_postprocess.py`
+the order below; toggle each via `Options`. Implementation: `typeseg/_postprocess.py`
 (the interactive viewer in `viewers/core.py` has a few additional heuristics).
 
 | step | `Options` flag | what it does |

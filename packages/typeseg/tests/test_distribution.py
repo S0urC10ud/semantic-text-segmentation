@@ -5,7 +5,7 @@ per-character labels/confidence and segment spans. Runs both models on CPU.
 import numpy as np
 import pytest
 
-import textseg
+import typeseg
 
 
 TEXTS = [
@@ -16,7 +16,7 @@ TEXTS = [
 ]
 
 
-@pytest.mark.parametrize("fn", [textseg.fast, textseg.precise])
+@pytest.mark.parametrize("fn", [typeseg.fast, typeseg.precise])
 @pytest.mark.parametrize("text", TEXTS)
 def test_char_probs_is_a_valid_distribution(fn, text):
     r = fn(text)
@@ -53,7 +53,7 @@ def test_char_probs_is_a_valid_distribution(fn, text):
 def test_confidence_matches_distribution_top_prob():
     """For non-`other` characters, char_confidence is the probability the model
     assigned to the (post-processed) label in char_probs."""
-    r = textseg.fast("def square(x): return x * x")
+    r = typeseg.fast("def square(x): return x * x")
     probs, labels = r.char_probs, r.labels
     idx = {name: i for i, name in enumerate(labels)}
     checked = 0
@@ -66,6 +66,6 @@ def test_confidence_matches_distribution_top_prob():
 
 
 def test_segment_text_matches_span():
-    r = textseg.precise("print('hi'); SELECT 1;")
+    r = typeseg.precise("print('hi'); SELECT 1;")
     for s in r.segments:
         assert s.text == r.text[s.start:s.end]
