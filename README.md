@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/typeseg.svg)](https://pypi.org/project/typeseg/)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Live demo](https://img.shields.io/badge/demo-typeseg.martin--dallinger.me-f2994a.svg)](https://typeseg.martin-dallinger.me)
 
 `typeseg` localizes *where* each content type begins and ends inside a text stream, labeling

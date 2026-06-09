@@ -2,10 +2,24 @@
 
 **Fine-grained, character-level content-type segmentation for textual inputs.**
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/S0urC10ud/semantic-text-segmentation/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/typeseg.svg)](https://pypi.org/project/typeseg/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Live demo](https://img.shields.io/badge/demo-typeseg.martin--dallinger.me-f2994a.svg)](https://typeseg.martin-dallinger.me)
+
 `typeseg` labels every character position of a text with one of 35 content types
 (`html`, `css`, `javascript_typescript`, `python`, `powershell`, `encoding_base64`, …),
 recovering the internal structure of mixed, malformed, or convention-breaking inputs.
 The only runtime dependency is `numpy`.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/S0urC10ud/semantic-text-segmentation/main/images/llm_segmentation.png" alt="Correct model output on a heavily mangled HTML input with a hidden shell payload" width="460">
+</p>
+<p align="center">
+  <em>Model output on a heavily mangled input (stress-test): the script/style tags are missing and a
+  reverse shell targeting an LLM is hidden inside an HTML comment, yet the embedded <code>shell</code>
+  region is recovered correctly. Color saturation reflects per-character confidence.</em>
+</p>
 
 ```bash
 pip install typeseg              # CPU, numpy only
@@ -24,6 +38,12 @@ result = typeseg.fast(text)      # U-Net: faster, when throughput matters more t
 for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} {seg.confidence:.2f}")
 ```
+
+The bundled `examples/segcat.py` renders the result in the terminal:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/S0urC10ud/semantic-text-segmentation/main/images/typeseg-example.png" alt="typeseg segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">
+</p>
 
 A `Segmentation` exposes:
 
@@ -47,6 +67,17 @@ When printed to a terminal, a `Segment` renders as a colour-tinted chip of its t
 (matching the interactive viewer). Colour is auto-detected: it is emitted only to a TTY
 and honours `NO_COLOR`; force it with `TYPESEG_COLOR=always` or disable with
 `TYPESEG_COLOR=never`.
+
+## Use cases
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/S0urC10ud/semantic-text-segmentation/main/images/use_cases.png" alt="Representative use cases for granular content-type segmentation" width="820">
+</p>
+
+Content-aware routing and LLM-agent guardrails, span-level scanning of mixed/encoded payloads,
+structure recovery in malformed or convention-breaking inputs, and dataset triage — moving the
+decision from the whole file down to individual character spans. See the
+[project README](https://github.com/S0urC10ud/semantic-text-segmentation#use-cases) for details.
 
 ### Backends
 
