@@ -13,7 +13,7 @@ recovering the internal structure of mixed, malformed, or convention-breaking in
 The only runtime dependency is `numpy`.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/S0urC10ud/semantic-text-segmentation/main/images/llm_segmentation.png" alt="Correct model output on a heavily mangled HTML input with a hidden shell payload" width="460">
+  <img src="https://typeseg.martin-dallinger.me/images/llm_segmentation.png" alt="Correct model output on a heavily mangled HTML input with a hidden shell payload" width="460">
 </p>
 <p align="center">
   <em>Model output on a heavily mangled input (stress-test): the script/style tags are missing and a
@@ -42,7 +42,7 @@ for seg in result.segments:
 The bundled `examples/segcat.py` renders the result in the terminal:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/S0urC10ud/semantic-text-segmentation/main/images/typeseg-example.png" alt="typeseg segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">
+  <img src="https://typeseg.martin-dallinger.me/images/typeseg-example.png" alt="typeseg segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">
 </p>
 
 A `Segmentation` exposes:
@@ -71,7 +71,7 @@ and honours `NO_COLOR`; force it with `TYPESEG_COLOR=always` or disable with
 ## Use cases
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/S0urC10ud/semantic-text-segmentation/main/images/use_cases.png" alt="Representative use cases for granular content-type segmentation" width="820">
+  <img src="https://typeseg.martin-dallinger.me/images/use_cases.png" alt="Representative use cases for granular content-type segmentation" width="820">
 </p>
 
 Content-aware routing and LLM-agent guardrails, span-level scanning of mixed/encoded payloads,

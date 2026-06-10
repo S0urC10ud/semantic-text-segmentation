@@ -156,6 +156,10 @@ body{
   padding:18px 20px;
   border-bottom:1px solid var(--border);
 }
+.panel-title{
+  flex:0 0 300px;
+  min-width:0;
+}
 .panel-title h2{
   margin:0 0 4px;
   font-size:18px;
@@ -175,7 +179,7 @@ body{
   flex-wrap:wrap;
 }
 .counter-group{
-  min-width:112px;
+  min-width:150px;
   padding:8px 12px;
   border:1px solid var(--border);
   border-radius:12px;
@@ -201,6 +205,8 @@ body{
   color:#0f172a;
   font-size:13px;
   font-weight:700;
+  white-space:nowrap;
+  font-variant-numeric:tabular-nums;
 }
 .threshold-controls{
   display:flex;
@@ -405,13 +411,9 @@ body{
   outline-offset:1px;
 }
 .char.newline{
-  display:block;
-  width:100%;
-  height:0;
-  line-height:0;
-  margin:0;
-  padding:0;
-  visibility:hidden;
+  /* the literal "\n" inside renders as exactly one break via the
+     container's white-space:pre-wrap — no <br>, no block box */
+  display:inline;
 }
 
 .tooltip{
@@ -481,6 +483,9 @@ body{
   }
   .segmentor-panel .panel-head{
     flex-direction:column;
+  }
+  .panel-title{
+    flex:0 0 auto;
   }
   .controls{
     justify-content:flex-start;

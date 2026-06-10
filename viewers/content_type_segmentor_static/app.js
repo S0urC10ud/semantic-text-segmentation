@@ -33,7 +33,7 @@ function escAttr(text){
 }
 
 function sanitizeToViewerText(text){
-  return String(text || '').replace(/\r/g, '\n').replace(SANITIZE_REGEX, '¤');
+  return String(text || '').replace(/\r\n?/g, '\n').replace(SANITIZE_REGEX, '¤');
 }
 
 function enforceSanitizedTextarea(textarea){
@@ -233,7 +233,7 @@ function renderSegments(payload){
       const style = `--seg-color:${color};background-color:${bg};box-shadow:inset 0 -1px 0 ${borderColor};`;
       if (ch === '\n'){
         pieces.push(
-          `<span class="char newline" style="${style}" data-probs="${probsAttr}" data-label-id="${labelId}"><br></span>`
+          `<span class="char newline" data-probs="${probsAttr}" data-label-id="${labelId}">\n</span>`
         );
       } else {
         pieces.push(
