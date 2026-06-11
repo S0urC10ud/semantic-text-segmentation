@@ -19,12 +19,14 @@
 }
 
 *{box-sizing:border-box}
-html,body{height:100%}
+html,body{min-height:100%}
 body{
   margin:0;
   background:
     radial-gradient(1200px 700px at 10% -10%, #ffffff, transparent 60%),
     var(--bg);
+  background-attachment:fixed;
+  background-repeat:no-repeat;
   color:var(--text);
   font-family:var(--sans);
   line-height:1.55;
@@ -184,28 +186,31 @@ body{
   align-items:center;
   justify-content:flex-end;
   flex-wrap:wrap;
+  flex:1 1 auto;
 }
+/* Keep the examples jump-link on the left, away from the primary actions. */
+#moreExamplesBtn{margin-right:auto}
 .counter-group{
-  min-width:150px;
-  padding:8px 12px;
+  min-width:120px;
+  padding:5px 10px;
   border:1px solid var(--border);
-  border-radius:12px;
+  border-radius:10px;
   background:#fff;
 }
 .threshold-group{
-  min-width:150px;
-  padding:8px 12px;
+  min-width:165px;
+  padding:5px 10px;
   border:1px solid var(--border);
-  border-radius:12px;
+  border-radius:10px;
   background:#fff;
 }
 .counter-label{
   display:block;
   color:var(--subtle);
-  font-size:11px;
+  font-size:10px;
   font-weight:700;
   text-transform:uppercase;
-  letter-spacing:.08em;
+  letter-spacing:.07em;
 }
 .counter-value{
   display:block;
@@ -218,23 +223,26 @@ body{
 .threshold-controls{
   display:flex;
   align-items:center;
-  gap:10px;
+  gap:8px;
+  margin-top:2px;
 }
 .threshold-range{
   flex:1;
-  min-width:60px;
+  min-width:54px;
   accent-color:var(--accent);
 }
 .threshold-input{
-  width:52px;
-  padding:6px 8px;
+  width:66px;
+  padding:3px 6px;
   border:1px solid var(--border);
-  border-radius:10px;
+  border-radius:8px;
   background:var(--panel-2);
   color:var(--text);
   font:inherit;
-  font-size:13px;
+  font-size:12px;
   font-weight:700;
+  text-align:center;
+  font-variant-numeric:tabular-nums;
 }
 .threshold-input:focus{
   outline:none;
