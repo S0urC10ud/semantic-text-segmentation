@@ -17,15 +17,18 @@ _WHITESPACE = set(" \t\n\r\f\v")
 
 
 def _runs(labels: List[int]) -> List[Tuple[int, int, int]]:
-    runs: List[Tuple[int, int, int]] = []
-    if not labels:
-        return runs
-    start = 0
-    for i in range(1, len(labels) + 1):
-        if i == len(labels) or labels[i] != labels[start]:
-            runs.append((start, i, labels[start]))
-            start = i
-    return runs
+    # Contiguous equal-label spans. Vectorised: the change points are where adjacent
+    # labels differ. This is called once per post-processing pass over the full
+    # sequence, so the pure-Python scan (with its per-iteration len()) dominated the
+    # pipeline; np.diff finds the boundaries in C. Output is identical.
+    n = len(labels)
+    if n == 0:
+        return []
+    arr = np.asarray(labels)
+    cuts = np.flatnonzero(arr[1:] != arr[:-1]) + 1
+    starts = [0, *cuts.tolist()]
+    ends = [*cuts.tolist(), n]
+    return [(s, e, int(labels[s])) for s, e in zip(starts, ends)]
 
 
 def relabel_whitespace(text: str, labels: List[int]) -> List[int]:
@@ -34,29 +37,21 @@ def relabel_whitespace(text: str, labels: List[int]) -> List[int]:
     n = len(text)
     if n == 0:
         return labels
-    is_ws = [c in _WHITESPACE for c in text]
-    if not any(is_ws):
+    ws = np.fromiter((c in _WHITESPACE for c in text), dtype=bool, count=n)
+    if not ws.any():
         return labels
-    left = [-1] * n
-    right = [-1] * n
-    last = -1
-    for i in range(n):
-        if not is_ws[i]:
-            last = labels[i]
-        left[i] = last
-    last = -1
-    for i in range(n - 1, -1, -1):
-        if not is_ws[i]:
-            last = labels[i]
-        right[i] = last
-    out = list(labels)
-    for i in range(n):
-        if is_ws[i]:
-            if left[i] != -1:
-                out[i] = left[i]
-            elif right[i] != -1:
-                out[i] = right[i]
-    return out
+    labels_arr = np.asarray(labels)
+    pos = np.arange(n)
+    # left_src[i] = index of nearest non-ws char at <= i (-1 if none): running max of
+    # the non-ws indices. right_src[i] = nearest non-ws at >= i (n if none): reverse
+    # running min. A whitespace char takes its left host's label, else the right's.
+    left_src = np.maximum.accumulate(np.where(ws, -1, pos))
+    right_src = np.minimum.accumulate(np.where(ws, n, pos)[::-1])[::-1]
+    src = np.where(left_src >= 0, left_src, right_src)        # prefer left, fall back right
+    take = ws & (src < n)                                     # leave ws with no host at all
+    out = labels_arr.copy()
+    out[take] = labels_arr[src[take]]
+    return out.tolist()
 
 
 def confidence_gate(char_probs: np.ndarray, labels: List[int], threshold: float, other_index: int) -> List[int]:
@@ -424,16 +419,22 @@ def paired_delimiter_fill(text: str, labels: List[int], char_probs: np.ndarray, 
             if cur_score is None:
                 cur_score = _boundary_local_score(text, cur_start) + _boundary_local_score(text, cur_end)
             best_start, best_end, best_score = cur_start, cur_end, cur_score
+            n_text = len(text)
             for ls in range(-max_shift, max_shift + 1):
                 cs = cur_start + ls
                 if cs < left_run[0] or cs >= cur_end:
+                    continue
+                # The wrap is valid only if text[cs-1] opens a pair; its required
+                # closing char is fixed by the left shift, so resolve it once here
+                # instead of calling _matching_wrap for every (ls, rs) combination.
+                close_needed = _WRAP_OPEN_TO_CLOSE.get(text[cs - 1]) if cs > 0 else None
+                if close_needed is None:
                     continue
                 for rs in range(-max_shift, max_shift + 1):
                     ce = cur_end + rs
                     if ce <= cs or ce > right_run[1] or (cs == cur_start and ce == cur_end):
                         continue
-                    if not _matching_wrap(text[cs - 1] if cs > 0 else "",
-                                          text[ce] if ce < len(text) else ""):
+                    if (text[ce] if ce < n_text else "") != close_needed:
                         continue
                     sc = _score_wrapped(text, char_probs, left_run, mid_run, right_run, cs, ce)
                     if sc is not None and sc > best_score + 1e-6:

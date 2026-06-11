@@ -226,3 +226,16 @@ benchmark numbers; on by default here for deployment-style output). Step 5 is an
 the interactive viewer also applies. The viewer has further heuristics
 (`markdown_structure_fill`, `local_host_fill`, `newline_snap`) not ported here — see
 `viewers/core.py` for those.
+
+These passes are cheap, but on long inputs they run on the CPU and can outweigh the
+model's own forward pass — so the highest throughput is with post-processing off,
+exposing the raw per-character argmax:
+
+```python
+raw = Options(whitespace_relabel=False, confidence_gating=False, boundary_snap=False,
+              min_run_normalize=False, paired_delimiter_fill=False)
+result = precise(text, raw)
+```
+
+The trade-off is noisier segments (single-character runs, frayed boundaries); the
+default keeps post-processing on for cleaner, deployment-style output.
