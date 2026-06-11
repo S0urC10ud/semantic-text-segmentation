@@ -142,7 +142,7 @@ def _assemble(text: str, byte_probs: np.ndarray, options: Options) -> Segmentati
         labels = snap_boundaries(text, labels, char_probs, options.boundary_snap_max_shift,
                                  options.min_run_chars)
     if options.min_run_normalize:
-        labels = normalize_short_runs(labels, char_probs, options.min_run_chars)
+        labels = normalize_short_runs(labels, char_probs, options.min_run_chars, other_index)
     if options.paired_delimiter_fill:
         labels = paired_delimiter_fill(text, labels, char_probs, options.paired_delimiter_max_shift)
     if options.whitespace_relabel:

@@ -34,6 +34,7 @@ gpu = ["onnxruntime-gpu>=1.17", "cupy-cuda12x>=13"]
 
 [tool.setuptools]
 packages = ["typeseg"]
+license-files = ["LICENSE"]
 
 [tool.setuptools.package-data]
 typeseg = ["data/*.npz", "data/*.json", "data/*.onnx"]

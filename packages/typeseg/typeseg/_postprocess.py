@@ -67,8 +67,13 @@ def confidence_gate(char_probs: np.ndarray, labels: List[int], threshold: float,
     return [other_index if maxp[i] < threshold else lab for i, lab in enumerate(labels)]
 
 
-def normalize_short_runs(labels: List[int], char_probs: np.ndarray, min_run_chars: int) -> List[int]:
-    """Absorb interior runs shorter than ``min_run_chars`` into the better-supported neighbour."""
+def normalize_short_runs(labels: List[int], char_probs: np.ndarray, min_run_chars: int,
+                         other_index: int = -1) -> List[int]:
+    """Absorb interior runs shorter than ``min_run_chars`` into the better-supported neighbour.
+
+    Runs labelled ``other_index`` are skipped: they are deliberate abstentions
+    produced by confidence gating, and merging one into a neighbour would assign a
+    label the model scored below threshold (matches the viewer)."""
     if min_run_chars <= 1 or len(labels) <= 2:
         return labels
     out = list(labels)
@@ -88,6 +93,8 @@ def normalize_short_runs(labels: List[int], char_probs: np.ndarray, min_run_char
             if s <= guard:  # left neighbour was just rewritten this pass
                 continue
             if (e - s) >= min_run_chars:
+                continue
+            if other_index >= 0 and _lab == other_index:
                 continue
             left_lab, left_len = runs[idx - 1][2], runs[idx - 1][1] - runs[idx - 1][0]
             right_lab, right_len = runs[idx + 1][2], runs[idx + 1][1] - runs[idx + 1][0]
