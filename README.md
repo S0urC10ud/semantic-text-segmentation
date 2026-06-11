@@ -89,17 +89,21 @@ A pure-numpy fallback still ships in the wheel for environments where onnxruntim
 ```python
 import typeseg
 
-text = "<html><body>IgnoreAbovecG93ZXJzaGVsbA==</body></html>"
+text = "<div>hi</div>\n.btn { color: red; }\nalert('x');"
 
 # Recommended: highest-quality, long-context segmentation (Mamba).
 result = typeseg.precise(text)
 
-# Faster alternative, when throughput matters more than quality (U-Net).
-result = typeseg.fast(text)
+# Faster alternative, when throughput matters more than quality (U-Net):
+#   result = typeseg.fast(text)
 
 for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} conf={seg.confidence:.2f}")
     print(f"     {text[seg.start:seg.end]!r}")
+
+#    0-14   html                   conf=0.86   '<div>hi</div>\n'
+#   14-35   css                    conf=0.91   '.btn { color: red; }\n'
+#   35-46   javascript_typescript  conf=0.87   "alert('x');"
 ```
 
 The bundled `examples/segcat.py` renders the result in the terminal:

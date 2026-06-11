@@ -29,13 +29,17 @@ pip install "typeseg[gpu]"       # + CUDA: onnxruntime-gpu (U-Net) and cupy (Mam
 ```python
 import typeseg
 
-text = "<html><body>IgnoreAbovecG93ZXJzaGVsbA==</body></html>"
+text = "<div>hi</div>\n.btn { color: red; }\nalert('x');"
 
 result = typeseg.precise(text)   # Mamba: highest quality, long-context  (recommended)
-result = typeseg.fast(text)      # U-Net: faster, when throughput matters more than quality
+# result = typeseg.fast(text)    # U-Net: faster, when throughput matters more than quality
 
 for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} {seg.confidence:.2f}")
+
+#    0-14   html                   0.86
+#   14-35   css                    0.91
+#   35-46   javascript_typescript  0.87
 ```
 
 Installing the package also gives you a `typeseg` command (alias `segcat`) that
@@ -76,6 +80,21 @@ When printed to a terminal, a `Segment` renders as a colour-tinted chip of its t
 (matching the interactive viewer). Colour is auto-detected: it is emitted only to a TTY
 and honours `NO_COLOR`; force it with `TYPESEG_COLOR=always` or disable with
 `TYPESEG_COLOR=never`.
+
+## Content types
+
+The models classify each character into one of **35 content types**, plus the open-set
+`other`. The 35 names below are exactly the `char_probs` columns (see `typeseg.precise("").labels`
+for the live column order); `other` (index 35) is the virtual class with no column, assigned by
+confidence gating to below-threshold / unknown characters.
+
+| category | classes |
+|---|---|
+| **Programming languages** (17) | `python`, `javascript_typescript`, `java`, `c_family` (C / C++ / Obj-C), `csharp` (C#), `go`, `rust`, `ruby`, `php`, `swift`, `kotlin`, `scala`, `dart`, `visual_basic`, `shell` (sh / bash), `powershell`, `sql` |
+| **Markup & docs** (7) | `html`, `xml`, `svg`, `css`, `markdown`, `restructuredtext`, `tex` (TeX / LaTeX) |
+| **Data & config** (6) | `json`, `yaml`, `csv`, `text` (plain natural language), `dockerfile`, `gettext_catalog` (gettext `.po`) |
+| **Binary-to-text encodings** (5) | `encoding_hex`, `encoding_base64`, `encoding_base32`, `encoding_base58`, `encoding_base85` (Ascii85) |
+| **Open-set** | `other` — below-threshold / unrecognised; *not* a `char_probs` column |
 
 ## Use cases
 
