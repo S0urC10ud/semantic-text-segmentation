@@ -454,6 +454,19 @@ body{
   height:100%;
   background:var(--color, var(--accent));
 }
+.pp-trace{
+  margin-top:6px;
+  padding-top:6px;
+  border-top:1px solid var(--border);
+  font-size:12px;
+  color:var(--subtle);
+}
+.pp-trace b{
+  color:var(--text);
+}
+.pp-trace .pp-step{
+  font-style:italic;
+}
 
 .footer{
   text-align:center;

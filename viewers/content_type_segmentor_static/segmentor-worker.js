@@ -163,12 +163,28 @@ async function runSegment(payloadObj) {
     raw_labels[i] = best_j;
   }
 
-  const final_labels = postprocessCharLabels(text, raw_labels, probs, {
+  const ppResult = postprocessCharLabelsTraced(text, raw_labels, probs, {
     threshold: nextThreshold,
     otherId: num_classes,
     ppOptions: ppOptions
   });
-  
+  const final_labels = ppResult.labels;
+
+  // Per-char provenance: which post-processing steps changed the label,
+  // as [{step, from, to}, ...] per character (null when untouched).
+  const char_pp_trace = new Array(seq).fill(null);
+  let prev_stage_labels = raw_labels;
+  for (const stage of ppResult.stages) {
+    const cur = stage.labels;
+    for (let i = 0; i < seq; i++) {
+      if (cur[i] !== prev_stage_labels[i]) {
+        if (!char_pp_trace[i]) char_pp_trace[i] = [];
+        char_pp_trace[i].push({ step: stage.step, from: prev_stage_labels[i], to: cur[i] });
+      }
+    }
+    prev_stage_labels = cur;
+  }
+
   const segments = [];
   let currentLabel = -1;
   let currentStart = 0;
@@ -213,6 +229,7 @@ async function runSegment(payloadObj) {
     segments,
     char_top_probs,
     char_confidences,
+    char_pp_trace,
     stats,
     input_bytes: seq,
     window_count: 1,

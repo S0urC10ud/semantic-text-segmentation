@@ -335,15 +335,15 @@ function _snap_boundaries_to_delimiters(text, labels, charProbs, max_shift, min_
                 if (shift < 0) {
                     // Shifting left: chars [cand, boundary) change from left_label to right_label
                     for (let i = cand; i < boundary; i++) {
-                        let p_dest = charProbs[i * numClasses + right_label];
-                        let p_src = charProbs[i * numClasses + left_label];
+                        let p_dest = _label_prob(charProbs, i, right_label, numClasses);
+                        let p_src = _label_prob(charProbs, i, left_label, numClasses);
                         if (p_dest < p_src * 0.5) { valid = false; break; }
                     }
                 } else {
                     // Shifting right: chars [boundary, cand) change from right_label to left_label
                     for (let i = boundary; i < cand; i++) {
-                        let p_dest = charProbs[i * numClasses + left_label];
-                        let p_src = charProbs[i * numClasses + right_label];
+                        let p_dest = _label_prob(charProbs, i, left_label, numClasses);
+                        let p_src = _label_prob(charProbs, i, right_label, numClasses);
                         if (p_dest < p_src * 0.5) { valid = false; break; }
                     }
                 }
@@ -558,8 +558,17 @@ function _fill_markdown_structure_regions(text, labels, char_probs, markdown_lab
     return [arr, locked];
 }
 
+// The virtual "other" label (id === numClasses) has no probability column;
+// treat its prob as 0.0 like the Python reference _label_prob, instead of
+// reading the next character's row out of bounds.
+function _label_prob(charProbs, pos, label, numClasses) {
+    if (label >= 0 && label < numClasses) return charProbs[pos * numClasses + label];
+    return 0.0;
+}
+
 function _mean_prob(charProbs, start, end, targetClass, numClasses) {
     if (start >= end) return 0.0;
+    if (targetClass < 0 || targetClass >= numClasses) return 0.0;
     let sum = 0.0;
     for (let i = start; i < end; i++) {
         sum += charProbs[i * numClasses + targetClass];
@@ -567,7 +576,7 @@ function _mean_prob(charProbs, start, end, targetClass, numClasses) {
     return sum / (end - start);
 }
 
-function _normalize_short_runs(labels, charProbs, min_run_chars, locked_mask, numClasses) {
+function _normalize_short_runs(labels, charProbs, min_run_chars, locked_mask, numClasses, otherId) {
     let arr = new Int32Array(labels);
     if (min_run_chars <= 1 || arr.length <= 2) return arr;
     let max_passes = Math.max(1, arr.length);
@@ -577,6 +586,10 @@ function _normalize_short_runs(labels, charProbs, min_run_chars, locked_mask, nu
         for (let idx = 1; idx < runs.length - 1; idx++) {
             let start = runs[idx][0], end = runs[idx][1], run_len = end - start;
             if (run_len >= min_run_chars) continue;
+            // "other" runs are deliberate abstentions from confidence gating;
+            // merging them into a neighbor would assign a label the model gave
+            // sub-threshold probability. Leave them alone.
+            if (otherId !== undefined && otherId >= 0 && runs[idx][2] === otherId) continue;
             
             let left_run = runs[idx - 1];
             let right_run = runs[idx + 1];
@@ -708,43 +721,57 @@ function _threshold_labels(labels, charProbs, numClasses, threshold, otherId) {
     return out;
 }
 
-function postprocessCharLabels(text, labels, charProbs, options = {}) {
+/**
+ * Same pipeline as postprocessCharLabels, but also returns the label array
+ * after every enabled step so callers can attribute label changes to the
+ * step that made them: { labels, stages: [{ step, labels }] }.
+ */
+function postprocessCharLabelsTraced(text, labels, charProbs, options = {}) {
     let min_run_chars = options.min_run_chars !== undefined ? options.min_run_chars : 3;
     let boundary_snap_max_shift = options.boundary_snap_max_shift !== undefined ? options.boundary_snap_max_shift : 2;
     let threshold = options.threshold || 0.3;
     let otherId = options.otherId !== undefined ? options.otherId : -1;
 
     let numClasses = Math.floor(charProbs.length / labels.length);
-    if (numClasses <= 0) return new Int32Array(labels);
+    if (numClasses <= 0) return { labels: new Int32Array(labels), stages: [] };
 
     let pp = options.ppOptions || { whitespace: true, threshold: true, snap: true, shortRuns: true };
 
     // Start from raw argmax labels
     let currentLabels = new Int32Array(labels);
     let currentProbs = new Float32Array(charProbs);
+    let stages = [];
 
     // Step 1: Deterministic whitespace relabeling
     if (pp.whitespace) {
         let [wsLabels, wsProbs] = _relabel_whitespace(text, currentLabels, currentProbs, numClasses);
         currentLabels = wsLabels;
         currentProbs = wsProbs;
+        stages.push({ step: 'whitespace', labels: currentLabels });
     }
 
     // Step 2: Confidence gating (threshold)
     if (pp.threshold) {
         currentLabels = _threshold_labels(currentLabels, currentProbs, numClasses, threshold, otherId);
+        stages.push({ step: 'threshold', labels: currentLabels });
     }
 
     // Step 3: Local boundary snapping (±2 chars toward delimiters)
     if (pp.snap) {
         currentLabels = _snap_boundaries_to_delimiters(text, currentLabels, currentProbs, boundary_snap_max_shift, min_run_chars, numClasses);
+        stages.push({ step: 'snap', labels: currentLabels });
     }
 
     // Step 4: Minimum-run normalization (remove interior runs < min_run_chars)
     if (pp.shortRuns) {
         let locked_mask = _new_lock_mask(labels.length);
-        currentLabels = _normalize_short_runs(currentLabels, currentProbs, min_run_chars, locked_mask, numClasses);
+        currentLabels = _normalize_short_runs(currentLabels, currentProbs, min_run_chars, locked_mask, numClasses, otherId);
+        stages.push({ step: 'shortRuns', labels: currentLabels });
     }
 
-    return currentLabels;
+    return { labels: currentLabels, stages };
+}
+
+function postprocessCharLabels(text, labels, charProbs, options = {}) {
+    return postprocessCharLabelsTraced(text, labels, charProbs, options).labels;
 }

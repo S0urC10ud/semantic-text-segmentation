@@ -220,6 +220,7 @@ function renderSegments(payload){
   const text = String(payload.text || '');
   const probs = Array.isArray(payload.char_top_probs) ? payload.char_top_probs : [];
   const confidences = Array.isArray(payload.char_confidences) ? payload.char_confidences : [];
+  const ppTrace = Array.isArray(payload.char_pp_trace) ? payload.char_pp_trace : [];
   const pieces = [];
 
   for (const segment of payload.segments){
@@ -232,14 +233,16 @@ function renderSegments(payload){
       const bg = hexToRgbaConfidence(color, 0.22, confidence);
       const topProbs = Array.isArray(probs[idx]) ? probs[idx] : [];
       const probsAttr = escAttr(JSON.stringify(topProbs));
+      const trace = Array.isArray(ppTrace[idx]) ? ppTrace[idx] : [];
+      const ppAttr = trace.length ? ` data-pp="${escAttr(JSON.stringify(trace))}"` : '';
       const style = `--seg-color:${color};background-color:${bg};box-shadow:inset 0 -1px 0 ${borderColor};`;
       if (ch === '\n'){
         pieces.push(
-          `<span class="char newline" data-probs="${probsAttr}" data-label-id="${labelId}">\n</span>`
+          `<span class="char newline" data-probs="${probsAttr}" data-label-id="${labelId}"${ppAttr}>\n</span>`
         );
       } else {
         pieces.push(
-          `<span class="char" style="${style}" data-probs="${probsAttr}" data-label-id="${labelId}">${esc(ch)}</span>`
+          `<span class="char" style="${style}" data-probs="${probsAttr}" data-label-id="${labelId}"${ppAttr}>${esc(ch)}</span>`
         );
       }
     }
@@ -342,6 +345,21 @@ function showTooltip(event){
         <div class="value">${percentage}%</div>
       </div>
     `;
+  }
+
+  const ppTrace = JSON.parse(target.dataset.pp || '[]');
+  if (Array.isArray(ppTrace) && ppTrace.length){
+    const PP_STEP_NAMES = {
+      whitespace: 'whitespace relabeling',
+      threshold: 'confidence gating',
+      snap: 'boundary snapping',
+      shortRuns: 'min-run normalization',
+    };
+    let chain = `<b>${esc(labelName(ppTrace[0].from))}</b>`;
+    for (const t of ppTrace){
+      chain += ` &rarr; <b>${esc(labelName(t.to))}</b> <span class="pp-step">${esc(PP_STEP_NAMES[t.step] || t.step)}</span>`;
+    }
+    html += `<div class="pp-trace">post-processed: ${chain}</div>`;
   }
 
   tooltip.innerHTML = html;
