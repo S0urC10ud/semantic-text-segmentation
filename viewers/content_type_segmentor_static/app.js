@@ -580,6 +580,14 @@ function bindUi(){
     modelSelect.addEventListener('change', () => switchModel(modelSelect.value));
   }
 
+  const showInferenceSpeed = el('#showInferenceSpeed');
+  if (showInferenceSpeed) {
+    showInferenceSpeed.addEventListener('change', () => {
+      const group = el('#inferenceGroup');
+      if (group) group.hidden = !showInferenceSpeed.checked;
+    });
+  }
+
   const settingsModal = el('#settingsModal');
   if (settingsModal) {
     el('#settingsBtn').addEventListener('click', () => settingsModal.showModal());

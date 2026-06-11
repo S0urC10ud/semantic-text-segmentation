@@ -186,7 +186,7 @@ body{
   background:#fff;
 }
 .threshold-group{
-  min-width:220px;
+  min-width:150px;
   padding:8px 12px;
   border:1px solid var(--border);
   border-radius:12px;
@@ -215,11 +215,11 @@ body{
 }
 .threshold-range{
   flex:1;
-  min-width:120px;
+  min-width:60px;
   accent-color:var(--accent);
 }
 .threshold-input{
-  width:72px;
+  width:52px;
   padding:6px 8px;
   border:1px solid var(--border);
   border-radius:10px;
