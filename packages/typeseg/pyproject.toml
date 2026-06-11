@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "typeseg"
-version = "0.2.1"
+version = "0.2.2"
 description = "Fine-grained, character-level content-type segmentation for textual inputs (U-Net + Mamba)."
 readme = "README.md"
 license = "Apache-2.0"
@@ -33,12 +33,18 @@ segcat = "typeseg._cli:main"
 # launch-bound and slow on GPU). The base install already ships the fast ONNX CPU
 # backend, so this extra only adds the GPU pieces.
 #
+# cupy-cuda12x[ctk]: CuPy JIT-compiles its kernels via nvrtc at runtime, which needs
+# the CUDA toolkit *headers*. The plain cupy wheel ships nvrtc but not the headers,
+# so on a box without a system CUDA install the Mamba kernel fails to compile at
+# first use; the `[ctk]` extra pulls the nvidia-*-cu12 header/lib wheels so it works
+# out of the box. (The runtime also degrades to CPU + warns if headers are missing.)
+#
 # Gated to non-macOS: neither onnxruntime-gpu nor cupy-cuda12x publishes macOS
 # wheels (and Apple has no NVIDIA CUDA), so on a Mac `typeseg[gpu]` resolves to the
 # base package instead of failing with ResolutionImpossible.
 gpu = [
     "onnxruntime-gpu>=1.17; platform_system != 'Darwin'",
-    "cupy-cuda12x>=13; platform_system != 'Darwin'",
+    "cupy-cuda12x[ctk]>=13; platform_system != 'Darwin'",
 ]
 
 [tool.setuptools]

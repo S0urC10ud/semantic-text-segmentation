@@ -14,6 +14,7 @@ follows the same contract as ``_onnx_backend``: ``numpy`` forces it off,
 from __future__ import annotations
 
 import json
+import warnings
 from functools import lru_cache
 from typing import Optional
 
@@ -121,33 +122,81 @@ def _has_device() -> bool:
     return int(cp.cuda.runtime.getDeviceCount()) > 0
 
 
+@lru_cache(maxsize=1)
+def _probe_compile():
+    """Confirm CuPy can JIT-compile a kernel. Returns ``(ok, error_or_None)``.
+
+    CuPy compiles every elementwise/raw kernel at runtime via nvrtc, which needs the
+    CUDA toolkit headers. The pip ``cupy-cuda12x`` wheel ships nvrtc but NOT those
+    headers, so on a machine without a system CUDA toolkit (or the ``[ctk]`` header
+    wheels) compilation raises at first use -- e.g. ``RuntimeError: Failed to find
+    CUDA headers``. A bare device check passes there, so without this probe the auto
+    router picks CuPy and then crashes mid-inference instead of falling back. The
+    ``astype`` forces a real nvrtc compile; the result is cached so a broken box pays
+    it once. Never raises -- callers branch on the returned flag.
+    """
+    try:
+        cp = _import_cupy()
+        cp.arange(4, dtype=cp.int32).astype(cp.float32).sum().item()  # forces nvrtc compile
+        return True, None
+    except Exception as exc:  # nvrtc/header/driver init failure
+        return False, exc
+
+
+_warned_compile_fail = False
+
+
+def _warn_compile_fail_once(exc: Exception) -> None:
+    global _warned_compile_fail
+    if _warned_compile_fail:
+        return
+    _warned_compile_fail = True
+    warnings.warn(
+        "typeseg: a CUDA device was found but CuPy could not compile its GPU kernels "
+        f"({type(exc).__name__}: {exc}); falling back to the CPU (ONNX) backend for "
+        "precise(). CuPy JIT-compiles kernels and needs the CUDA toolkit headers -- "
+        "install them with: pip install \"cupy-cuda12x[ctk]\" (or set the CUDA_PATH "
+        "environment variable to a system CUDA 12.x install). Silence with "
+        "TYPESEG_BACKEND=numpy or Python's warnings filters.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def available() -> bool:
     """True if the CuPy GPU Mamba path should be used.
 
-    Auto mode: True when cupy imports and a CUDA device is present. With
-    ``TYPESEG_BACKEND=gpu``/``cuda`` a missing CuPy or device is a hard error.
-    With ``TYPESEG_BACKEND=numpy`` this is always off.
+    Auto mode: True when cupy imports, a CUDA device is present, AND CuPy can
+    actually compile a kernel (headers available). Any of those failing falls back
+    to ONNX/numpy (a one-time warning if a device was present but kernels won't
+    compile). With ``TYPESEG_BACKEND=gpu``/``cuda`` any failure is a hard error;
+    with ``TYPESEG_BACKEND=numpy`` this is always off.
     """
     mode = _mode()
     if mode == "numpy":
         return False
+    stage = "device"
     try:
         if not _has_device():
             raise RuntimeError("no CUDA device visible to CuPy")
+        if not _data("mamba_al.npz").is_file():
+            raise RuntimeError("bundled Mamba weights are missing")
+        stage = "compile"
+        ok, perr = _probe_compile()
+        if not ok:
+            raise perr if perr is not None else RuntimeError("CuPy kernel compilation failed")
     except Exception as exc:
         if _require_gpu():
             raise RuntimeError(
-                f"TYPESEG_BACKEND={mode} requires the GPU backend, but CuPy could not "
-                f"initialise a CUDA device ({exc}). Install with: pip install \"typeseg[gpu]\" "
-                "and ensure CUDA 12.x is on the library path."
+                f"TYPESEG_BACKEND={mode} requires the CuPy GPU backend, but it could not "
+                f"initialise ({exc}). Install with: pip install \"typeseg[gpu]\" (which bundles "
+                "the CUDA toolkit headers CuPy needs to JIT its kernels); with a system CUDA "
+                "install, set CUDA_PATH."
             ) from exc
+        if stage == "compile":  # device present but headers missing -> the actionable case
+            _warn_compile_fail_once(exc)
         return False
-    try:
-        return _data("mamba_al.npz").is_file()
-    except Exception:
-        if _require_gpu():
-            raise
-        return False
+    return True
 
 
 @lru_cache(maxsize=1)

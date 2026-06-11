@@ -17,7 +17,13 @@ from ._runtime import backend_info, run as _run
 from ._segmentation import Segment, Segmentation
 
 __all__ = ["fast", "precise", "Options", "Segment", "Segmentation", "backend_info", "__version__"]
-__version__ = "0.1.0"
+
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("typeseg")
+except (ImportError, PackageNotFoundError):  # not installed / running from source tree
+    __version__ = "0.0.0"
 
 
 def fast(text: str, options: Optional[Options] = None) -> Segmentation:
