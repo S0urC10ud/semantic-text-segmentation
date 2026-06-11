@@ -258,7 +258,7 @@ function updateResultMeta(payload){
     meta.textContent = 'No segmentation result yet.';
     return;
   }
-  meta.textContent = `${Number(payload.input_bytes || 0)} bytes, ${Number((payload.text || '').length)} characters, threshold ${formatThreshold(payload.other_threshold)}`;
+  meta.textContent = 'Hover any character to inspect its class probabilities.';
 }
 
 function setStatus(message, mode='neutral'){
