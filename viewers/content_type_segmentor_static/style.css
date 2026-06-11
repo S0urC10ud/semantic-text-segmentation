@@ -49,7 +49,11 @@ body{
   font-weight:700;
   letter-spacing:.3px;
 }
-.brand span{color:var(--accent)}
+.brand .brand-type{color:var(--accent)}
+/* "Seg": every glyph its own colour for a playful wordmark. */
+.brand-seg span:nth-child(1){color:#e84393}
+.brand-seg span:nth-child(2){color:#00b894}
+.brand-seg span:nth-child(3){color:#f39c12}
 .topbar-actions{
   display:flex;
   gap:10px;
@@ -70,6 +74,8 @@ body{
 }
 .badge.subtle{color:#0f172a}
 .badge.neutral{color:var(--subtle)}
+.link-badge{color:var(--accent);text-decoration:none;cursor:pointer;transition:background .15s,border-color .15s}
+.link-badge:hover{border-color:var(--accent);background:#eef4ff}
 .badge.success{
   color:#0b7a3e;
   background:rgba(46, 204, 113, 0.10);
@@ -171,6 +177,8 @@ body{
   color:var(--subtle);
   font-size:13px;
 }
+.status-line a{color:var(--accent);text-decoration:none;font-weight:600}
+.status-line a:hover{text-decoration:underline}
 
 .controls{
   display:flex;

@@ -3,7 +3,7 @@ const STATIC_BASE = './';
 // fresh deploy is picked up immediately despite GitHub Pages' max-age=600.
 const WORKER_URL = `${STATIC_BASE}segmentor-worker.js?v=${Date.now()}`;
 const SANITIZE_REGEX = /[^\x20-\x7E¤\n\t]/g;
-const DEFAULT_THRESHOLD = 0.3;
+const DEFAULT_THRESHOLD = 0.1;
 
 const STATE = {
   manifest: null,
@@ -436,7 +436,9 @@ async function loadManifest(){
   });
 
 
-  syncThresholdUi(STATE.manifest.other_threshold);
+  // Initialise the slider at the viewer default (0.1), not the manifest's
+  // thesis-recommended 0.3, so low-confidence chars stay visible by default.
+  syncThresholdUi(DEFAULT_THRESHOLD);
   updateInputHint();
   updateByteCounter();
 }

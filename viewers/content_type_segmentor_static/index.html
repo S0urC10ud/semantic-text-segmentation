@@ -9,10 +9,12 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <span>TypeSeg</span>: Semantic Text Segmentation
+      <span class="brand-type">Type</span><span class="brand-seg"><span>S</span><span>e</span><span>g</span></span>: Semantic Text Segmentation
     </div>
     <div class="topbar-actions">
       <div id="runtimeBadge" class="badge neutral">Loading browser runtime...</div>
+      <a href="https://pypi.org/project/typeseg/" target="_blank" rel="noopener" class="badge link-badge">🐍 pip install typeseg</a>
+      <a href="https://github.com/S0urC10ud/semantic-text-segmentation" target="_blank" rel="noopener" class="badge link-badge">★ GitHub</a>
       <button id="settingsBtn" class="badge" style="cursor:pointer;">⚙️ Settings</button>
     </div>
   </header>
@@ -26,7 +28,7 @@
       <div class="panel-head">
         <div class="panel-title">
           <h2>Segment Any Text Into Its Constituent Content Types</h2>
-          <p class="status-line">Running locally in your browser.</p>
+          <p class="status-line">Running locally in your browser &mdash; want to run it with Python? <a href="https://pypi.org/project/typeseg/" target="_blank" rel="noopener">Get it on PyPI &rarr;</a></p>
         </div>
         <div class="controls">
           <div class="threshold-group">
@@ -39,7 +41,7 @@
                 min="0"
                 max="1"
                 step="0.01"
-                value="0.30"
+                value="0.10"
               >
               <input
                 id="thresholdInput"
@@ -48,7 +50,7 @@
                 min="0"
                 max="1"
                 step="0.01"
-                value="0.30"
+                value="0.10"
                 inputmode="decimal"
               >
             </div>
