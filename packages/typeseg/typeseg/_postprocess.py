@@ -64,7 +64,7 @@ def confidence_gate(char_probs: np.ndarray, labels: List[int], threshold: float,
     if threshold <= 0.0 or char_probs.size == 0:
         return labels
     maxp = char_probs.max(axis=1)
-    return [other_index if maxp[i] < threshold else lab for i, lab in enumerate(labels)]
+    return np.where(maxp < threshold, other_index, np.asarray(labels, dtype=np.intp)).tolist()
 
 
 def normalize_short_runs(labels: List[int], char_probs: np.ndarray, min_run_chars: int,
@@ -452,21 +452,27 @@ def paired_delimiter_fill(text: str, labels: List[int], char_probs: np.ndarray, 
 def build_segments(text: str, labels: List[int], char_probs: np.ndarray,
                    label_names: List[str], other_index: int, other_label: str) -> Tuple[List[Segment], List[str], List[float]]:
     n = len(text)
-    char_conf: List[float] = []
-    char_label_names: List[str] = []
-    for i in range(n):
-        lab = labels[i]
-        if char_probs.size:
-            known_max = float(char_probs[i].max())
-            conf = (1.0 - known_max) if lab == other_index else float(char_probs[i, lab])
-        else:
-            conf = 0.0
-        char_conf.append(conf)
-        char_label_names.append(other_label if lab == other_index else label_names[lab])
+    # Per-char confidence, vectorised. `other` (no probability column) scores
+    # 1 - max(known); every other label scores its own column. The old per-char
+    # `char_probs[i].max()` Python loop did n separate numpy reductions and was the
+    # bottleneck of the whole pipeline -- this is the same result in two reductions.
+    if char_probs.size:
+        lab_arr = np.asarray(labels, dtype=np.intp)
+        is_other = lab_arr == other_index
+        known_max = char_probs.max(axis=1)                               # (n,)
+        safe_lab = np.where(is_other, 0, lab_arr)                        # avoid OOB at other_index
+        picked = char_probs[np.arange(n), safe_lab]                      # (n,) chosen-label prob
+        conf_arr = np.where(is_other, 1.0 - known_max, picked).astype(np.float64)
+    else:
+        conf_arr = np.zeros(n, dtype=np.float64)
+    char_conf: List[float] = conf_arr.tolist()
+    char_label_names: List[str] = [
+        other_label if lab == other_index else label_names[lab] for lab in labels
+    ]
 
     segments: List[Segment] = []
     for s, e, lab in _runs(labels):
         name = other_label if lab == other_index else label_names[lab]
-        conf = float(np.mean(char_conf[s:e])) if e > s else 0.0
+        conf = float(conf_arr[s:e].mean()) if e > s else 0.0
         segments.append(Segment(start=s, end=e, label=name, confidence=conf, text=text[s:e]))
     return segments, char_label_names, char_conf
