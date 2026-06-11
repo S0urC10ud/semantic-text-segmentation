@@ -315,7 +315,18 @@ function _snap_boundaries_to_delimiters(text, labels, charProbs, max_shift, min_
                 let cand = boundary + shift;
                 // Don't shift past run boundaries
                 if (cand <= left_run[0] || cand >= right_run[1]) continue;
-                
+
+                // Never move a boundary onto or across a line break: a line end is
+                // already a natural boundary (matches the reference
+                // _score_boundary_candidate newline guards).
+                if (cand > 0 && text[cand - 1] === '\n') continue;
+                if (cand < text.length && text[cand] === '\n') continue;
+                let crossesNewline = false;
+                for (let i = Math.min(cand, boundary); i < Math.max(cand, boundary); i++) {
+                    if (text[i] === '\n') { crossesNewline = true; break; }
+                }
+                if (crossesNewline) continue;
+
                 let score = getScore(cand);
                 if (score <= current_score) continue; // Must strictly improve delimiter score
                 
