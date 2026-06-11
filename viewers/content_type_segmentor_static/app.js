@@ -1,5 +1,7 @@
 const STATIC_BASE = './';
-const WORKER_URL = `${STATIC_BASE}segmentor-worker.js`;
+// Cache-bust the worker (and, via its query string, its importScripts) so a
+// fresh deploy is picked up immediately despite GitHub Pages' max-age=600.
+const WORKER_URL = `${STATIC_BASE}segmentor-worker.js?v=${Date.now()}`;
 const SANITIZE_REGEX = /[^\x20-\x7E¤\n\t]/g;
 const DEFAULT_THRESHOLD = 0.3;
 

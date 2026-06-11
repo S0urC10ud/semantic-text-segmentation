@@ -157,13 +157,14 @@ body{
   border-bottom:1px solid var(--border);
 }
 .panel-title{
-  flex:0 0 300px;
+  flex:0 0 auto;
   min-width:0;
 }
 .panel-title h2{
   margin:0 0 4px;
   font-size:18px;
   color:#0f172a;
+  white-space:nowrap;
 }
 .status-line{
   margin:0;
@@ -486,6 +487,9 @@ body{
   }
   .panel-title{
     flex:0 0 auto;
+  }
+  .panel-title h2{
+    white-space:normal;
   }
   .controls{
     justify-content:flex-start;

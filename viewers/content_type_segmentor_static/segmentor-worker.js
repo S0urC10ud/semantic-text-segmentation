@@ -1,9 +1,12 @@
 const STATIC_BASE = './';
 
-importScripts(STATIC_BASE + 'js/mamba.js');
-importScripts(STATIC_BASE + 'js/webgpu_matmul.js');
-importScripts(STATIC_BASE + 'js/postprocess.js');
-importScripts(STATIC_BASE + 'js/unet.js');
+// Reuse the cache-busting query the page passed on the worker URL.
+const ASSET_VERSION = self.location.search || '';
+
+importScripts(STATIC_BASE + 'js/mamba.js' + ASSET_VERSION);
+importScripts(STATIC_BASE + 'js/webgpu_matmul.js' + ASSET_VERSION);
+importScripts(STATIC_BASE + 'js/postprocess.js' + ASSET_VERSION);
+importScripts(STATIC_BASE + 'js/unet.js' + ASSET_VERSION);
 
 const STATE = {
   manifest: null,
