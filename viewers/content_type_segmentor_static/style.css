@@ -265,6 +265,20 @@ body{
   cursor:not-allowed;
 }
 .btn:active{transform:translateY(1px)}
+.btn-arrow{
+  display:inline-block;
+  vertical-align:-1px;
+  margin-left:6px;
+  animation:btnArrowBounce 1.8s ease-in-out infinite;
+}
+.btn:hover .btn-arrow{animation-duration:.9s}
+@keyframes btnArrowBounce{
+  0%,100%{transform:translateY(0)}
+  50%{transform:translateY(2px)}
+}
+@media (prefers-reduced-motion: reduce){
+  .btn-arrow{animation:none}
+}
 
 .body{
   display:grid;

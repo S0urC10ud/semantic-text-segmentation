@@ -387,7 +387,7 @@ function hideTooltip(){
 
 function setBusy(busy){
   STATE.busy = Boolean(busy);
-  for (const id of ['segmentBtn', 'loadDemoBtn', 'downloadJsonBtn']){
+  for (const id of ['segmentBtn', 'downloadJsonBtn']){
     el(`#${id}`).disabled = STATE.busy || !STATE.ready;
   }
   for (const id of ['thresholdRange', 'thresholdInput']){
@@ -587,13 +587,8 @@ function bindUi(){
   });
 
   el('#segmentBtn').addEventListener('click', segmentCurrentText);
-  el('#loadDemoBtn').addEventListener('click', async () => {
-    try{
-      await loadDemoText();
-      setStatus('Loaded the default demo sample.', 'success');
-    }catch(err){
-      setStatus(`Failed to load the demo sample: ${err.message}`, 'error');
-    }
+  el('#moreExamplesBtn').addEventListener('click', () => {
+    el('#examplesSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
   el('#downloadJsonBtn').addEventListener('click', downloadJson);
 
