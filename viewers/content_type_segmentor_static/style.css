@@ -50,10 +50,8 @@ body{
   letter-spacing:.3px;
 }
 .brand .brand-type{color:var(--accent)}
-/* "Seg": every glyph its own colour for a playful wordmark. */
-.brand-seg span:nth-child(1){color:#e84393}
-.brand-seg span:nth-child(2){color:#00b894}
-.brand-seg span:nth-child(3){color:#f39c12}
+/* "Seg" in a brighter blue against "Type"'s deeper accent blue. */
+.brand-seg{color:var(--accent-2)}
 .topbar-actions{
   display:flex;
   gap:10px;
