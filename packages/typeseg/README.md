@@ -39,7 +39,17 @@ for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} {seg.confidence:.2f}")
 ```
 
-The bundled `examples/segcat.py` renders the result in the terminal:
+Installing the package also gives you a `typeseg` command (alias `segcat`) that
+renders a file — tinted by content type, with a legend and a per-segment
+confidence table — straight in the terminal, no Python REPL needed:
+
+```bash
+typeseg file.html              # segment a file with Mamba (precise)
+typeseg --model fast file.html # use the faster U-Net instead
+cat foo.txt | typeseg          # read from stdin
+typeseg --demo                 # built-in mixed / prompt-injection sample
+python -m typeseg --demo       # equivalent module form
+```
 
 <p align="center">
   <img src="https://typeseg.martin-dallinger.me/images/typeseg-example.png" alt="typeseg segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">

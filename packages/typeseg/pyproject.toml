@@ -23,6 +23,10 @@ dependencies = ["numpy>=1.21"]
 Homepage = "https://github.com/s0urc10ud/semantic-text-segmentation"
 Demo = "https://typeseg.martin-dallinger.me"
 
+[project.scripts]
+typeseg = "typeseg._cli:main"
+segcat = "typeseg._cli:main"
+
 [project.optional-dependencies]
 # Faster, dynamic-length inference. numpy alone already runs both models at
 # arbitrary length on CPU; these only swap in the ONNX Runtime backend.
