@@ -68,20 +68,19 @@ or a Base64 payload pasted into an LLM prompt.
 ## Installation
 
 ```bash
-pip install typeseg
+pip install typeseg              # CPU: numpy + ONNX Runtime (fast; the default)
 ```
 
-The wheel bundles both models and runs at **arbitrary input length** with only `numpy`. For faster
-inference, install an extra that swaps in the ONNX Runtime backend (identical API and output);
-`typeseg` auto-selects the CUDA provider when a GPU is present:
+The wheel bundles both models and runs them at **arbitrary input length** on the fast ONNX Runtime
+CPU backend out of the box. For CUDA, install the `gpu` extra (identical API and output); `typeseg`
+auto-selects the GPU when one is present:
 
 ```bash
-pip install "typeseg[onnx]"      # faster CPU (onnxruntime)
-pip install "typeseg[gpu]"       # GPU/CUDA (onnxruntime-gpu, auto-selected)
+pip install "typeseg[gpu]"       # GPU/CUDA: onnxruntime-gpu (U-Net) + cupy (Mamba scan)
 ```
 
-> The published package is built from this repository. Until the first PyPI release, install from
-> source (see [Development](#development-research-code)).
+A pure-numpy fallback still ships in the wheel for environments where onnxruntime is unavailable
+(or with `TYPESEG_BACKEND=numpy`).
 
 ## Quick start
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "typeseg"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fine-grained, character-level content-type segmentation for textual inputs (U-Net + Mamba)."
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Security",
 ]
-dependencies = ["numpy>=1.21"]
+dependencies = ["numpy>=1.21", "onnxruntime>=1.17"]
 
 [project.urls]
 Homepage = "https://github.com/s0urc10ud/semantic-text-segmentation"
@@ -28,12 +28,10 @@ typeseg = "typeseg._cli:main"
 segcat = "typeseg._cli:main"
 
 [project.optional-dependencies]
-# Faster, dynamic-length inference. numpy alone already runs both models at
-# arbitrary length on CPU; these only swap in the ONNX Runtime backend.
-onnx = ["onnxruntime>=1.17"]      # CPU acceleration
 # CUDA: onnxruntime-gpu accelerates the U-Net; cupy runs the Mamba selective-scan
 # as a custom CUDA kernel (one thread per channel; the ONNX `Scan` op is
-# launch-bound and slow on GPU).
+# launch-bound and slow on GPU). The base install already ships the fast ONNX CPU
+# backend, so this extra only adds the GPU pieces.
 gpu = ["onnxruntime-gpu>=1.17", "cupy-cuda12x>=13"]
 
 [tool.setuptools]

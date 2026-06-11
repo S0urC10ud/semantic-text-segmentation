@@ -22,8 +22,7 @@ The only runtime dependency is `numpy`.
 </p>
 
 ```bash
-pip install typeseg              # CPU, numpy only
-pip install "typeseg[onnx]"      # + ONNX Runtime (faster CPU)
+pip install typeseg              # CPU: numpy + ONNX Runtime (fast; the default)
 pip install "typeseg[gpu]"       # + CUDA: onnxruntime-gpu (U-Net) and cupy (Mamba scan)
 ```
 
@@ -91,9 +90,12 @@ decision from the whole file down to individual character spans. See the
 
 ### Backends
 
-The only required dependency is `numpy`; both models run at **arbitrary input
-length** on it. The `onnx`/`gpu` extras transparently swap in faster backends — the
-API and output are identical (verified bit-close). Inspect the active backend:
+`pip install typeseg` pulls `numpy` and `onnxruntime`, so both models run on the fast
+ONNX CPU backend at **arbitrary input length** out of the box (≈8× faster for the
+U-Net, ≈1.5× for Mamba vs. the pure-numpy loop). The `gpu` extra transparently swaps
+in CUDA backends — the API and output are identical (verified bit-close). A pure-numpy
+fallback still ships in the box and runs whenever onnxruntime is unavailable or
+`TYPESEG_BACKEND=numpy` is set. Inspect the active backend:
 
 ```python
 import typeseg
