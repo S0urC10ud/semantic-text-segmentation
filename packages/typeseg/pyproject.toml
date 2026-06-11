@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "typeseg"
-version = "0.2.0"
+version = "0.2.1"
 description = "Fine-grained, character-level content-type segmentation for textual inputs (U-Net + Mamba)."
 readme = "README.md"
 license = "Apache-2.0"
@@ -32,7 +32,14 @@ segcat = "typeseg._cli:main"
 # as a custom CUDA kernel (one thread per channel; the ONNX `Scan` op is
 # launch-bound and slow on GPU). The base install already ships the fast ONNX CPU
 # backend, so this extra only adds the GPU pieces.
-gpu = ["onnxruntime-gpu>=1.17", "cupy-cuda12x>=13"]
+#
+# Gated to non-macOS: neither onnxruntime-gpu nor cupy-cuda12x publishes macOS
+# wheels (and Apple has no NVIDIA CUDA), so on a Mac `typeseg[gpu]` resolves to the
+# base package instead of failing with ResolutionImpossible.
+gpu = [
+    "onnxruntime-gpu>=1.17; platform_system != 'Darwin'",
+    "cupy-cuda12x>=13; platform_system != 'Darwin'",
+]
 
 [tool.setuptools]
 packages = ["typeseg"]

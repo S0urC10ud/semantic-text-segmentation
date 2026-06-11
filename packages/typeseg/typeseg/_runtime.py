@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import platform
+import warnings
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +31,36 @@ except ImportError:  # pragma: no cover
     from importlib_resources import files as _files  # type: ignore
 
 DEFAULT_CHUNK = 1536
+
+_warned_no_gpu = False
+
+
+def _maybe_warn_no_gpu() -> None:
+    """On macOS, warn once that GPU backends are unavailable (CPU/ONNX only).
+
+    Wheel installs run no install-time hook, so we cannot print during
+    ``pip install``; this is the first runtime opportunity to tell a Mac user why
+    ``typeseg[gpu]`` resolved to the plain CPU package. Only fires in auto mode —
+    an explicit ``TYPESEG_BACKEND`` (numpy forced, or gpu/cuda fail-fast) is the
+    user's own choice and is left to the backend to honour. Suppressible via the
+    standard ``warnings`` filters or ``TYPESEG_BACKEND=numpy``.
+    """
+    global _warned_no_gpu
+    if _warned_no_gpu or platform.system() != "Darwin":
+        return
+    if ob._mode():  # explicit backend choice — don't second-guess it
+        _warned_no_gpu = True
+        return
+    _warned_no_gpu = True
+    warnings.warn(
+        "typeseg: running on CPU (ONNX). GPU backends are unavailable on macOS — "
+        "neither onnxruntime-gpu nor cupy-cuda12x publishes macOS wheels and Apple "
+        "has no NVIDIA CUDA, so 'typeseg[gpu]' installs the same CPU package. "
+        "This is expected; the CPU ONNX backend is fast. Silence this warning with "
+        "TYPESEG_BACKEND=numpy or Python's warnings filters.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -165,6 +197,7 @@ def _empty(text: str) -> Segmentation:
 def run(model: str, text: str, options: Optional[Options]) -> Segmentation:
     if options is None:
         options = Options()
+    _maybe_warn_no_gpu()
     if not text:
         return _empty(text)
     byte_tokens = text_to_bytes(text)
