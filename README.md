@@ -308,8 +308,8 @@ The repository is organized as follows:
 - `evaluation/` — benchmark datasets, the evaluation harness, and reports.
 - `active_learning/` — the boundary-focused active-learning loop (`infer → acquire → oracle → store`).
 - `viewers/` — small FastAPI / browser frontends, including the fully client-side WebGPU viewer.
-- `packages/typeseg/` — the minimal, inference-only package published to PyPI (numpy + optional
-  ONNX Runtime).
+- `packages/typeseg/` — the minimal, inference-only package published to PyPI (numpy + ONNX Runtime
+  core; CuPy/onnxruntime-gpu via the optional `gpu` extra).
 
 A good reading path is `downloader/main.py` → `train/utils/window_generator.py` → `train/main.py` →
 `evaluation/obtain_eval_dataset.py` → `evaluation/evaluation.py` → `viewers/interactive_viewer.py`.

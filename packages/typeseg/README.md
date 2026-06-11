@@ -10,7 +10,9 @@
 `typeseg` labels every character position of a text with one of 35 content types
 (`html`, `css`, `javascript_typescript`, `python`, `powershell`, `encoding_base64`, …),
 recovering the internal structure of mixed, malformed, or convention-breaking inputs.
-The only runtime dependency is `numpy`.
+Runtime dependencies are just `numpy` and `onnxruntime` — both pulled by `pip install
+typeseg`, so the fast ONNX CPU backend works out of the box at arbitrary input length,
+no GPU required. (A pure-numpy fallback also ships, used when onnxruntime is absent.)
 
 <p align="center">
   <img src="https://typeseg.martin-dallinger.me/images/llm_segmentation.png" alt="Correct model output on a heavily mangled HTML input with a hidden shell payload" width="460">
@@ -130,7 +132,7 @@ honestly.
 
 **Per-model device (auto).** The two models reach the GPU by different routes:
 
-- `fast()` (U-Net) runs on **onnxruntime-gpu** — ~3–4× faster on GPU; ~140k chars/s.
+- `fast()` (U-Net) runs on **onnxruntime-gpu** — ~2× faster than CPU end-to-end; ~140k chars/s.
 - `precise()` (Mamba) runs its selective-scan through a **custom CUDA scan kernel**
   (a CuPy `RawKernel`, `cupy-cuda12x`), reaching ~58k tokens/s for the raw forward —
   edging out the research model's JAX `associative_scan` (54.9k tok/s). The selective-scan
@@ -187,6 +189,7 @@ typeseg.backend_info()
 #  'fast_providers': ['CUDAExecutionProvider', 'CPUExecutionProvider'],
 #  'precise_providers': ['CuPyCUDA:NVIDIA GeForce RTX 5070 Laptop GPU']}
 
+text = "<div>hi</div>\n.btn { color: red; }\nalert('x');"
 typeseg.fast(text)      # U-Net on onnxruntime-gpu  (~140k chars/s)
 typeseg.precise(text)   # Mamba on the CuPy scan    (~58k tokens/s raw forward)
 ```
