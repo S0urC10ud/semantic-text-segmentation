@@ -506,7 +506,47 @@ async function switchModel(modelName){
   }
 }
 
-async function segmentCurrentText(){
+// True when the editor/output panes have collapsed into a single vertical
+// column (narrow viewport: mobile or a half-width desktop window). Detected by
+// geometry rather than a hardcoded breakpoint so it tracks the CSS grid switch
+// automatically: side-by-side => the output starts beside the editor (similar
+// top); stacked => the output starts below the editor's bottom edge.
+function isStackedLayout(){
+  const editor = el('.editor-pane');
+  const output = el('.output-pane');
+  if (!editor || !output){
+    return false;
+  }
+  const ed = editor.getBoundingClientRect();
+  const out = output.getBoundingClientRect();
+  return out.top > ed.bottom - 1;
+}
+
+// In the stacked layout the result sits below the input, off-screen after a
+// run, so bring it into view. No-op in the side-by-side layout (result already
+// visible) and when the output is already near the top of the viewport, to
+// avoid yanking the page unnecessarily. Offsets for the sticky topbar.
+function revealResultIfStacked(){
+  if (!isStackedLayout()){
+    return;
+  }
+  const output = el('.output-pane');
+  if (!output){
+    return;
+  }
+  const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+  const rect = output.getBoundingClientRect();
+  if (rect.top >= 0 && rect.top <= vh * 0.5){
+    return;
+  }
+  const topbar = el('.topbar');
+  const offset = (topbar ? topbar.getBoundingClientRect().height : 0) + 12;
+  const targetY = Math.max(0, window.scrollY + rect.top - offset);
+  const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({ top: targetY, behavior: prefersReduced ? 'auto' : 'smooth' });
+}
+
+async function segmentCurrentText(opts = {}){
   const textarea = el('#inputText');
   enforceSanitizedTextarea(textarea);
   updateByteCounter();
@@ -547,6 +587,11 @@ async function segmentCurrentText(){
     updateResultMeta(payload);
     el('#elapsedBadge').textContent = `${Number(payload.elapsed_ms || 0).toFixed(1)} ms`;
     setStatus(`Segmented successfully with ${payload.runtime}.`, 'success');
+    if (opts.revealResult){
+      // After the DOM has flushed the freshly rendered output (its height
+      // shifts where the output pane sits), reveal it on narrow layouts.
+      requestAnimationFrame(revealResultIfStacked);
+    }
   }catch(err){
     setStatus(`Segmentation failed: ${err.message}`, 'error');
   }finally{
@@ -586,7 +631,7 @@ function bindUi(){
     syncThresholdUi(thresholdInput.value);
   });
 
-  el('#segmentBtn').addEventListener('click', segmentCurrentText);
+  el('#segmentBtn').addEventListener('click', () => segmentCurrentText({ revealResult: true }));
   el('#moreExamplesBtn').addEventListener('click', () => {
     el('#examplesSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
@@ -696,8 +741,13 @@ async function loadExample(ex) {
   const textarea = el('#inputText');
   textarea.value = ex.text;
   updateByteCounter();
-  window.scrollTo({ top: 0, behavior: 'smooth' });
-  await segmentCurrentText();
+  // Side-by-side: jump up to the segmentor so the result lands in view. Stacked:
+  // skip — segmentCurrentText reveals the result pane when it finishes, so we
+  // don't fire two competing smooth scrolls.
+  if (!isStackedLayout()){
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  await segmentCurrentText({ revealResult: true });
 }
 
 async function bootstrap(){
