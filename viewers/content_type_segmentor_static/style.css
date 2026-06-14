@@ -163,14 +163,16 @@ body{
   border-bottom:1px solid var(--border);
 }
 .panel-title{
-  flex:0 0 auto;
+  /* Shrink + wrap to absorb tight widths so the controls keep their single
+     row instead of fragmenting into ragged lines. */
+  flex:0 1 auto;
   min-width:0;
 }
 .panel-title h2{
   margin:0 0 4px;
   font-size:18px;
   color:#0f172a;
-  white-space:nowrap;
+  white-space:normal;
 }
 .status-line{
   margin:0;
@@ -186,7 +188,9 @@ body{
   align-items:center;
   justify-content:flex-end;
   flex-wrap:wrap;
-  flex:1 1 auto;
+  /* Grow to fill (keeps "More examples" pushed left via margin-right:auto), but
+     never shrink below content — the title wraps to make room instead. */
+  flex:1 0 auto;
 }
 /* Keep the examples jump-link on the left, away from the primary actions. */
 #moreExamplesBtn{margin-right:auto}
