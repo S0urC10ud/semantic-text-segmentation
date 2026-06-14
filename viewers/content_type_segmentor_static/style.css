@@ -155,24 +155,23 @@ body{
 }
 
 .segmentor-panel .panel-head{
+  /* Title row stacked above the controls row. Side-by-side never fit within
+     the .shell max-width cap (title + controls overflow it), which produced a
+     cramped middle band; stacking is robust at every width. */
   display:flex;
-  align-items:flex-start;
-  justify-content:space-between;
-  gap:20px;
+  flex-direction:column;
+  gap:16px;
   padding:18px 20px;
   border-bottom:1px solid var(--border);
 }
 .panel-title{
-  /* Shrink + wrap to absorb tight widths so the controls keep their single
-     row instead of fragmenting into ragged lines. */
-  flex:0 1 auto;
   min-width:0;
 }
 .panel-title h2{
   margin:0 0 4px;
   font-size:18px;
   color:#0f172a;
-  white-space:normal;
+  white-space:nowrap;
 }
 .status-line{
   margin:0;
@@ -188,9 +187,7 @@ body{
   align-items:center;
   justify-content:flex-end;
   flex-wrap:wrap;
-  /* Grow to fill (keeps "More examples" pushed left via margin-right:auto), but
-     never shrink below content — the title wraps to make room instead. */
-  flex:1 0 auto;
+  flex:1 1 auto;
 }
 /* Keep the examples jump-link on the left, away from the primary actions. */
 #moreExamplesBtn{margin-right:auto}
