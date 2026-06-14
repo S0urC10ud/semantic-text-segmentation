@@ -648,120 +648,144 @@ body{
   -webkit-mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
 }
 
-/* ── Runtime status toast ── */
-.runtime-toast{
+/* ── Runtime status splash overlay ── */
+.runtime-overlay{
   position:fixed;
-  right:20px;
-  bottom:20px;
-  z-index:1200;
+  inset:0;
+  z-index:2000;
   display:flex;
   align-items:center;
-  gap:10px;
-  padding:11px 17px 11px 13px;
-  border-radius:999px;
-  background:rgba(255,255,255,.78);
-  backdrop-filter:blur(14px) saturate(160%);
-  -webkit-backdrop-filter:blur(14px) saturate(160%);
-  border:1px solid var(--border);
-  box-shadow:
-    0 12px 34px rgba(15,23,42,.18),
-    0 2px 8px rgba(15,23,42,.06),
-    inset 0 1px 0 rgba(255,255,255,.6);
-  font-family:var(--sans);
-  font-size:13px;
-  font-weight:650;
-  letter-spacing:.1px;
-  color:var(--text);
+  justify-content:center;
+  padding:24px;
+  background:
+    radial-gradient(900px 600px at 50% 38%, rgba(234,242,255,.55), transparent 70%),
+    rgba(247,249,252,.66);
+  backdrop-filter:blur(12px) saturate(140%);
+  -webkit-backdrop-filter:blur(12px) saturate(140%);
   /* hidden resting state — JS toggles .is-visible */
   opacity:0;
-  transform:translateY(16px) scale(.96);
   pointer-events:none;
-  transition:
-    opacity .5s cubic-bezier(.22,1,.36,1),
-    transform .5s cubic-bezier(.22,1,.36,1),
-    border-color .4s ease,
-    box-shadow .4s ease;
-  will-change:opacity, transform;
+  transition:opacity .55s cubic-bezier(.22,1,.36,1), visibility .55s;
+  visibility:hidden;
 }
-.runtime-toast.is-visible{
+.runtime-overlay.is-visible{
   opacity:1;
-  transform:translateY(0) scale(1);
-}
-.runtime-toast[data-state="success"]{
-  border-color:rgba(46,204,113,.42);
-  box-shadow:
-    0 12px 34px rgba(11,122,62,.18),
-    0 2px 8px rgba(15,23,42,.06),
-    inset 0 1px 0 rgba(255,255,255,.6);
-}
-.runtime-toast[data-state="error"]{
-  border-color:rgba(231,76,60,.46);
-  box-shadow:
-    0 12px 34px rgba(180,35,24,.18),
-    0 2px 8px rgba(15,23,42,.06),
-    inset 0 1px 0 rgba(255,255,255,.6);
+  pointer-events:auto;
+  visibility:visible;
 }
 
-.runtime-toast-icon{
+.runtime-overlay-card{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:16px;
+  padding:40px 52px 36px;
+  border-radius:24px;
+  background:rgba(255,255,255,.84);
+  backdrop-filter:blur(22px) saturate(160%);
+  -webkit-backdrop-filter:blur(22px) saturate(160%);
+  border:1px solid var(--border);
+  box-shadow:
+    0 36px 90px rgba(15,23,42,.24),
+    0 6px 18px rgba(15,23,42,.08),
+    inset 0 1px 0 rgba(255,255,255,.75);
+  text-align:center;
+  transform:translateY(14px) scale(.96);
+  transition:transform .55s cubic-bezier(.22,1,.36,1), border-color .4s ease;
+  will-change:transform;
+}
+.runtime-overlay.is-visible .runtime-overlay-card{
+  transform:translateY(0) scale(1);
+}
+.runtime-overlay[data-state="error"] .runtime-overlay-card{
+  border-color:rgba(231,76,60,.45);
+}
+
+.runtime-overlay-brand{
+  font-size:26px;
+  font-weight:800;
+  letter-spacing:.3px;
+  line-height:1;
+}
+.runtime-overlay-brand .brand-type{color:var(--accent)}
+.runtime-overlay-brand .brand-seg{color:var(--accent-2)}
+
+.runtime-overlay-icon{
   position:relative;
-  width:18px;
-  height:18px;
-  flex:0 0 auto;
+  width:56px;
+  height:56px;
   display:inline-flex;
   align-items:center;
   justify-content:center;
+  margin:4px 0 2px;
 }
 /* Show only the glyph for the current state. */
-.runtime-toast .rt-spinner,
-.runtime-toast .rt-check,
-.runtime-toast .rt-cross{display:none}
-.runtime-toast[data-state="loading"] .rt-spinner{display:block}
-.runtime-toast[data-state="success"] .rt-check{display:block}
-.runtime-toast[data-state="error"] .rt-cross{display:block}
+.runtime-overlay .rt-spinner,
+.runtime-overlay .rt-check,
+.runtime-overlay .rt-cross{display:none}
+.runtime-overlay[data-state="loading"] .rt-spinner{display:block}
+.runtime-overlay[data-state="success"] .rt-check{display:block}
+.runtime-overlay[data-state="error"] .rt-cross{display:block}
 
 /* Gradient-arc ring spinner (masked donut). */
 .rt-spinner{
-  width:17px;
-  height:17px;
+  width:52px;
+  height:52px;
   border-radius:50%;
-  background:conic-gradient(from 90deg, transparent 8%, var(--accent-2) 55%, var(--accent) 100%);
-  -webkit-mask:radial-gradient(farthest-side, #0000 calc(100% - 3px), #000 calc(100% - 2.5px));
-  mask:radial-gradient(farthest-side, #0000 calc(100% - 3px), #000 calc(100% - 2.5px));
-  animation:rtSpin .75s linear infinite;
+  background:conic-gradient(from 90deg, transparent 6%, var(--accent-2) 55%, var(--accent) 100%);
+  -webkit-mask:radial-gradient(farthest-side, #0000 calc(100% - 6px), #000 calc(100% - 5.5px));
+  mask:radial-gradient(farthest-side, #0000 calc(100% - 6px), #000 calc(100% - 5.5px));
+  animation:rtSpin .85s linear infinite;
 }
 @keyframes rtSpin{to{transform:rotate(360deg)}}
 
 /* Check / cross stroke-draw on state entry. */
+.rt-check, .rt-cross{ width:40px; height:40px; }
 .rt-check path{
   stroke:#0b7a3e;
-  stroke-width:2.6;
+  stroke-width:2.4;
   stroke-linecap:round;
   stroke-linejoin:round;
   stroke-dasharray:24;
   stroke-dashoffset:24;
 }
-.runtime-toast[data-state="success"] .rt-check path{
-  animation:rtDraw .42s .04s cubic-bezier(.65,0,.35,1) forwards;
+.runtime-overlay[data-state="success"] .rt-check path{
+  animation:rtDraw .45s .05s cubic-bezier(.65,0,.35,1) forwards;
 }
 .rt-cross path{
   stroke:#b42318;
-  stroke-width:2.6;
+  stroke-width:2.4;
   stroke-linecap:round;
   stroke-dasharray:32;
   stroke-dashoffset:32;
 }
-.runtime-toast[data-state="error"] .rt-cross path{
-  animation:rtDraw .3s ease forwards;
+.runtime-overlay[data-state="error"] .rt-cross path{
+  animation:rtDraw .32s ease forwards;
 }
 @keyframes rtDraw{to{stroke-dashoffset:0}}
 
-@media (max-width: 520px){
-  .runtime-toast{ left:16px; right:16px; bottom:16px; justify-content:center; }
+.runtime-overlay-title{
+  font-size:18px;
+  font-weight:700;
+  color:var(--text);
 }
+.runtime-overlay[data-state="error"] .runtime-overlay-title{
+  color:#b42318;
+}
+.runtime-overlay-sub{
+  font-size:13px;
+  color:var(--subtle);
+  margin-top:-6px;
+}
+.runtime-overlay[data-state="error"] .runtime-overlay-sub{
+  color:var(--subtle);
+}
+
 @media (prefers-reduced-motion: reduce){
-  .runtime-toast{ transition:opacity .2s ease; transform:none; }
-  .runtime-toast.is-visible{ transform:none; }
-  .rt-spinner{ animation-duration:1.4s; }
+  .runtime-overlay{ transition:opacity .2s ease, visibility .2s; }
+  .runtime-overlay-card{ transform:none; transition:none; }
+  .runtime-overlay.is-visible .runtime-overlay-card{ transform:none; }
+  .rt-spinner{ animation-duration:1.5s; }
   .rt-check path,
   .rt-cross path{ animation:none; stroke-dashoffset:0; }
 }

