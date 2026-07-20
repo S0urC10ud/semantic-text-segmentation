@@ -17,11 +17,13 @@ if str(TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAIN_ROOT))
 
 import utils.config as cfg
+from utils.full_sequence import build_monitor_file_sequence
 from active_learning.label_store import LabelStore, StoredRefinement
 from train.utils.epoch_batcher import (
     MonitorFineTuneBatcher,
     _apply_monitor_removal_span,
     _build_augmented_fragment_datasets,
+    _crop_monitor_window,
 )
 from train.utils.monitor_eval import FILE_DTYPE, SEG_DTYPE
 
@@ -76,6 +78,24 @@ def _monitor_data_two_files() -> dict:
 
 
 class TestMonitorFineTuneAugmentation(unittest.TestCase):
+    def test_boundary_centered_crop_keeps_context_on_both_sides(self) -> None:
+        py_id = int(cfg.LANG2ID["python"])
+        sql_id = int(cfg.LANG2ID["sql"])
+        file_bytes = np.arange(100, dtype=np.uint8)
+        x, y = _crop_monitor_window(
+            np.random.default_rng(7),
+            20,
+            file_bytes,
+            [(0, 50, py_id), (50, 100, sql_id)],
+            boundary_sample_prob=1.0,
+            boundary_margin=5,
+        )
+        transitions = np.flatnonzero(y[1:] != y[:-1]) + 1
+        self.assertEqual(transitions.size, 1)
+        self.assertGreaterEqual(int(transitions[0]), 5)
+        self.assertLessEqual(int(transitions[0]), 15)
+        self.assertFalse(np.any(x == cfg.PAD_BYTE_ID))
+
     def test_apply_monitor_removal_span_line_keeps_following_labels_aligned(self) -> None:
         py_id = int(cfg.LANG2ID["python"])
         sql_id = int(cfg.LANG2ID["sql"])
@@ -253,6 +273,103 @@ class TestMonitorFineTuneAugmentation(unittest.TestCase):
             y[:6],
             np.array([py_id, py_id, sql_id, sql_id, sql_id, sql_id], dtype=np.uint8),
         )
+
+    def test_build_full_sequence_can_center_crop_on_transition(self) -> None:
+        py_id = int(cfg.LANG2ID["python"])
+        sql_id = int(cfg.LANG2ID["sql"])
+        files = np.array([(0, 100, 0, 2, 0, py_id)], dtype=FILE_DTYPE)
+        segments = np.array(
+            [(0, 0, 50, py_id), (0, 50, 100, sql_id)],
+            dtype=SEG_DTYPE,
+        )
+        contents = np.arange(100, dtype=np.uint8)
+
+        _x, y = MonitorFineTuneBatcher._build_full_sequence(
+            np.random.default_rng(7),
+            20,
+            files,
+            contents,
+            segments,
+            len(files),
+            boundary_sample_prob=1.0,
+            boundary_margin=5,
+        )
+
+        transitions = np.flatnonzero(y[1:] != y[:-1]) + 1
+        self.assertEqual(transitions.size, 1)
+        self.assertGreaterEqual(int(transitions[0]), 5)
+        self.assertLessEqual(int(transitions[0]), 15)
+
+    def test_build_full_sequence_can_require_a_transition_file(self) -> None:
+        py_id = int(cfg.LANG2ID["python"])
+        sql_id = int(cfg.LANG2ID["sql"])
+        files = np.array(
+            [(0, 40, 0, 1, 0, py_id), (40, 40, 1, 2, 0, py_id)],
+            dtype=FILE_DTYPE,
+        )
+        segments = np.array(
+            [(0, 0, 40, py_id), (1, 0, 20, py_id), (1, 20, 40, sql_id)],
+            dtype=SEG_DTYPE,
+        )
+        contents = np.arange(80, dtype=np.uint8)
+
+        _x, y = MonitorFineTuneBatcher._build_full_sequence(
+            np.random.default_rng(3),
+            20,
+            files,
+            contents,
+            segments,
+            len(files),
+            preferred_file_indices=np.array([0, 1], dtype=np.int64),
+            preferred_prob=1.0,
+            boundary_sample_prob=1.0,
+            boundary_margin=5,
+            require_transition=True,
+        )
+
+        self.assertEqual(int(np.count_nonzero(y[1:] != y[:-1])), 1)
+
+    def test_full_sequence_pair_balancing_selects_a_distinct_pair_first(self) -> None:
+        py_id = int(cfg.LANG2ID["python"])
+        sql_id = int(cfg.LANG2ID["sql"])
+        css_id = int(cfg.LANG2ID["css"])
+        files = np.array([(0, 100, 0, 3, 0, py_id)], dtype=FILE_DTYPE)
+        segments = np.array(
+            [(0, 0, 20, py_id), (0, 20, 80, sql_id), (0, 80, 100, css_id)],
+            dtype=SEG_DTYPE,
+        )
+        pairs = sorted(((py_id, sql_id), (sql_id, css_id)))
+        target_pair_index = pairs.index((sql_id, css_id))
+
+        class FixedRng:
+            def __init__(self):
+                self.calls = 0
+
+            def random(self):
+                return 0.0
+
+            def integers(self, low, high=None):
+                values = (target_pair_index, 0, low)
+                value = values[min(self.calls, len(values) - 1)]
+                self.calls += 1
+                return value
+
+        _x, y, _meta = build_monitor_file_sequence(
+            files,
+            np.arange(100, dtype=np.uint8),
+            segments,
+            0,
+            target_len=20,
+            pad_byte_id=int(cfg.PAD_BYTE_ID),
+            pad_label_id=int(cfg.PAD_ID),
+            rng=FixedRng(),
+            random_crop=True,
+            boundary_sample_prob=1.0,
+            boundary_margin=5,
+            boundary_pair_balanced=True,
+        )
+
+        self.assertIn(css_id, set(map(int, y.tolist())))
 
     def test_build_augmented_window_mixed_keeps_labels_aligned(self) -> None:
         data_cfg = cfg.DataConfig(window_min_bytes=12, window_max_bytes=12, min_seg_len=2)

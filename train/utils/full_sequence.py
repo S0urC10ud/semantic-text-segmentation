@@ -150,6 +150,9 @@ def build_monitor_file_sequence(
     pad_label_id: int,
     rng: Optional[np.random.Generator] = None,
     random_crop: bool = False,
+    boundary_sample_prob: float = 0.0,
+    boundary_margin: int = 64,
+    boundary_pair_balanced: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     row = files[int(file_idx)]
     byte_len = int(row["byte_len"])
@@ -159,9 +162,41 @@ def build_monitor_file_sequence(
     if byte_len <= 0:
         return out_x, out_y, {"file_idx": int(file_idx), "byte_len": 0, "crop_start": 0}
 
+    seg_slice = segments[int(row["seg_start"]) : int(row["seg_start"]) + int(row["seg_count"])]
     crop_start = 0
     if byte_len > target and random_crop and rng is not None:
-        crop_start = int(rng.integers(0, byte_len - target + 1))
+        crop_start = None
+        probability = float(max(0.0, min(1.0, boundary_sample_prob)))
+        if probability > 0.0 and float(rng.random()) < probability:
+            boundary_records = [
+                (int(left["end"]), int(left["label"]), int(right["label"]))
+                for left, right in zip(seg_slice, seg_slice[1:])
+                if int(left["label"]) != int(right["label"])
+                and int(left["end"]) == int(right["start"])
+                and 0 < int(left["end"]) < byte_len
+            ]
+            if boundary_records:
+                if boundary_pair_balanced:
+                    by_pair: Dict[tuple[int, int], List[int]] = {}
+                    for position, left_label, right_label in boundary_records:
+                        by_pair.setdefault((left_label, right_label), []).append(position)
+                    pairs = sorted(by_pair)
+                    pair = pairs[int(rng.integers(0, len(pairs)))]
+                    positions = by_pair[pair]
+                    boundary = positions[int(rng.integers(0, len(positions)))]
+                else:
+                    boundary = boundary_records[
+                        int(rng.integers(0, len(boundary_records)))
+                    ][0]
+                margin = min(max(0, int(boundary_margin)), max(0, target // 2))
+                low = max(0, boundary - target + margin)
+                high = min(byte_len - target, boundary - margin)
+                if low <= high:
+                    crop_start = int(rng.integers(low, high + 1))
+                else:
+                    crop_start = max(0, min(byte_len - target, boundary - target // 2))
+        if crop_start is None:
+            crop_start = int(rng.integers(0, byte_len - target + 1))
     crop_end = min(byte_len, crop_start + target)
     take = max(0, crop_end - crop_start)
 
@@ -172,7 +207,6 @@ def build_monitor_file_sequence(
     if take > 0:
         out_x[:take] = file_bytes[crop_start:crop_end].astype(np.int32, copy=False)
 
-    seg_slice = segments[int(row["seg_start"]) : int(row["seg_start"]) + int(row["seg_count"])]
     for seg in seg_slice:
         seg_start = int(seg["start"])
         seg_end = int(seg["end"])

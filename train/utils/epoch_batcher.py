@@ -236,6 +236,9 @@ def _crop_monitor_window(
     window_len: int,
     file_bytes: np.ndarray,
     file_segments: List[MonitorSegment],
+    *,
+    boundary_sample_prob: float = 0.0,
+    boundary_margin: int = 64,
 ):
     byte_len = int(file_bytes.size)
     if byte_len <= 0:
@@ -243,7 +246,27 @@ def _crop_monitor_window(
 
     start = 0
     if byte_len > window_len:
-        start = int(rng.integers(0, byte_len - window_len + 1))
+        start = None
+        probability = float(max(0.0, min(1.0, boundary_sample_prob)))
+        if probability > 0.0 and file_segments and float(rng.random()) < probability:
+            boundaries = [
+                int(left[1])
+                for left, right in zip(file_segments, file_segments[1:])
+                if int(left[2]) != int(right[2])
+                and int(left[1]) == int(right[0])
+                and 0 < int(left[1]) < byte_len
+            ]
+            if boundaries:
+                boundary = boundaries[int(rng.integers(0, len(boundaries)))]
+                margin = min(max(0, int(boundary_margin)), max(0, window_len // 2))
+                low = max(0, boundary - window_len + margin)
+                high = min(byte_len - window_len, boundary - margin)
+                if low <= high:
+                    start = int(rng.integers(low, high + 1))
+                else:
+                    start = max(0, min(byte_len - window_len, boundary - window_len // 2))
+        if start is None:
+            start = int(rng.integers(0, byte_len - window_len + 1))
     end = start + min(window_len, byte_len)
 
     x = np.full(window_len, cfg.PAD_BYTE_ID, dtype=np.int32)
@@ -764,6 +787,8 @@ class MonitorFineTuneBatcher:
         allow_substring_removal: bool = False,
         preferred_file_indices: Optional[np.ndarray] = None,
         preferred_prob: float = 0.0,
+        boundary_sample_prob: float = 0.0,
+        boundary_margin: int = 64,
     ):
         max_attempts = 32
         for _ in range(max_attempts):
@@ -798,6 +823,8 @@ class MonitorFineTuneBatcher:
                 window_len,
                 file_bytes,
                 file_segments,
+                boundary_sample_prob=boundary_sample_prob,
+                boundary_margin=boundary_margin,
             )
             if window is None:
                 continue
@@ -831,6 +858,12 @@ class MonitorFineTuneBatcher:
                 allow_substring_removal=True,
                 preferred_file_indices=preferred_file_indices,
                 preferred_prob=preferred_prob,
+                boundary_sample_prob=float(
+                    getattr(data_cfg, "fine_tune_boundary_sample_prob", 0.0)
+                ),
+                boundary_margin=int(
+                    getattr(data_cfg, "fine_tune_boundary_margin", 64)
+                ),
             )
         if not fragment_dsets:
             return MonitorFineTuneBatcher._build_window(
@@ -843,6 +876,12 @@ class MonitorFineTuneBatcher:
                 allow_substring_removal=True,
                 preferred_file_indices=preferred_file_indices,
                 preferred_prob=preferred_prob,
+                boundary_sample_prob=float(
+                    getattr(data_cfg, "fine_tune_boundary_sample_prob", 0.0)
+                ),
+                boundary_margin=int(
+                    getattr(data_cfg, "fine_tune_boundary_margin", 64)
+                ),
             )
 
         seed = int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
@@ -883,15 +922,37 @@ class MonitorFineTuneBatcher:
         *,
         preferred_file_indices: Optional[np.ndarray] = None,
         preferred_prob: float = 0.0,
+        boundary_sample_prob: float = 0.0,
+        boundary_margin: int = 64,
+        require_transition: bool = False,
+        pair_balanced: bool = False,
     ):
         if total_files <= 0:
             return None
-        file_idx = _sample_monitor_file_index(
-            rng,
-            total_files,
-            preferred_file_indices=preferred_file_indices,
-            preferred_prob=preferred_prob,
+        boundary_requested = bool(
+            require_transition
+            and float(boundary_sample_prob) > 0.0
+            and float(rng.random()) < float(boundary_sample_prob)
         )
+        file_idx = 0
+        for _ in range(16 if boundary_requested else 1):
+            file_idx = _sample_monitor_file_index(
+                rng,
+                total_files,
+                preferred_file_indices=preferred_file_indices,
+                preferred_prob=preferred_prob,
+            )
+            if not boundary_requested:
+                break
+            row = files[int(file_idx)]
+            file_segments = _monitor_file_segments(
+                row, segments, int(row["byte_len"])
+            )
+            if any(
+                left[2] != right[2]
+                for left, right in zip(file_segments, file_segments[1:])
+            ):
+                break
         x, y, _ = build_monitor_file_sequence(
             files,
             contents,
@@ -902,6 +963,11 @@ class MonitorFineTuneBatcher:
             pad_label_id=int(cfg.PAD_ID),
             rng=rng,
             random_crop=True,
+            boundary_sample_prob=1.0 if boundary_requested else (
+                0.0 if require_transition else boundary_sample_prob
+            ),
+            boundary_margin=boundary_margin,
+            boundary_pair_balanced=pair_balanced,
         )
         return x, y
 
@@ -937,6 +1003,22 @@ class MonitorFineTuneBatcher:
                     total_files,
                     preferred_file_indices=preferred_file_indices,
                     preferred_prob=preferred_prob,
+                    boundary_sample_prob=float(
+                        getattr(data_cfg, "fine_tune_boundary_sample_prob", 0.0)
+                    ),
+                    boundary_margin=int(
+                        getattr(data_cfg, "fine_tune_boundary_margin", 64)
+                    ),
+                    require_transition=bool(
+                        getattr(
+                            data_cfg,
+                            "fine_tune_boundary_require_transition",
+                            False,
+                        )
+                    ),
+                    pair_balanced=bool(
+                        getattr(data_cfg, "fine_tune_boundary_pair_balanced", False)
+                    ),
                 )
             else:
                 piece = MonitorFineTuneBatcher._build_augmented_window(
@@ -1015,6 +1097,26 @@ class MonitorFineTuneBatcher:
             matches = np.flatnonzero(files["type_id"] == int(dense_bias_type_id))
             if int(matches.size) > 0:
                 preferred_file_indices = matches.astype(np.int64, copy=False)
+
+        if bool(getattr(cfg_obj, "fine_tune_carrier_balanced", False)):
+            carrier_by_file = list((monitor_data.get("meta") or {}).get("carrierByFile") or [])
+            if len(carrier_by_file) != int(total_files):
+                raise RuntimeError(
+                    "Carrier-balanced fine-tuning requires meta.json carrierByFile "
+                    f"for all {total_files} files; found {len(carrier_by_file)} entries."
+                )
+            groups: Dict[str, List[int]] = {}
+            for file_index, carrier in enumerate(carrier_by_file):
+                groups.setdefault(str(carrier), []).append(int(file_index))
+            target = max(len(indices) for indices in groups.values())
+            balanced: List[int] = []
+            for carrier in sorted(groups):
+                indices = groups[carrier]
+                repeats, remainder = divmod(target, len(indices))
+                balanced.extend(indices * repeats)
+                balanced.extend(indices[:remainder])
+            preferred_file_indices = np.asarray(balanced, dtype=np.int64)
+            bias_prob = 1.0
 
         full_files = bool(full_files)
         target_sequence_len = max(1, int(full_file_max_bytes)) if full_files else int(cfg_obj.window_max_bytes)
@@ -1103,6 +1205,22 @@ class MonitorFineTuneBatcher:
                         total_files,
                         preferred_file_indices=preferred_file_indices,
                         preferred_prob=bias_prob,
+                        boundary_sample_prob=float(
+                            getattr(cfg_obj, "fine_tune_boundary_sample_prob", 0.0)
+                        ),
+                        boundary_margin=int(
+                            getattr(cfg_obj, "fine_tune_boundary_margin", 64)
+                        ),
+                        require_transition=bool(
+                            getattr(
+                                cfg_obj,
+                                "fine_tune_boundary_require_transition",
+                                False,
+                            )
+                        ),
+                        pair_balanced=bool(
+                            getattr(cfg_obj, "fine_tune_boundary_pair_balanced", False)
+                        ),
                     )
                 elif augment:
                     window = MonitorFineTuneBatcher._build_augmented_window(
@@ -1127,6 +1245,12 @@ class MonitorFineTuneBatcher:
                         total_files,
                         preferred_file_indices=preferred_file_indices,
                         preferred_prob=bias_prob,
+                        boundary_sample_prob=float(
+                            getattr(cfg_obj, "fine_tune_boundary_sample_prob", 0.0)
+                        ),
+                        boundary_margin=int(
+                            getattr(cfg_obj, "fine_tune_boundary_margin", 64)
+                        ),
                     )
                 if window is None:
                     # If we repeatedly fail to build a window, just break and

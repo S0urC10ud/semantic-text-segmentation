@@ -337,6 +337,7 @@ def build_model(train_cfg: "TrainConfig", num_classes: int) -> nn.Module:
             channels=train_cfg.channels,
             dropout_rate=train_cfg.dropout_rate,
             dtype=train_cfg.dtype,
+            num_token_embeddings=int(getattr(train_cfg, "num_token_embeddings", cfg.NUM_TOKEN_EMBEDDINGS)),
         )
     if arch in {"mamba", "mamba1d", "bimamba", "ssm"}:
         return Mamba1D(
@@ -350,6 +351,7 @@ def build_model(train_cfg: "TrainConfig", num_classes: int) -> nn.Module:
             bidirectional=getattr(train_cfg, "mamba_bidirectional", True),
             dropout_rate=train_cfg.dropout_rate,
             dtype=train_cfg.dtype,
+            num_token_embeddings=int(getattr(train_cfg, "num_token_embeddings", cfg.NUM_TOKEN_EMBEDDINGS)),
         )
     raise ValueError(f"Unknown arch '{arch}'. Expected 'unet1d' or 'mamba'.")
 
@@ -601,8 +603,25 @@ def cross_entropy_masked(
     loss = optax.softmax_cross_entropy_with_integer_labels(
         logits, safe_labels.astype(jnp.int32)
     )
-    loss = loss * mask.astype(loss.dtype)
-    denom = jnp.maximum(1, jnp.sum(mask))
+    weights = mask.astype(loss.dtype)
+    boundary_extra = float(max(0.0, getattr(cfg, "BOUNDARY_LOSS_WEIGHT", 0.0)))
+    boundary_radius = int(max(0, getattr(cfg, "BOUNDARY_LOSS_RADIUS", 0)))
+    if boundary_extra > 0.0 and boundary_radius >= 0 and labels.ndim >= 2:
+        transition = jnp.zeros_like(mask, dtype=jnp.bool_)
+        adjacent_valid = jnp.logical_and(mask[:, 1:], mask[:, :-1])
+        changed = jnp.logical_and(labels[:, 1:] != labels[:, :-1], adjacent_valid)
+        transition = transition.at[:, 1:].set(changed)
+        vicinity = jnp.zeros_like(transition, dtype=jnp.bool_)
+        for offset in range(-boundary_radius, boundary_radius + 1):
+            vicinity = jnp.logical_or(
+                vicinity,
+                _shift_sequence(transition, offset, False),
+            )
+        weights = weights * (
+            1.0 + jnp.asarray(boundary_extra, dtype=loss.dtype) * vicinity.astype(loss.dtype)
+        )
+    loss = loss * weights
+    denom = jnp.maximum(1.0, jnp.sum(weights))
     return jnp.sum(loss) / denom
 
 

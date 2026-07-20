@@ -91,6 +91,11 @@ IGNORED_TRAINING_TOKEN_IDS: Tuple[int, ...] = tuple(
 AUX_NEIGHBOR_OFFSETS: Tuple[int, ...] = (-2, -1, 1, 2)
 AUX_NEIGHBOR_LOSS_WEIGHT: float = 1.0
 
+# Optional domain-adaptation emphasis around true class transitions. A value of
+# zero preserves the released training objective exactly.
+BOUNDARY_LOSS_WEIGHT: float = 0.0
+BOUNDARY_LOSS_RADIUS: int = 4
+
 @dataclass
 class DataConfig:
     """Configuration for data loading, augmentation, and batching."""
@@ -141,6 +146,13 @@ class DataConfig:
     # Encoded/hex content augmentation
     hex_spacing_aug_prob: float = 0.1
 
+    # Malware/domain fine-tuning crop controls. Kept generic so the sampler
+    # can emphasize true labeled transitions without carrier-specific rules.
+    fine_tune_boundary_sample_prob: float = 0.0
+    fine_tune_boundary_margin: int = 64
+    fine_tune_boundary_require_transition: bool = False
+    fine_tune_boundary_pair_balanced: bool = False
+
     def buckets(self) -> List[int]:
         """Generate window size buckets from min to max."""
         if self.window_min_bytes == self.window_max_bytes:
@@ -161,6 +173,9 @@ class TrainConfig:
     model_dim: int = 128
     channels: Tuple[int, ...] = (128, 256, 384, 512)
     dropout_rate: float = 0.1
+    num_token_embeddings: int = NUM_TOKEN_EMBEDDINGS
+    boundary_loss_weight: float = 0.0
+    boundary_loss_radius: int = 4
     # Mamba-specific hyperparameters (only used when arch == 'mamba')
     mamba_layers: int = 6
     mamba_d_state: int = 8

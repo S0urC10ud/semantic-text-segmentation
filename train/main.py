@@ -110,6 +110,21 @@ def _signal_handler(sig, frame):
     print(f"Signal {sig} received; stopping...", flush=True)
 
 
+def _checkpoint_embedding_rows(path_value: str) -> int:
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    if not path.is_file() or path.suffix != ".msgpack":
+        return int(cfg.NUM_TOKEN_EMBEDDINGS)
+    try:
+        restored = serialization.msgpack_restore(path.read_bytes())
+        params = checkpoint_params_subtree(restored)
+        return int(np.asarray(params["Embed_0"]["embedding"]).shape[0])
+    except Exception as exc:
+        print(f"Checkpoint vocabulary inference failed for {path}: {exc}", flush=True)
+        return int(cfg.NUM_TOKEN_EMBEDDINGS)
+
+
 # register early, before long inits
 if mp.current_process().name == "MainProcess":
     signal.signal(signal.SIGINT, _signal_handler)
@@ -496,6 +511,12 @@ def main():
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--channels", type=str, default="32,64,64,128,128,128,128,256")
     parser.add_argument("--dropout_rate", type=float, default=0.15)
+    parser.add_argument(
+        "--compute_dtype",
+        choices=("bfloat16", "float32"),
+        default="bfloat16",
+        help="Model compute dtype; float32 is a compatibility fallback for long Mamba training on some GPUs.",
+    )
     # Mamba-only knobs (ignored for unet1d). Defaults match TrainConfig.
     parser.add_argument("--mamba_layers", type=int, default=6)
     parser.add_argument("--mamba_d_state", type=int, default=8)
@@ -695,6 +716,63 @@ def main():
             "When enabled, augmentation fragments are drawn from monitor segments and, if available, "
             "the active-learning SQLite store."
         ),
+    )
+    parser.add_argument(
+        "--fine_tune_carrier_balanced",
+        action="store_true",
+        default=False,
+        help=(
+            "Sample carrier families uniformly when the fine-tune memmap provides "
+            "a carrierByFile entry in meta.json."
+        ),
+    )
+    parser.add_argument(
+        "--fine_tune_boundary_sample_prob",
+        type=float,
+        default=0.0,
+        help="Probability that a U-Net fine-tune window is centered around a labeled transition.",
+    )
+    parser.add_argument(
+        "--fine_tune_boundary_margin",
+        type=int,
+        default=64,
+        help="Minimum preferred context on each side of a sampled transition.",
+    )
+    parser.add_argument(
+        "--fine_tune_boundary_require_transition",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When boundary sampling is selected, retry file selection until a "
+            "file with a genuine labeled transition is found."
+        ),
+    )
+    parser.add_argument(
+        "--fine_tune_boundary_pair_balanced",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Choose a distinct adjacent label pair before choosing one of its "
+            "boundary occurrences, preventing repeated pairs from dominating."
+        ),
+    )
+    parser.add_argument(
+        "--boundary_loss_weight",
+        type=float,
+        default=0.0,
+        help="Additional cross-entropy weight within --boundary_loss_radius of a true transition.",
+    )
+    parser.add_argument(
+        "--boundary_loss_radius",
+        type=int,
+        default=4,
+        help="Radius in model byte tokens for optional boundary-weighted loss.",
+    )
+    parser.add_argument(
+        "--aux_neighbor_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for auxiliary neighboring-label heads; set to zero for legacy checkpoints.",
     )
     parser.add_argument(
         "--fine_tune_dense_bias_label",
@@ -916,6 +994,20 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
+    d_cfg.fine_tune_carrier_balanced = bool(args.fine_tune_carrier_balanced)
+    d_cfg.fine_tune_boundary_sample_prob = float(
+        max(0.0, min(1.0, args.fine_tune_boundary_sample_prob))
+    )
+    d_cfg.fine_tune_boundary_margin = max(0, int(args.fine_tune_boundary_margin))
+    d_cfg.fine_tune_boundary_require_transition = bool(
+        args.fine_tune_boundary_require_transition
+    )
+    d_cfg.fine_tune_boundary_pair_balanced = bool(
+        args.fine_tune_boundary_pair_balanced
+    )
+    cfg.BOUNDARY_LOSS_WEIGHT = float(max(0.0, args.boundary_loss_weight))
+    cfg.BOUNDARY_LOSS_RADIUS = max(0, int(args.boundary_loss_radius))
+    cfg.AUX_NEIGHBOR_LOSS_WEIGHT = float(max(0.0, args.aux_neighbor_loss_weight))
     # Override mode probabilities when provided via CLI (for ablation studies).
     if args.pure_prob is not None:
         d_cfg.pure_prob = max(0.0, float(args.pure_prob))
@@ -950,6 +1042,16 @@ def main():
     if args.fine_tune:
         args.monitor_eval_root = args.fine_tune_val_root
 
+    checkpoint_vocab_size = (
+        _checkpoint_embedding_rows(args.fine_tune_ckpt_path)
+        if args.fine_tune and args.fine_tune_ckpt_path
+        else int(cfg.NUM_TOKEN_EMBEDDINGS)
+    )
+    if checkpoint_vocab_size != int(cfg.NUM_TOKEN_EMBEDDINGS):
+        print(
+            f"Fine-tune checkpoint uses compact token vocabulary: {checkpoint_vocab_size} rows.",
+            flush=True,
+        )
     t_cfg = cfg.TrainConfig(
         steps=args.steps,
         schedule_steps=args.schedule_steps,
@@ -961,6 +1063,10 @@ def main():
         model_dim=args.model_dim,
         channels=tuple(map(int, args.channels.split(","))),
         dropout_rate=args.dropout_rate,
+        dtype=jnp.float32 if args.compute_dtype == "float32" else jnp.bfloat16,
+        num_token_embeddings=checkpoint_vocab_size,
+        boundary_loss_weight=float(cfg.BOUNDARY_LOSS_WEIGHT),
+        boundary_loss_radius=int(cfg.BOUNDARY_LOSS_RADIUS),
         mamba_layers=int(args.mamba_layers),
         mamba_d_state=int(args.mamba_d_state),
         mamba_expand=int(args.mamba_expand),
@@ -997,15 +1103,21 @@ def main():
     t_cfg.full_files = bool(args.full_files)
     t_cfg.full_file_max_bytes = int(args.full_file_max_bytes)
 
-    # Prepare datasets
-    print("Preparing datasets...", flush=True)
-    dsets = prepare_dsets_by_lang_with_splits(
-        d_cfg.data_root,
-        use_train_windows=not args.dont_use_train_windows,
-        include_languages=selected_langs,
-        verbose=False,
-    )
-    train_dsets = dsets["train"]
+    # Dedicated monitor fine-tuning is self-contained and does not require the
+    # original Arrow corpus to be available on the adaptation machine.
+    if t_cfg.fine_tune:
+        print("Fine-tune mode: skipping unrelated base Arrow datasets.", flush=True)
+        dsets = {"train": {}, "val": {}}
+        train_dsets = {}
+    else:
+        print("Preparing datasets...", flush=True)
+        dsets = prepare_dsets_by_lang_with_splits(
+            d_cfg.data_root,
+            use_train_windows=not args.dont_use_train_windows,
+            include_languages=selected_langs,
+            verbose=False,
+        )
+        train_dsets = dsets["train"]
 
     # Preview mode (mirrors training distribution, including mixed overlays)
     if t_cfg.preview_only:
@@ -1116,6 +1228,18 @@ def main():
             "full_files": bool(args.full_files),
             "full_file_max_bytes": int(args.full_file_max_bytes),
             "fine_tune_augment_monitor": bool(args.fine_tune_augment_monitor),
+            "fine_tune_carrier_balanced": bool(args.fine_tune_carrier_balanced),
+            "fine_tune_boundary_sample_prob": float(d_cfg.fine_tune_boundary_sample_prob),
+            "fine_tune_boundary_margin": int(d_cfg.fine_tune_boundary_margin),
+            "fine_tune_boundary_require_transition": bool(
+                d_cfg.fine_tune_boundary_require_transition
+            ),
+            "fine_tune_boundary_pair_balanced": bool(
+                d_cfg.fine_tune_boundary_pair_balanced
+            ),
+            "boundary_loss_weight": float(cfg.BOUNDARY_LOSS_WEIGHT),
+            "boundary_loss_radius": int(cfg.BOUNDARY_LOSS_RADIUS),
+            "aux_neighbor_loss_weight": float(cfg.AUX_NEIGHBOR_LOSS_WEIGHT),
             "fine_tune_dense_bias_label": str(args.fine_tune_dense_bias_label or ""),
             "fine_tune_dense_bias_prob": float(args.fine_tune_dense_bias_prob),
             "fine_tune_dense_bias_source_run_id": str(args.fine_tune_dense_bias_source_run_id or ""),
@@ -1639,7 +1763,7 @@ def main():
         per_class = None
         conf_mat = None
 
-        if not full_files_mode:
+        if not full_files_mode and not t_cfg.fine_tune:
             val_loss, val_acc, conf_mat = evaluate_split_with_metrics(
                 state=eval_state,
                 dsets_by_lang=dsets["val"],
@@ -1670,7 +1794,7 @@ def main():
             primary_acc = float(val_acc)
         else:
             print(
-                "Full-file mode active: skipping ordinary validation and using monitor-only evaluation.",
+                "Fine-tune/full-file mode: skipping ordinary base-corpus validation.",
                 flush=True,
             )
             _wandb_safe_log({"meta/val_skipped_full_files": 1}, step=step, commit=False)

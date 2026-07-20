@@ -49,6 +49,29 @@ class TestMaskedLoss(unittest.TestCase):
         loss_b = float(cross_entropy_masked(logits_b, labels, tokens=tokens, pad_id=cfg.PAD_ID))
         self.assertTrue(np.isclose(loss_a, loss_b, atol=1e-8))
 
+    def test_boundary_weight_emphasizes_transition_errors(self) -> None:
+        labels = jnp.array([[0, 0, 1, 1]], dtype=jnp.uint8)
+        tokens = jnp.array([[65, 66, 67, 68]], dtype=jnp.int32)
+        logits = jnp.array(
+            [[[5.0, 0.0], [5.0, 0.0], [5.0, 0.0], [0.0, 5.0]]],
+            dtype=jnp.float32,
+        )
+        old_weight = cfg.BOUNDARY_LOSS_WEIGHT
+        old_radius = cfg.BOUNDARY_LOSS_RADIUS
+        try:
+            cfg.BOUNDARY_LOSS_WEIGHT = 0.0
+            cross_entropy_masked.clear_cache()
+            baseline = float(cross_entropy_masked(logits, labels, tokens=tokens))
+            cfg.BOUNDARY_LOSS_WEIGHT = 3.0
+            cfg.BOUNDARY_LOSS_RADIUS = 0
+            cross_entropy_masked.clear_cache()
+            weighted = float(cross_entropy_masked(logits, labels, tokens=tokens))
+        finally:
+            cfg.BOUNDARY_LOSS_WEIGHT = old_weight
+            cfg.BOUNDARY_LOSS_RADIUS = old_radius
+            cross_entropy_masked.clear_cache()
+        self.assertGreater(weighted, baseline)
+
 
 if __name__ == "__main__":
     unittest.main()

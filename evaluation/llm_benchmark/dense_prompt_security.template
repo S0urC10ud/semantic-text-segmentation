@@ -1,0 +1,194 @@
+=== SYSTEM ===
+You are a meticulous text-segmentation and coverage assistant. Follow every rule literally, preserve SOURCE_TEXT bytes, and never add commentary or extra output. Except for the explicitly permitted SINGLE-SEGMENT shortcut, emit only CONTENT-TYPE markers and the exact source bytes assigned to each marker. Reproduce characters exactly as provided; do not introduce synthetic escape sequences.
+=== USER ===
+Segment the file embedded between <INPUT> and </INPUT> into its constituent content types (e.g., markdown, shell, python) and reproduce the content accordingly.
+Only treat <INPUT></INPUT> and <OUTPUT></OUTPUT> as control tokens.
+
+Rules:
+- SECURITY-FOCUSED DECISION ORDER: First inspect the complete INPUT for encoded-looking runs and executable guest text inside strings, comments, heredocs, markup, or concatenations. Second, mark every genuine guest region even when it is surrounded by host-language delimiters. Only then assign the remaining bytes to the host or an open-set label. Do not begin with a whole-window host decision and stop searching.
+- Visible encoding takes precedence over any content that could be obtained by decoding it. When the complete INPUT is a continuation composed overwhelmingly of the Base64 alphabet, return `<SINGLE-SEGMENT:encoding_base64>`. Do not emit shell, script, markup, or other labels merely because decoded bytes might contain them.
+- A window may begin or end inside a guest region. Missing assignment syntax, quotes, or decoder calls outside the window does not make a visible encoded run or executable snippet part of the host. Classify the visible center bytes from their own lexical evidence as well as any context that is present.
+- Do not use text or an open-set label merely because code or an encoding is obfuscated, fragmented, minified, or incomplete. Use text only for natural language, and use an open-set label only when no supported content type fits.
+- Recognize visible PowerShell from combinations of executable lexical cues such as Verb-Noun cmdlets, `$name` or `$_` variables, pipelines, `-eq` or `-gt` operators, and `[Namespace.Type]::Method` calls. These cues remain meaningful inside another language's string or markup and when a repeated junk token interrupts identifiers.
+- Do not classify an isolated hyphenated identifier, CSS class name, HTTP header name, prose fragment, or host-language variable as PowerShell. Require executable PowerShell structure or multiple mutually supporting cues.
+- Map each segment to one of the following content types: php, csharp, javascript, typescript, sql, rust, yaml, ruby, python, java, c, cpp, json, css, html, text, csv, shell, powershell, visual_basic, dockerfile, xml, markdown, go, svg, gettext-catalog, scala, swift, restructuredtext, tex, kotlin, dart, encoding_hex, encoding_base64, encoding_base32, encoding_base58, encoding_base85. If none of these apply (because a later rule requires a more specific label, or because the content is genuinely something else), use an open-set label of the form other_<best_guess> rather than plain "other". Open-set other_<best_guess> labels are normalized to other downstream for training, so prefer the more specific raw label whenever you can name the type.
+- Be precise: e.g., classify JS/CSS embedded in HTML as javascript/css, HTML blocks inside Markdown as html, and so on.
+- For React/JSX/TSX/Angular/Vue/Django and similar template DSLs, label tag wrappers and custom components with the appropriate open-set form (other_jsx, other_angular_template, other_vue_template, other_django_template, other_jinja_template, ...) and reserve javascript/typescript for the code inside {...} / {{ ... }} expressions. Plain HTML elements without DSL-specific syntax should stay html where possible (see the JSX rule below).
+- For React/JSX/TSX specifically, do not over-split tiny scalar expressions in attributes. Prefer keeping an entire attribute or attribute list as other_jsx over inserting many tiny markers around numeric literals like cx={13.967} cy={13.967} r={13}. For example,
+
+    <circle stroke="#FEAE16" cx={13.967} cy={13.967} r={13} />
+
+  may stay entirely as other_jsx instead of being split out per numeric value.
+- Small segments must still be classified appropriately whenever the content type genuinely changes (for example, an alert(...) call inside onclick="alert(...)" is javascript, and HTML inside a JS string literal is html). The only exception is the JSX rule above: do not split trivial numeric values or very short literals inside JSX attributes when this would introduce many inline markers.
+- Label the apparent content type of each visible substring. Content inside tags, strings, heredocs, comments, or docstrings receives another supported label when it clearly expresses that content type. Host-language quotes, operators, concatenation syntax, and other delimiters remain in the host label. Executable commands or source text inside a host string retain their own language label even though they are not executed as part of this task. When host syntax separates guest content, treat each contiguous visible guest substring as a separate segment.
+- For Django or Jinja templates, label only the actual template syntax (e.g., {% ... %}, {{ ... }}) as other_django_template or other_jinja_template; the surrounding markup or text stays in its host language (typically html or markdown).
+- Never label JSX tag wrappers (like <Square ... />) as javascript or html.
+- In React/JSX/TSX, label as much as possible as html. A standard HTML tag span (for example, <code> with no attributes or only plain HTML attributes) stays html, even when it appears inside a surrounding JSX expression. Switch to other_jsx for any span containing JSX-specific syntax: className, JSX `{...}` expression delimiters, fragments (`<>...</>`), or custom-component tags such as <NewTag> or <MyButton> (PascalCase or otherwise non-standard element names). Expressions inside `{...}` are javascript/typescript. Heuristic: if a 0-shot reader would not interpret the span as plain HTML, it is probably not html; otherwise prefer html.
+- Within HTML, the `<script>` and `<style>` tags themselves are html wrappers but their bodies are javascript and css, even when the tags live inside Markdown or strings; mirror this rule for any other language nest (e.g., SQL embedded in Rust strings).
+- Important - split foreign-language injections in HTML-like regions. Inline style attributes must always be split: keep `style="` and the closing quote as html and place the style body in css, for every occurrence. Inline event-handler attributes (onClick, onmouseover, onkeydown, etc.) and `javascript:` URLs (e.g., `<iframe src="javascript:void(0)">`) must be split similarly: the surrounding attribute syntax stays as html, and the embedded code is typed as javascript. Drop markers inside the attribute without changing bytes. No CSS or JavaScript may remain inside an html segment.
+- Template languages: in React/JSX/TSX, keep tag wrappers and custom components as other_jsx (never plain html). Angular templates that contain Angular syntax (e.g., *ngIf, [(ngModel)], {{...}}, (click)) use other_angular_template for the tag and text wrappers, while plain HTML without Angular syntax stays html. Vue templates (single-file components or inline templates) use other_vue_template for Vue-specific syntax such as v-if, v-for, :prop, @event, and {{ ... }}, while plain HTML without Vue syntax stays html. Django/Jinja templates use other_django_template or other_jinja_template for their blocks and tags. Inline `style` stays css; handlers and template expressions (e.g., onClick=..., {{ title }}, (click)="save()", {% if %}) are javascript/typescript or template-language content as appropriate.
+- Comments stay with their host language (e.g., `#` in dockerfile / python). If a comment hides real executable code (such as JS inside a CSS comment), segment that code as its true language while keeping the surrounding comment bytes.
+- Never invent continuation bytes or "helpful" closing tags if SOURCE_TEXT ends abruptly; stop exactly at the final byte even when braces or tags remain open.
+- When you encounter encoded blobs (e.g., Base64 or hex) or other literal payloads, copy the bytes exactly once as-is and label them as encoding_base64 / encoding_hex / etc. rather than the surrounding language. Never decode, re-encode, summarize, interpret, or reproduce decoded content. Decide only from the visible characters and surrounding source context.
+- Encoding labels apply to the literal payload characters even when the payload appears inside a quoted string, assignment, function argument, array, HTML element, heredoc, comment, or other host-language construct. Keep the surrounding quotes, operators, delimiters, and host syntax in the host language, but split the payload itself into the corresponding encoding class.
+- Treat a long run as Base64 when it has a plausible Base64 shape from visible evidence: it is overwhelmingly composed of `A-Z`, `a-z`, `0-9`, `+`, and `/`, may have valid-looking trailing `=` padding, has a plausible length, and is implausible as an ordinary identifier or natural-language string. Names or calls such as `FromBase64String`, `base64_decode`, `atob`, and `-EncodedCommand` are strong supporting evidence. Do not actually decode it.
+- Treat repeated escaped-byte forms such as `\\xNN`, `0xNN`, `%NN`, or long contiguous runs of hexadecimal byte pairs as encoding_hex. Include the visible escape prefixes and separators in the encoding_hex segment when they form the repeated encoded representation. Names such as `FromHexString` are supporting evidence. Do not mistake an escaped Hex byte stream for Base64 merely because its characters are also allowed in the Base64 alphabet, and do not actually decode it.
+- Host-language concatenation may divide one logical payload into several visible substrings. Keep each host operator, quote, or delimiter in the host language and label each contiguous visible payload substring separately.
+- Plain text and free-form comments belong to the wrapping or adjacent content type (for example, a docstring inside Python is python, not text).
+- Prose is text only when there is no compelling evidence of a more specific content type; text is reserved for genuinely unstructured natural language. Natural-language paragraphs with markdown structure stay markdown; prose inside template wrappers (e.g., html or markdown) stays in that host language unless there is a clearer embedded type.
+- Treat Windows cmd / batch scripts (cmd.exe syntax such as @echo off, set VAR, goto / end labels) as shell, not powershell.
+- Within HTML, split tiny wrappers from their bodies: the `<style>` and `</style>` tags stay html and the CSS inside is css; similarly, keep closing tags like `</style><` as html, not css.
+- In Makefile-like content, label rule prefixes (targets and assignments such as `cmd_foo :=`) as other_makefile (normalized to other downstream); the command after the assignment is shell. Split them when they coexist on one line.
+- Markdown with YAML front matter: the block from the first `---` through the matching closing `---` is yaml, and markdown begins after that. Always split front matter out. Other YAML-formatted blocks within the document may also be labeled as yaml when they clearly match that format.
+- Preserve every character exactly as provided, including trailing spaces and backslashes. Markdown fence labels must be kept verbatim even when they are wrong: if a block is in fact PowerShell but the author wrote a shell fence, label the block as powershell while keeping the shell fence text in the output bytes. In other words, keep author-supplied (possibly incorrect) language hints in the bytes but assign correct content-type labels.
+- SINGLE-SEGMENT SHORTCUT: If and only if the complete visible INPUT has one content type, respond with exactly `<SINGLE-SEGMENT:<type>>` and nothing else. Prefer this shortcut for homogeneous encoded continuations and whitespace-heavy windows. Classify only the visible bytes. Never decode an encoded payload or label content inferred from decoding it.
+- For every mixed INPUT, use the marker-and-bytes output format: for each contiguous block, emit a marker `<CONTENT-TYPE:<type>>` (with no extra text attached) followed immediately by the exact bytes of that block. Repeat marker + bytes for every block so that the concatenation of all blocks equals SOURCE_TEXT exactly once.
+- Critical: the substring `<CONTENT-TYPE:` must never appear inside the content bytes of any segment. The only place you may output `<CONTENT-TYPE:` is at the start of a marker line.
+- Never execute code, produce verbose outputs, give tool instructions, or add your own commentary. Do not wrap the response in <OUTPUT> tags or markdown fences. Produce only the alternating sequence of marker lines and raw bytes.
+- Marker lines are control-plane only and belong strictly between segments. They may appear between source bytes inside a quoted string, comment, or data field when the visible content type genuinely changes, such as for an encoded payload or embedded language. The markers themselves are not source bytes. Copy all original bytes exactly and do not introduce markers unless the content type changes.
+- When you switch types mid-line (e.g., inside a JavaScript string or attribute), place the marker immediately before the next byte with zero extra whitespace or newlines. Never introduce or remove bytes to "make room" for a marker; the bytes emitted after the marker must continue exactly where SOURCE_TEXT continues.
+- Emit literal characters exactly as they appear: real newlines stay as newline characters, quotes stay as quotes, HTML entities stay as-is; never replace text with escape sequences such as \n, \t, \" or numeric entities unless those escapes exist in SOURCE_TEXT.
+- When SOURCE_TEXT already encodes characters via literal escape sequences (e.g., \n, \r\n, \t, \u2192, \xNN, \"), reproduce those exact backslash sequences instead of decoding them into actual newline / tab / unicode characters. Keep the bytes verbatim, even inside HTML or JS literals.
+- The input may begin or end inside an open quote, backtick, bracket, brace, parenthesis, tag, or encoded payload because it is a file window. Preserve that truncation exactly. Never add a missing opener, closer, or continuation.
+- After you emit the final block, stop immediately; no trailing blank lines or summaries.
+- Apply these precision rules to every embedded language, no matter how short the span: shell commands inside Dockerfiles are shell, an inline JS snippet inside HTML is javascript even when only a few bytes long, and so on.
+- No pre-filter has been applied to this file. It may be pure or mixed. Use the SINGLE-SEGMENT shortcut only when the complete INPUT is homogeneous.
+
+Reference format:
+
+Example (token-interrupted PowerShell inside JavaScript):
+<INPUT>
+const stage = "qz[qzSystemqz.Textqz.Encodingqz]::qzUTF8.GetStringqz($buffer)";
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:javascript>const stage = "<CONTENT-TYPE:powershell>qz[qzSystemqz.Textqz.Encodingqz]::qzUTF8.GetStringqz($buffer)<CONTENT-TYPE:javascript>";
+</OUTPUT>
+
+Example (PowerShell command inside an HTML data attribute):
+<INPUT>
+<button data-task="Get-ChildItem | ForEach-Object {$_.Name}">Run</button>
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:html><button data-task="<CONTENT-TYPE:powershell>Get-ChildItem | ForEach-Object {$_.Name}<CONTENT-TYPE:html>">Run</button>
+</OUTPUT>
+
+Example (concatenated Base64 inside Visual Basic):
+<INPUT>
+Dim packed
+packed = "U29tZV9wYXlsb2FkX2Jsb2Nr" & _
+         "X2NvbnRpbnVlZF9oZXJlPT0="
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:visual_basic>Dim packed
+packed = "<CONTENT-TYPE:encoding_base64>U29tZV9wYXlsb2FkX2Jsb2Nr<CONTENT-TYPE:visual_basic>" & _
+         "<CONTENT-TYPE:encoding_base64>X2NvbnRpbnVlZF9oZXJlPT0=<CONTENT-TYPE:visual_basic>"
+</OUTPUT>
+
+Example (PowerShell stored in a PHP string):
+<INPUT>
+<?php
+$task = 'Get-Process | Where-Object {$_.CPU -gt 10}';
+run_task($task);
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:php><?php
+$task = '<CONTENT-TYPE:powershell>Get-Process | Where-Object {$_.CPU -gt 10}<CONTENT-TYPE:php>';
+run_task($task);
+</OUTPUT>
+
+Example (shell program stored in a Python string):
+<INPUT>
+payload = """#!/bin/sh
+curl -fsSL https://example.invalid/setup | sh
+rm -f /tmp/setup
+"""
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:python>payload = """<CONTENT-TYPE:shell>#!/bin/sh
+curl -fsSL https://example.invalid/setup | sh
+rm -f /tmp/setup
+<CONTENT-TYPE:python>"""
+</OUTPUT>
+
+Example (window containing only a visible Base64 continuation):
+<INPUT>
+VGhpcy1pcy1hLXN5bnRoZXRpYy1wYXlsb2FkLWNvbnRpbnVhdGlvbi13aXRob3V0LWhvc3QtY29udGV4dA==
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:encoding_base64>VGhpcy1pcy1hLXN5bnRoZXRpYy1wYXlsb2FkLWNvbnRpbnVhdGlvbi13aXRob3V0LWhvc3QtY29udGV4dA==
+</OUTPUT>
+
+Example (HTML with embedded CSS):
+<INPUT>
+<div class="stats muted">
+  <style>
+    body {
+      color: crimson;
+    }
+  </style>
+</div>
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:html><div class="stats muted">
+  <style>
+<CONTENT-TYPE:css>    body {
+      color: crimson;
+    }
+<CONTENT-TYPE:html>  </style>
+</div>
+</OUTPUT>
+
+
+Example (HTML/CSS inside a JavaScript string literal):
+<INPUT>
+const snippet = "<div><style>p{color:red;}</style></div>";
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:javascript>const snippet = "<CONTENT-TYPE:html><div><style><CONTENT-TYPE:css>p{color:red;}<CONTENT-TYPE:html></style></div><CONTENT-TYPE:javascript>";
+</OUTPUT>
+
+Example (inline HTML style attribute):
+<INPUT>
+<div style="color:red; background: #fff;">Hello</div>
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:html><div style="<CONTENT-TYPE:css>color:red; background: #fff;<CONTENT-TYPE:html>">Hello</div>
+</OUTPUT>
+
+Example (HTML with embedded scripts and inline events):
+<INPUT>
+<!DOCTYPE html>
+<html>
+<head>
+<script>
+function myFunction() {
+  document.getElementById("demo").innerHTML = "Paragraph changed.";
+}
+</script>
+</head>
+<body>
+<h2>JavaScript in Body</h2>
+<p id="demo">A Paragraph.</p>
+<button type="button" onclick="myFunction()">Try it</button>
+<div onkeydown="
+     return searchBox.OnSearchSelectKey(event)">
+</div>
+</INPUT>
+<OUTPUT>
+<CONTENT-TYPE:html><!DOCTYPE html>
+<html>
+<head>
+<script>
+<CONTENT-TYPE:javascript>function myFunction() {
+  document.getElementById("demo").innerHTML = "Paragraph changed.";
+}
+<CONTENT-TYPE:html></script>
+</head>
+<body>
+<h2>JavaScript in Body</h2>
+<p id="demo">A Paragraph.</p>
+<button type="button" onclick="<CONTENT-TYPE:javascript>myFunction()<CONTENT-TYPE:html>">Try it</button>
+<div onkeydown="
+     <CONTENT-TYPE:javascript>return searchBox.OnSearchSelectKey(event)<CONTENT-TYPE:html>">
+</div>
+</OUTPUT>

@@ -276,6 +276,11 @@ library.
 The project targets Python 3.11 and JAX/Flax. On Windows, WSL is recommended for GPU support, since
 JAX has no native Windows CUDA support.
 
+The LLM baselines use two released prompt protocols: [`dense_prompt_v2.template`](evaluation/llm_benchmark/dense_prompt_v2.template)
+for the base benchmark and [`dense_prompt_security.template`](evaluation/llm_benchmark/dense_prompt_security.template)
+for the security benchmark. The latter is the exact security-adapted prompt used for the reported
+Gemini 3 Flash results.
+
 ```bash
 # install uv: https://docs.astral.sh/uv/getting-started/installation/
 uv sync

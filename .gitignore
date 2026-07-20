@@ -66,6 +66,7 @@ src/.checkpoints/**
 # Environment variables file
 .env
 .env.local
+.gemini-key
 wandb/**
 src/wandb/**
 # IDE and Editor-specific files
