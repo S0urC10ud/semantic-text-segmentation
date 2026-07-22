@@ -1,21 +1,21 @@
-# TypeSeg
+# TypeMap
 
 **Fine-grained, character-level content-type segmentation for textual inputs.**
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/S0urC10ud/semantic-text-segmentation/blob/main/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/typeseg.svg)](https://pypi.org/project/typeseg/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/REDACTED/semantic-text-segmentation/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/typemap.svg)](https://pypi.org/project/typemap/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
-[![Live demo](https://img.shields.io/badge/demo-typeseg.martin--dallinger.me-f2994a.svg)](https://typeseg.martin-dallinger.me)
+[![Live demo](https://img.shields.io/badge/demo-REDACTED-f2994a.svg)](https://REDACTED)
 
-`typeseg` labels every character position of a text with one of 35 content types
+`typemap` labels every character position of a text with one of 35 content types
 (`html`, `css`, `javascript_typescript`, `python`, `powershell`, `encoding_base64`, …),
 recovering the internal structure of mixed, malformed, or convention-breaking inputs.
 Runtime dependencies are just `numpy` and `onnxruntime` — both pulled by `pip install
-typeseg`, so the fast ONNX CPU backend works out of the box at arbitrary input length,
+typemap`, so the fast ONNX CPU backend works out of the box at arbitrary input length,
 no GPU required. (A pure-numpy fallback also ships, used when onnxruntime is absent.)
 
 <p align="center">
-  <img src="https://typeseg.martin-dallinger.me/images/llm_segmentation.png" alt="Correct model output on a heavily mangled HTML input with a hidden shell payload" width="460">
+  <img src="https://REDACTED/images/llm_segmentation.png" alt="Correct model output on a heavily mangled HTML input with a hidden shell payload" width="460">
 </p>
 <p align="center">
   <em>Model output on a heavily mangled input (stress-test): the script/style tags are missing and a
@@ -24,17 +24,17 @@ no GPU required. (A pure-numpy fallback also ships, used when onnxruntime is abs
 </p>
 
 ```bash
-pip install typeseg              # CPU: numpy + ONNX Runtime (fast; the default)
-pip install "typeseg[gpu]"       # + CUDA: onnxruntime-gpu (U-Net) and cupy (Mamba scan)
+pip install typemap              # CPU: numpy + ONNX Runtime (fast; the default)
+pip install "typemap[gpu]"       # + CUDA: onnxruntime-gpu (U-Net) and cupy (Mamba scan)
 ```
 
 ```python
-import typeseg
+import typemap
 
 text = "<div>hi</div>\n.btn { color: red; }\nalert('x');"
 
-result = typeseg.precise(text)   # Mamba: highest quality, long-context  (recommended)
-# result = typeseg.fast(text)    # U-Net: faster, when throughput matters more than quality
+result = typemap.precise(text)   # Mamba: highest quality, long-context  (recommended)
+# result = typemap.fast(text)    # U-Net: faster, when throughput matters more than quality
 
 for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} {seg.confidence:.2f}")
@@ -44,20 +44,20 @@ for seg in result.segments:
 #   35-46   javascript_typescript  0.87
 ```
 
-Installing the package also gives you a `typeseg` command (alias `segcat`) that
+Installing the package also gives you a `typemap` command (alias `segcat`) that
 renders a file — tinted by content type, with a legend and a per-segment
 confidence table — straight in the terminal, no Python REPL needed:
 
 ```bash
-typeseg file.html              # segment a file with Mamba (precise)
-typeseg --model fast file.html # use the faster U-Net instead
-cat foo.txt | typeseg          # read from stdin
-typeseg --demo                 # built-in mixed / prompt-injection sample
-python -m typeseg --demo       # equivalent module form
+typemap file.html              # segment a file with Mamba (precise)
+typemap --model fast file.html # use the faster U-Net instead
+cat foo.txt | typemap          # read from stdin
+typemap --demo                 # built-in mixed / prompt-injection sample
+python -m typemap --demo       # equivalent module form
 ```
 
 <p align="center">
-  <img src="https://typeseg.martin-dallinger.me/images/typeseg-example.png" alt="typeseg segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">
+  <img src="https://REDACTED/images/typemap-example.png" alt="typemap segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">
 </p>
 
 A `Segmentation` exposes:
@@ -73,20 +73,20 @@ A `Segmentation` exposes:
 - `labels` — the class names, in `char_probs` column order.
 
 ```python
-r = typeseg.precise("SELECT 1")
+r = typemap.precise("SELECT 1")
 r.char_probs.shape            # (8, 35)
 r.char_distribution(0)        # {'sql': 0.99, 'text': 0.001, ...} for char 0
 ```
 
 When printed to a terminal, a `Segment` renders as a colour-tinted chip of its text
 (matching the interactive viewer). Colour is auto-detected: it is emitted only to a TTY
-and honours `NO_COLOR`; force it with `TYPESEG_COLOR=always` or disable with
-`TYPESEG_COLOR=never`.
+and honours `NO_COLOR`; force it with `TYPEMAP_COLOR=always` or disable with
+`TYPEMAP_COLOR=never`.
 
 ## Content types
 
 The models classify each character into one of **35 content types**, plus the open-set
-`other`. The 35 names below are exactly the `char_probs` columns (see `typeseg.precise("").labels`
+`other`. The 35 names below are exactly the `char_probs` columns (see `typemap.precise("").labels`
 for the live column order); `other` (index 35) is the virtual class with no column, assigned by
 confidence gating to below-threshold / unknown characters.
 
@@ -101,26 +101,26 @@ confidence gating to below-threshold / unknown characters.
 ## Use cases
 
 <p align="center">
-  <img src="https://typeseg.martin-dallinger.me/images/use_cases.png" alt="Representative use cases for granular content-type segmentation" width="820">
+  <img src="https://REDACTED/images/use_cases.png" alt="Representative use cases for granular content-type segmentation" width="820">
 </p>
 
 Content-aware routing and LLM-agent guardrails, span-level scanning of mixed/encoded payloads,
 structure recovery in malformed or convention-breaking inputs, and dataset triage — moving the
 decision from the whole file down to individual character spans. See the
-[project README](https://github.com/S0urC10ud/semantic-text-segmentation#use-cases) for details.
+[project README](https://github.com/REDACTED/semantic-text-segmentation#use-cases) for details.
 
 ### Backends
 
-`pip install typeseg` pulls `numpy` and `onnxruntime`, so both models run on the fast
+`pip install typemap` pulls `numpy` and `onnxruntime`, so both models run on the fast
 ONNX CPU backend at **arbitrary input length** out of the box (≈8× faster for the
 U-Net, ≈1.5× for Mamba vs. the pure-numpy loop). The `gpu` extra transparently swaps
 in CUDA backends — the API and output are identical (verified bit-close). A pure-numpy
 fallback still ships in the box and runs whenever onnxruntime is unavailable or
-`TYPESEG_BACKEND=numpy` is set. Inspect the active backend:
+`TYPEMAP_BACKEND=numpy` is set. Inspect the active backend:
 
 ```python
-import typeseg
-typeseg.backend_info()
+import typemap
+typemap.backend_info()
 # {'backend': 'onnx', 'gpu': True, 'precise_gpu': True,
 #  'fast_providers': ['CUDAExecutionProvider', 'CPUExecutionProvider'],
 #  'precise_providers': ['CuPyCUDA:NVIDIA GeForce RTX 5070 Laptop GPU']}
@@ -143,9 +143,9 @@ honestly.
   path always stays on CPU and CuPy carries the GPU acceleration instead (~100× over the
   ONNX `Scan` path). When CuPy/GPU is absent, `precise()` falls back to ONNX (or numpy) on CPU.
 
-Select the backend with the `TYPESEG_BACKEND` environment variable:
+Select the backend with the `TYPEMAP_BACKEND` environment variable:
 
-| `TYPESEG_BACKEND` | behaviour |
+| `TYPEMAP_BACKEND` | behaviour |
 |---|---|
 | *(unset)* / `onnx` / `cpu` | auto: U-Net on CUDA (onnxruntime) when it loads, Mamba on CuPy CUDA when present; otherwise CPU/numpy |
 | `numpy` | force the pure-numpy backend |
@@ -153,7 +153,7 @@ Select the backend with the `TYPESEG_BACKEND` environment variable:
 
 `gpu`/`cuda` is the "fail fast" mode: rather than silently running on CPU it errors if
 the GPU backends are missing, the CUDA provider is absent, or CUDA fails to load. GPU
-needs `pip install "typeseg[gpu]"` (onnxruntime-gpu for the U-Net, CuPy for the Mamba
+needs `pip install "typemap[gpu]"` (onnxruntime-gpu for the U-Net, CuPy for the Mamba
 scan) plus CUDA 12.x + cuDNN 9.x on the library path.
 
 #### Running on GPU
@@ -163,7 +163,7 @@ pulls the CUDA libraries as pip wheels so nothing has to be installed system-wid
 
 ```bash
 # 1. The GPU extra: onnxruntime-gpu (U-Net) + cupy-cuda12x (Mamba scan)
-pip install "typeseg[gpu]"
+pip install "typemap[gpu]"
 
 # 2. CUDA 12 + cuDNN 9 libraries that onnxruntime-gpu needs (CuPy bundles its own).
 #    Skip any you already have system-wide.
@@ -183,19 +183,19 @@ PY
 Verify both models are on the GPU:
 
 ```python
-import typeseg
-typeseg.backend_info()
+import typemap
+typemap.backend_info()
 # {'backend': 'onnx', 'gpu': True, 'precise_gpu': True,
 #  'fast_providers': ['CUDAExecutionProvider', 'CPUExecutionProvider'],
 #  'precise_providers': ['CuPyCUDA:NVIDIA GeForce RTX 5070 Laptop GPU']}
 
 text = "<div>hi</div>\n.btn { color: red; }\nalert('x');"
-typeseg.fast(text)      # U-Net on onnxruntime-gpu  (~140k chars/s)
-typeseg.precise(text)   # Mamba on the CuPy scan    (~58k tokens/s raw forward)
+typemap.fast(text)      # U-Net on onnxruntime-gpu  (~140k chars/s)
+typemap.precise(text)   # Mamba on the CuPy scan    (~58k tokens/s raw forward)
 ```
 
 To make GPU mandatory (raise instead of silently using CPU), set
-`TYPESEG_BACKEND=gpu`. Notes:
+`TYPEMAP_BACKEND=gpu`. Notes:
 
 - The **first** CUDA call compiles kernels — a one-time warmup of seconds (longer on
   brand-new GPU architectures, e.g. Blackwell `sm_120`). Keep the process warm.
@@ -208,7 +208,7 @@ Post-processing mirrors the interactive viewer via an `Options` object; every st
 can be tuned or disabled:
 
 ```python
-from typeseg import precise, Options
+from typemap import precise, Options
 
 result = precise(text, Options(other_threshold=0.30, min_run_chars=3))
 result = precise(text, Options(paired_delimiter_fill=False))   # disable one step
@@ -216,13 +216,13 @@ result = precise(text, Options(paired_delimiter_fill=False))   # disable one ste
 
 ### Building from source
 
-The model weights (`typeseg/data/*.npz`, `*.onnx`) are generated from the released
+The model weights (`typemap/data/*.npz`, `*.onnx`) are generated from the released
 checkpoints and are not checked in. From the repository root:
 
 ```bash
-python scripts/export_typeseg_weights.py   # checkpoints -> data/*.npz + manifest.json
-python scripts/export_typeseg_onnx.py      # data/*.npz   -> data/*.onnx
-python -m build packages/typeseg   # or: uv build packages/typeseg
+python scripts/export_typemap_weights.py   # checkpoints -> data/*.npz + manifest.json
+python scripts/export_typemap_onnx.py      # data/*.npz   -> data/*.onnx
+python -m build packages/typemap   # or: uv build packages/typemap
 ```
 
 See the project repository and the accompanying MSc thesis for methodology, models,
@@ -232,7 +232,7 @@ and benchmarks. Licensed under Apache-2.0.
 
 The raw model gives a probability vector per character. Post-processing applies a few
 cheap local passes (each `O(n)`, no parsing) before segments are exposed. They run in
-the order below; toggle each via `Options`. Implementation: `typeseg/_postprocess.py`
+the order below; toggle each via `Options`. Implementation: `typemap/_postprocess.py`
 (the interactive viewer in `viewers/core.py` has a few additional heuristics).
 
 | step | `Options` flag | what it does |

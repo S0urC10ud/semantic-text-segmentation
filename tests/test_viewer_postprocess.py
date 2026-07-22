@@ -87,12 +87,12 @@ UV_PYTHON_INSTALL_DIR=/path/to/venv source ./env_setup.sh
 ## Training
 To begin training, some user / organization specific variables need to be set.
 To create a config for your specific use-case, create the file ```conf/org/YOUR_ORG.yaml```.
-You can base it on ```conf/org/jku.yaml```.
+You can base it on ```conf/org/REDACTED.yaml```.
 All configuration is based on **hydra**.
 
 ### Shared HF-Cache
 
-<span style="color: red;">IMPORTANT for NXAI servers!</span>
+<span style="color: red;">IMPORTANT for REDACTED servers!</span>
 """
 
 

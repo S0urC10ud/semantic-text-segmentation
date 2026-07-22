@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Export slimmed checkpoints + label metadata into the typeseg package data dir.
+"""Export slimmed checkpoints + label metadata into the typemap package data dir.
 
-Produces, under packages/typeseg/typeseg/data/:
+Produces, under packages/typemap/typemap/data/:
   unet_al.npz, mamba_al.npz   - flat float32 weights (keys: "Module__sub__param")
   manifest.json               - label set, class indices, post-processing defaults
 """
@@ -16,7 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "train"))
 import utils.config as cfg  # noqa: E402
 
-DATA = REPO / "packages" / "typeseg" / "typeseg" / "data"
+DATA = REPO / "packages" / "typemap" / "typemap" / "data"
 DATA.mkdir(parents=True, exist_ok=True)
 
 

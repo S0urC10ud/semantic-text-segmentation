@@ -9,8 +9,8 @@ import time
 
 import numpy as np
 
-from typeseg import _postprocess as pp
-from typeseg._tokenize import byte_probs_to_char
+from typemap import _postprocess as pp
+from typemap._tokenize import byte_probs_to_char
 
 
 def _synthetic(n_blocks):

@@ -1,12 +1,12 @@
 """Colourised content-type segmentation in the terminal.
 
-Installed as the ``typeseg`` / ``segcat`` console command, and runnable as
-``python -m typeseg``::
+Installed as the ``typemap`` / ``segcat`` console command, and runnable as
+``python -m typemap``::
 
-    typeseg file.html                 # segment a file, tinted by content type
-    typeseg --model fast file.html    # use the faster U-Net instead of Mamba
-    cat foo | typeseg                 # read from stdin
-    typeseg --demo                    # built-in mixed / injection sample
+    typemap file.html                 # segment a file, tinted by content type
+    typemap --model fast file.html    # use the faster U-Net instead of Mamba
+    cat foo | typemap                 # read from stdin
+    typemap --demo                    # built-in mixed / injection sample
 
 Renders the input tinted by predicted content type, a legend, and a segment
 table with per-segment confidence bars. Uses the numpy or ONNX backend.
@@ -76,7 +76,7 @@ def bar(conf, width=12):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        prog="typeseg",
+        prog="typemap",
         description="Colourised character-level content-type segmentation in the terminal.",
     )
     ap.add_argument("file", nargs="?", help="file to segment (default: read stdin)")
@@ -98,7 +98,7 @@ def main(argv=None):
     result = fn(text)
     info = backend_info()
 
-    print(f"\n{BOLD}typeseg.{args.model}{RESET}  "
+    print(f"\n{BOLD}typemap.{args.model}{RESET}  "
           f"{DIM}backend={info['backend']} gpu={info['gpu']}  "
           f"{len(text)} chars  {len(result.segments)} segments{RESET}\n")
 

@@ -3,7 +3,7 @@
 Single source of the label palette, shared by ``Segment.__repr__`` and the
 ``examples/segcat.py`` renderer so terminal output stays consistent and close to
 the interactive viewer. Colour is emitted only when the output is a TTY; honour
-``NO_COLOR`` and the ``TYPESEG_COLOR`` (``auto``/``always``/``never``) override.
+``NO_COLOR`` and the ``TYPEMAP_COLOR`` (``auto``/``always``/``never``) override.
 """
 from __future__ import annotations
 
@@ -49,9 +49,9 @@ def fg(rgb: Tuple[int, int, int]) -> str:
 
 
 def color_enabled(stream: Optional["object"] = None) -> bool:
-    """Whether to emit ANSI colour. ``TYPESEG_COLOR`` wins, then ``NO_COLOR``,
+    """Whether to emit ANSI colour. ``TYPEMAP_COLOR`` wins, then ``NO_COLOR``,
     else on only when ``stream`` (default stdout) is a TTY."""
-    mode = os.environ.get("TYPESEG_COLOR", "auto").lower()
+    mode = os.environ.get("TYPEMAP_COLOR", "auto").lower()
     if mode in ("never", "0", "off", "false"):
         return False
     if mode in ("always", "1", "on", "true"):

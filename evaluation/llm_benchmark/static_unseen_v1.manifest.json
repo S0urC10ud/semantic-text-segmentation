@@ -3,8 +3,8 @@
   "seed": 219540062,
   "samples_per_type_target": 50,
   "max_input_chars": 10000,
-  "arrow_root": "/Users/martindallinger/Documents/msc/text-segmentation/downloader/arrow_out/test",
-  "gemini_root": "/Users/martindallinger/Documents/msc/text-segmentation/gemini_segmentations",
+  "arrow_root": "/Users/REDACTED/Documents/msc/text-segmentation/downloader/arrow_out/test",
+  "gemini_root": "/Users/REDACTED/Documents/msc/text-segmentation/gemini_segmentations",
   "excluded_sha_count": 9902,
   "lang_order": [
     "php",
@@ -291,5 +291,5 @@
     }
   ],
   "total_samples": 1750,
-  "out_path": "/Users/martindallinger/Documents/msc/text-segmentation/evaluation/llm_benchmark/static_unseen_v1.jsonl"
+  "out_path": "/Users/REDACTED/Documents/msc/text-segmentation/evaluation/llm_benchmark/static_unseen_v1.jsonl"
 }

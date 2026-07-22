@@ -14,15 +14,15 @@ set -euo pipefail
 PROJECT="magika-segment-feb-2026"
 ZONE="europe-west1-c"
 INSTANCE="thesis-l4-robust"
-REMOTE_USER="martindallinger2002_gmail_com"
-REPO_DIR="/home/martindallinger2002_gmail_com/semantic-text-segmentation"
+REMOTE_USER="REDACTED"
+REPO_DIR="/home/REDACTED/semantic-text-segmentation"
 
 # ── The training script that runs ON the VM ────────────────────
 read -r -d '' TRAINING_SCRIPT << 'TRAINING_EOF' || true
 #!/usr/bin/env bash
 set -uo pipefail
 
-REMOTE_USER="martindallinger2002_gmail_com"
+REMOTE_USER="REDACTED"
 REPO_DIR="/home/${REMOTE_USER}/semantic-text-segmentation"
 LOG="/tmp/active_learning.log"
 
@@ -38,7 +38,7 @@ sleep 10
 su - "${REMOTE_USER}" << 'USEREOF'
 set -uo pipefail
 
-REPO_DIR="/home/martindallinger2002_gmail_com/semantic-text-segmentation"
+REPO_DIR="/home/REDACTED/semantic-text-segmentation"
 cd "${REPO_DIR}"
 source .venv/bin/activate
 

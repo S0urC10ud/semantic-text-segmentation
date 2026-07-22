@@ -12,8 +12,8 @@ import random
 import numpy as np
 import pytest
 
-import typeseg
-from typeseg import _postprocess as pp
+import typemap
+from typemap import _postprocess as pp
 
 
 # --- naive references (the pre-optimisation implementations) ---------------
@@ -111,7 +111,7 @@ SAMPLES = [
 
 
 @pytest.mark.parametrize("k", [1, 4, 16])
-@pytest.mark.parametrize("fn", [typeseg.fast, typeseg.precise])
+@pytest.mark.parametrize("fn", [typemap.fast, typemap.precise])
 def test_pipeline_consistent_on_looped_samples(fn, k):
     for s in SAMPLES:
         text = s * k
@@ -132,7 +132,7 @@ def test_pipeline_consistent_on_looped_samples(fn, k):
 
 
 def test_pipeline_deterministic_when_looped():
-    for fn in (typeseg.fast, typeseg.precise):
+    for fn in (typemap.fast, typemap.precise):
         text = SAMPLES[0] * 8
         a, b = fn(text), fn(text)
         assert a.char_labels == b.char_labels

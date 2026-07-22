@@ -597,8 +597,8 @@ async function segmentCurrentText(opts = {}){
   if (maxBytes > 0 && inputBytes > maxBytes){
     window.alert(
       `This in-browser demo caps input at ${maxBytes} bytes to stay responsive `
-      + `(your input is ${inputBytes} bytes). To segment larger inputs, run TypeSeg `
-      + `locally with Python:\n\nhttps://github.com/S0urC10ud/semantic-text-segmentation`
+      + `(your input is ${inputBytes} bytes). To segment larger inputs, run TypeMap `
+      + `locally with Python:\n\nhttps://github.com/REDACTED/semantic-text-segmentation`
     );
     return;
   }

@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT="${PROJECT:-magika-segment-feb-2026}"
 ZONE="${ZONE:-europe-west1-c}"
-REMOTE_USER="${REMOTE_USER:-martindallinger2002_gmail_com}"
+REMOTE_USER="${REMOTE_USER:-REDACTED}"
 REMOTE_REPO_DIR="${REMOTE_REPO_DIR:-/home/${REMOTE_USER}/semantic-text-segmentation}"
 AGGREGATOR_INSTANCE="${AGGREGATOR_INSTANCE:-thesis-l4-robust}"
 USE_IAP="${USE_IAP:-1}"

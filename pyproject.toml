@@ -1,7 +1,7 @@
 [project]
 name = "text-segmenter"
 version = "0.1.0"
-description = "Research code for fine-grained, character-level content-type segmentation (U-Net + Mamba, JAX/Flax). The minimal inference-only package is published separately as `typeseg`."
+description = "Research code for fine-grained, character-level content-type segmentation (U-Net + Mamba, JAX/Flax). The minimal inference-only package is published separately as `typemap`."
 readme = "README.md"
 requires-python = "~=3.11.0"
 license = "Apache-2.0"
@@ -45,7 +45,7 @@ gpu = [
 
 # This repository is a collection of research scripts run via `uv run python <path>`,
 # not an installable library. `uv sync` manages the environment; the published
-# inference package lives separately under `typeseg/`.
+# inference package lives separately under `typemap/`.
 [tool.uv]
 package = false
 

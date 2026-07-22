@@ -7,7 +7,7 @@ CPU). This backend runs the shared ``_mamba_kernel`` with ``xp=cupy`` and the
 parallel scan, loading the bundled ``mamba_al.npz`` weights onto the device once.
 
 Used automatically when ``cupy`` imports and a CUDA device is present; otherwise
-the ONNX (CPU) or pure-numpy backend handles ``precise()``. ``TYPESEG_BACKEND``
+the ONNX (CPU) or pure-numpy backend handles ``precise()``. ``TYPEMAP_BACKEND``
 follows the same contract as ``_onnx_backend``: ``numpy`` forces it off,
 ``gpu``/``cuda`` force it on and fail fast if CuPy or a device is missing.
 """
@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover
 
 
 def _data(name: str):
-    return _files("typeseg") / "data" / name
+    return _files("typemap") / "data" / name
 
 
 @lru_cache(maxsize=1)
@@ -152,12 +152,12 @@ def _warn_compile_fail_once(exc: Exception) -> None:
         return
     _warned_compile_fail = True
     warnings.warn(
-        "typeseg: a CUDA device was found but CuPy could not compile its GPU kernels "
+        "typemap: a CUDA device was found but CuPy could not compile its GPU kernels "
         f"({type(exc).__name__}: {exc}); falling back to the CPU (ONNX) backend for "
         "precise(). CuPy JIT-compiles kernels and needs the CUDA toolkit headers -- "
         "install them with: pip install \"cupy-cuda12x[ctk]\" (or set the CUDA_PATH "
         "environment variable to a system CUDA 12.x install). Silence with "
-        "TYPESEG_BACKEND=numpy or Python's warnings filters.",
+        "TYPEMAP_BACKEND=numpy or Python's warnings filters.",
         RuntimeWarning,
         stacklevel=3,
     )
@@ -169,8 +169,8 @@ def available() -> bool:
     Auto mode: True when cupy imports, a CUDA device is present, AND CuPy can
     actually compile a kernel (headers available). Any of those failing falls back
     to ONNX/numpy (a one-time warning if a device was present but kernels won't
-    compile). With ``TYPESEG_BACKEND=gpu``/``cuda`` any failure is a hard error;
-    with ``TYPESEG_BACKEND=numpy`` this is always off.
+    compile). With ``TYPEMAP_BACKEND=gpu``/``cuda`` any failure is a hard error;
+    with ``TYPEMAP_BACKEND=numpy`` this is always off.
     """
     mode = _mode()
     if mode == "numpy":
@@ -188,8 +188,8 @@ def available() -> bool:
     except Exception as exc:
         if _require_gpu():
             raise RuntimeError(
-                f"TYPESEG_BACKEND={mode} requires the CuPy GPU backend, but it could not "
-                f"initialise ({exc}). Install with: pip install \"typeseg[gpu]\" (which bundles "
+                f"TYPEMAP_BACKEND={mode} requires the CuPy GPU backend, but it could not "
+                f"initialise ({exc}). Install with: pip install \"typemap[gpu]\" (which bundles "
                 "the CUDA toolkit headers CuPy needs to JIT its kernels); with a system CUDA "
                 "install, set CUDA_PATH."
             ) from exc

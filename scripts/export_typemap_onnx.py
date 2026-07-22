@@ -1,11 +1,11 @@
-"""Build dynamic-length ONNX graphs for the typeseg U-Net and Mamba models.
+"""Build dynamic-length ONNX graphs for the typemap U-Net and Mamba models.
 
 Build-time tool only (needs ``onnx``; NOT a runtime dependency of the package).
-Reads the slimmed weights already bundled at ``packages/typeseg/typeseg/data``
+Reads the slimmed weights already bundled at ``packages/typemap/typemap/data``
 and writes ``unet_al.onnx`` / ``mamba_al.onnx`` next to them.
 
 The graphs consume *compact* token ids (0..129); the runtime applies the compact
-remap before feeding the session. Math mirrors ``typeseg._numpy_backend`` exactly.
+remap before feeding the session. Math mirrors ``typemap._numpy_backend`` exactly.
 
   * U-Net : input ``ids[N, 1536]`` int64  -> ``logits[N, 1536, 35]``
             (fixed 1536 window, dynamic batch; runtime tiles arbitrary length)
@@ -21,7 +21,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-DATA = Path(__file__).resolve().parents[1] / "packages" / "typeseg" / "typeseg" / "data"
+DATA = Path(__file__).resolve().parents[1] / "packages" / "typemap" / "typemap" / "data"
 OPSET = 17
 GELU_C = float(np.sqrt(2.0 / np.pi))
 
@@ -178,10 +178,10 @@ def build_unet(w: dict, channels, num_classes: int, seq: int = 1536) -> onnx.Mod
 
     inp = helper.make_tensor_value_info("ids", TensorProto.INT64, ["N", seq])
     out = helper.make_tensor_value_info("logits", TensorProto.FLOAT, ["N", seq, num_classes])
-    graph = helper.make_graph(g.nodes, "typeseg_unet", [inp], [out], g.inits)
+    graph = helper.make_graph(g.nodes, "typemap_unet", [inp], [out], g.inits)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)],
                               ir_version=9)
-    model.doc_string = "typeseg U-Net (fixed 1536 window, dynamic batch)"
+    model.doc_string = "typemap U-Net (fixed 1536 window, dynamic batch)"
     onnx.checker.check_model(model)
     return model
 
@@ -302,10 +302,10 @@ def build_mamba(w: dict, n_layers: int, d_state: int, dt_rank: int,
 
     inp = helper.make_tensor_value_info("ids", TensorProto.INT64, ["T"])
     out = helper.make_tensor_value_info("logits", TensorProto.FLOAT, ["T", num_classes])
-    graph = helper.make_graph(g.nodes, "typeseg_mamba", [inp], [out], g.inits)
+    graph = helper.make_graph(g.nodes, "typemap_mamba", [inp], [out], g.inits)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)],
                               ir_version=9)
-    model.doc_string = "typeseg Mamba (dynamic sequence length via Scan)"
+    model.doc_string = "typemap Mamba (dynamic sequence length via Scan)"
     onnx.checker.check_model(model)
     return model
 

@@ -3,13 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "typeseg"
+name = "typemap"
 version = "0.2.6"
 description = "Fine-grained, character-level content-type segmentation for textual inputs (U-Net + Mamba)."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.9"
-authors = [{ name = "Martin Dallinger" }]
+authors = [{ name = "REDACTED" }]
 keywords = ["segmentation", "content-type", "security", "mamba", "u-net", "tokenization"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -20,12 +20,12 @@ classifiers = [
 dependencies = ["numpy>=1.21", "onnxruntime>=1.17"]
 
 [project.urls]
-Homepage = "https://github.com/s0urc10ud/semantic-text-segmentation"
-Demo = "https://typeseg.martin-dallinger.me"
+Homepage = "https://github.com/REDACTED/semantic-text-segmentation"
+Demo = "https://REDACTED"
 
 [project.scripts]
-typeseg = "typeseg._cli:main"
-segcat = "typeseg._cli:main"
+typemap = "typemap._cli:main"
+segcat = "typemap._cli:main"
 
 [project.optional-dependencies]
 # CUDA: onnxruntime-gpu accelerates the U-Net; cupy runs the Mamba selective-scan
@@ -40,7 +40,7 @@ segcat = "typeseg._cli:main"
 # out of the box. (The runtime also degrades to CPU + warns if headers are missing.)
 #
 # Gated to non-macOS: neither onnxruntime-gpu nor cupy-cuda12x publishes macOS
-# wheels (and Apple has no NVIDIA CUDA), so on a Mac `typeseg[gpu]` resolves to the
+# wheels (and Apple has no NVIDIA CUDA), so on a Mac `typemap[gpu]` resolves to the
 # base package instead of failing with ResolutionImpossible.
 gpu = [
     "onnxruntime-gpu>=1.17; platform_system != 'Darwin'",
@@ -48,8 +48,8 @@ gpu = [
 ]
 
 [tool.setuptools]
-packages = ["typeseg"]
+packages = ["typemap"]
 license-files = ["LICENSE"]
 
 [tool.setuptools.package-data]
-typeseg = ["data/*.npz", "data/*.json", "data/*.onnx"]
+typemap = ["data/*.npz", "data/*.json", "data/*.onnx"]

@@ -12,7 +12,7 @@ import jax, jax.numpy as jnp                      # noqa: E402
 from flax import serialization                    # noqa: E402
 import viewers.core as core                        # noqa: E402
 from viewers.core import UNet1D, Mamba1D, _sanitize_model_bytes  # noqa: E402
-from typeseg._numpy_backend import unet_forward, mamba_forward, flatten_params, Weights  # noqa: E402
+from typemap._numpy_backend import unet_forward, mamba_forward, flatten_params, Weights  # noqa: E402
 
 PAD = 256
 

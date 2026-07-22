@@ -78,7 +78,7 @@ def _fake_runtime_model(runtime_mod, *, num_classes: int = 2, label_order: list[
     return model
 
 
-class TestContentTypeSegmentor(unittest.TestCase):
+class TestContentTypeMapmentor(unittest.TestCase):
     def test_runtime_matches_predictor_for_demo_input(self) -> None:
         runtime_mod = _load_runtime_module()
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))

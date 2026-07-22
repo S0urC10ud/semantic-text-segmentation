@@ -1,13 +1,13 @@
-# TypeSeg
+# TypeMap
 
 **Fine-grained, character-level content-type segmentation for textual (arbitrarily mangled) inputs.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/typeseg.svg)](https://pypi.org/project/typeseg/)
+[![PyPI](https://img.shields.io/pypi/v/typemap.svg)](https://pypi.org/project/typemap/)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
-[![Live demo](https://img.shields.io/badge/demo-typeseg.martin--dallinger.me-f2994a.svg)](https://typeseg.martin-dallinger.me)
+[![Live demo](https://img.shields.io/badge/demo-REDACTED-f2994a.svg)](https://REDACTED)
 
-`typeseg` localizes *where* each content type begins and ends inside a text stream, labeling
+`typemap` localizes *where* each content type begins and ends inside a text stream, labeling
 **every character position** with one of 35 textual content types (`html`, `css`,
 `javascript_typescript`, `python`, `powershell`, `encoding_base64`, …). Unlike file-level detectors
 that reduce a heterogeneous input to a single label, it recovers the internal structure of mixed,
@@ -30,7 +30,7 @@ or a Base64 payload pasted into an LLM prompt.
 - **Character-level boundaries.** Predicts a content type for every character, so a segment boundary
   can land between any two adjacent characters. Subword tokenizers cannot represent such boundaries —
   on `IgnoreAbovecG93ZXJzaGVsbA==`, a BPE vocabulary merges `IgnoreAbove` with the start of the
-  Base64 payload, contaminating the transition; `typeseg` does not.
+  Base64 payload, contaminating the transition; `typemap` does not.
 - **Two models, one API.** A long-context bidirectional **Mamba** state-space model is the
   recommended default for the best segmentation quality; a fast, heavily parallelizable **U-Net**
   trades some quality for much higher throughput on near-pure inputs.
@@ -68,34 +68,34 @@ or a Base64 payload pasted into an LLM prompt.
 ## Installation
 
 ```bash
-pip install typeseg              # CPU: numpy + ONNX Runtime (fast; the default)
+pip install typemap              # CPU: numpy + ONNX Runtime (fast; the default)
 ```
 
 The wheel bundles both models and runs them at **arbitrary input length** on the fast ONNX Runtime
-CPU backend out of the box. For CUDA, install the `gpu` extra (identical API and output); `typeseg`
+CPU backend out of the box. For CUDA, install the `gpu` extra (identical API and output); `typemap`
 auto-selects the GPU when one is present:
 
 ```bash
-pip install "typeseg[gpu]"       # GPU/CUDA: onnxruntime-gpu (U-Net) + cupy (Mamba scan)
+pip install "typemap[gpu]"       # GPU/CUDA: onnxruntime-gpu (U-Net) + cupy (Mamba scan)
 ```
 
 A pure-numpy fallback still ships in the wheel for environments where onnxruntime is unavailable
-(or with `TYPESEG_BACKEND=numpy`).
+(or with `TYPEMAP_BACKEND=numpy`).
 
 ## Quick start
 
-`typeseg` exposes two functions that mirror the two models:
+`typemap` exposes two functions that mirror the two models:
 
 ```python
-import typeseg
+import typemap
 
 text = "<div>hi</div>\n.btn { color: red; }\nalert('x');"
 
 # Recommended: highest-quality, long-context segmentation (Mamba).
-result = typeseg.precise(text)
+result = typemap.precise(text)
 
 # Faster alternative, when throughput matters more than quality (U-Net):
-#   result = typeseg.fast(text)
+#   result = typemap.fast(text)
 
 for seg in result.segments:
     print(f"{seg.start:>4}-{seg.end:<4} {seg.label:<22} conf={seg.confidence:.2f}")
@@ -109,7 +109,7 @@ for seg in result.segments:
 The bundled `examples/segcat.py` renders the result in the terminal:
 
 <p align="center">
-  <img src="./images/typeseg-example.png" alt="typeseg segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">
+  <img src="./images/typemap-example.png" alt="typemap segmenting a mixed CSS/JS/HTML/SQL/shell input in the terminal" width="760">
 </p>
 
 Both functions return a `Segmentation` with:
@@ -123,7 +123,7 @@ Both functions return a `Segmentation` with:
 - `labels` — the class names, in `char_probs` column order.
 
 Printed in a terminal, a `Segment` shows a colour-tinted chip of its text (auto-detected:
-TTY only, honours `NO_COLOR`; force with `TYPESEG_COLOR=always`).
+TTY only, honours `NO_COLOR`; force with `TYPEMAP_COLOR=always`).
 
 **Use `precise()` (Mamba) by default** — it gives the best segmentation quality and handles heavily
 segmented or long inputs where far-reaching context matters. Reach for `fast()` (U-Net) only when you
@@ -134,7 +134,7 @@ need maximum throughput and the input is near-pure, where the quality gap is sma
 Post-processing mirrors the interactive viewer and is controlled through an `Options` object:
 
 ```python
-from typeseg import precise, Options
+from typemap import precise, Options
 
 opts = Options(
     other_threshold=0.30,          # route positions below this confidence to `other`
@@ -152,7 +152,7 @@ result = precise(text, opts)
 ```
 
 Each step and its provenance (which of the thesis's four steps, which are viewer extras)
-is documented in [`packages/typeseg/README.md`](packages/typeseg/README.md#post-processing-methods).
+is documented in [`packages/typemap/README.md`](packages/typemap/README.md#post-processing-methods).
 
 ## Use cases
 
@@ -176,7 +176,7 @@ is documented in [`packages/typeseg/README.md`](packages/typeseg/README.md#post-
 ## Live demo
 
 A fully client-side viewer runs the Mamba model **directly in your browser** — no server, no upload,
-no ONNX runtime: **[typeseg.martin-dallinger.me](https://typeseg.martin-dallinger.me)**. The model is
+no ONNX runtime: **[REDACTED](https://REDACTED)**. The model is
 reimplemented from scratch in JavaScript, with the heavy dense projections **offloaded to WebGPU** (a
 custom WGSL matmul) and the selective-scan recurrence streamed over the full input. It runs at
 **arbitrary input length entirely on the client GPU** — the same variable-length segmentation as the
@@ -231,16 +231,16 @@ tokens/s; higher is better):
 
 The research U-Net comfortably clears the design criterion of 100,000 characters per second.
 
-**`typeseg` package throughput.** The pip package is a dependency-light deployment wrapper
+**`typemap` package throughput.** The pip package is a dependency-light deployment wrapper
 (numpy/ONNX/CuPy inference + sliding-window tiling + character-level post-processing), so it runs
 slower than the raw research model above. Measured end-to-end, warm (a laptop RTX 5070 for GPU):
 
-| Entry point | CPU (onnxruntime) | GPU (`typeseg[gpu]`) | Notes |
+| Entry point | CPU (onnxruntime) | GPU (`typemap[gpu]`) | Notes |
 |---|---:|---:|---|
 | `fast()` — U-Net | ~75,000 chars/s | ~140,000 chars/s | piecewise-constant; clears the 100k criterion on GPU |
 | `precise()` — Mamba | ~2,000 chars/s | ~25,000–35,000 chars/s | raw model ~58,000 tok/s (see below) |
 
-The two models take different GPU routes (see [Backends](packages/typeseg/README.md#backends)):
+The two models take different GPU routes (see [Backends](packages/typemap/README.md#backends)):
 the U-Net runs on **onnxruntime-gpu**, while the Mamba selective-scan runs through a **custom
 CUDA scan kernel** (a CuPy `RawKernel`). The selective-scan is a first-order linear — and therefore
 *associative* — recurrence; the stock ONNX `Scan` op evaluates it one timestep per kernel launch and
@@ -313,20 +313,20 @@ The repository is organized as follows:
 - `evaluation/` — benchmark datasets, the evaluation harness, and reports.
 - `active_learning/` — the boundary-focused active-learning loop (`infer → acquire → oracle → store`).
 - `viewers/` — small FastAPI / browser frontends, including the fully client-side WebGPU viewer.
-- `packages/typeseg/` — the minimal, inference-only package published to PyPI (numpy + ONNX Runtime
+- `packages/typemap/` — the minimal, inference-only package published to PyPI (numpy + ONNX Runtime
   core; CuPy/onnxruntime-gpu via the optional `gpu` extra).
 
 A good reading path is `downloader/main.py` → `train/utils/window_generator.py` → `train/main.py` →
 `evaluation/obtain_eval_dataset.py` → `evaluation/evaluation.py` → `viewers/interactive_viewer.py`.
 
-### Building the `typeseg` wheel
+### Building the `typemap` wheel
 
 The package's bundled weights are regenerated from the released checkpoints (they are not committed):
 
 ```bash
-python scripts/export_typeseg_weights.py   # checkpoints/*.msgpack -> packages/typeseg/typeseg/data/*.npz
-python scripts/export_typeseg_onnx.py      # *.npz                 -> dynamic-length *.onnx graphs
-uv build packages/typeseg          # -> packages/typeseg/dist/*.whl
+python scripts/export_typemap_weights.py   # checkpoints/*.msgpack -> packages/typemap/typemap/data/*.npz
+python scripts/export_typemap_onnx.py      # *.npz                 -> dynamic-length *.onnx graphs
+uv build packages/typemap          # -> packages/typemap/dist/*.whl
 ```
 
 Re-building the Gemini-augmented dataset or running the Gemini oracle requires
@@ -348,14 +348,14 @@ training data rather than just run the bundled checkpoints.
 
 ## Citation
 
-If you use `typeseg` in your research, please cite the thesis:
+Citation details are REDACTED for anonymous review:
 
 ```bibtex
-@mastersthesis{dallinger2026typeseg,
-  author  = {Dallinger, Martin},
-  title   = {Fine-Grained Content-Type Segmentation of Mixed Text Using Deep Learning},
-  school  = {Johannes Kepler University Linz},
-  address = {Linz, Austria},
+@mastersthesis{redacted2026typemap,
+  author  = {REDACTED},
+  title   = {REDACTED},
+  school  = {REDACTED},
+  address = {REDACTED},
   type    = {Master's thesis},
   year    = {2026}
 }
@@ -363,10 +363,8 @@ If you use `typeseg` in your research, please cite the thesis:
 
 ## License
 
-`typeseg` is licensed under the [Apache License 2.0](./LICENSE).
+`typemap` is licensed under the [Apache License 2.0](./LICENSE).
 
 ## Acknowledgments
 
-This work was carried out with extensive technical feedback from and many informative discussions with
-Dr. Yanick Fratantonio and Dr. Luca Invernizzi from Google Security Research (authors of
-[Magika](https://github.com/google/magika)), who also provided generous access to Google Cloud compute resources. Gemini models were used to create and refine the dense segment annotations and to act as the active-learning oracle. Thanks also go to Univ.-Prof. Stefan Rass (JKU Secure Systems Group) for his guidance, especially regarding aspects concering parsing and classical computer-science approaches.
+REDACTED for anonymous review.

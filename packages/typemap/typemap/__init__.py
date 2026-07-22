@@ -1,10 +1,10 @@
-"""typeseg — fine-grained, character-level content-type segmentation.
+"""typemap — fine-grained, character-level content-type segmentation.
 
 Two entry points mirror the two models:
 
-    >>> import typeseg
-    >>> result = typeseg.fast("<html>...</html>")     # U-Net, piecewise-constant
-    >>> result = typeseg.precise("...")               # Mamba, long-context
+    >>> import typemap
+    >>> result = typemap.fast("<html>...</html>")     # U-Net, piecewise-constant
+    >>> result = typemap.precise("...")               # Mamba, long-context
     >>> for seg in result.segments:
     ...     print(seg.start, seg.end, seg.label, seg.confidence)
 """
@@ -21,7 +21,7 @@ __all__ = ["fast", "precise", "Options", "Segment", "Segmentation", "backend_inf
 try:
     from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
-    __version__ = _pkg_version("typeseg")
+    __version__ = _pkg_version("typemap")
 except (ImportError, PackageNotFoundError):  # not installed / running from source tree
     __version__ = "0.0.0"
 

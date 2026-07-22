@@ -8,10 +8,10 @@ unless cupy imports and a CUDA device is present (so CPU-only CI is unaffected).
 import numpy as np
 import pytest
 
-from typeseg import _cupy_backend as cub
-from typeseg import _runtime as rt
-from typeseg._numpy_backend import mamba_forward
-from typeseg._tokenize import text_to_bytes
+from typemap import _cupy_backend as cub
+from typemap import _runtime as rt
+from typemap._numpy_backend import mamba_forward
+from typemap._tokenize import text_to_bytes
 
 
 def _gpu_available() -> bool:

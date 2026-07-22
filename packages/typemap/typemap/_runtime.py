@@ -40,10 +40,10 @@ def _maybe_warn_no_gpu() -> None:
 
     Wheel installs run no install-time hook, so we cannot print during
     ``pip install``; this is the first runtime opportunity to tell a Mac user why
-    ``typeseg[gpu]`` resolved to the plain CPU package. Only fires in auto mode —
-    an explicit ``TYPESEG_BACKEND`` (numpy forced, or gpu/cuda fail-fast) is the
+    ``typemap[gpu]`` resolved to the plain CPU package. Only fires in auto mode —
+    an explicit ``TYPEMAP_BACKEND`` (numpy forced, or gpu/cuda fail-fast) is the
     user's own choice and is left to the backend to honour. Suppressible via the
-    standard ``warnings`` filters or ``TYPESEG_BACKEND=numpy``.
+    standard ``warnings`` filters or ``TYPEMAP_BACKEND=numpy``.
     """
     global _warned_no_gpu
     if _warned_no_gpu or platform.system() != "Darwin":
@@ -53,11 +53,11 @@ def _maybe_warn_no_gpu() -> None:
         return
     _warned_no_gpu = True
     warnings.warn(
-        "typeseg: running on CPU (ONNX). GPU backends are unavailable on macOS — "
+        "typemap: running on CPU (ONNX). GPU backends are unavailable on macOS — "
         "neither onnxruntime-gpu nor cupy-cuda12x publishes macOS wheels and Apple "
-        "has no NVIDIA CUDA, so 'typeseg[gpu]' installs the same CPU package. "
+        "has no NVIDIA CUDA, so 'typemap[gpu]' installs the same CPU package. "
         "This is expected; the CPU ONNX backend is fast. Silence this warning with "
-        "TYPESEG_BACKEND=numpy or Python's warnings filters.",
+        "TYPEMAP_BACKEND=numpy or Python's warnings filters.",
         RuntimeWarning,
         stacklevel=2,
     )
@@ -65,12 +65,12 @@ def _maybe_warn_no_gpu() -> None:
 
 @lru_cache(maxsize=1)
 def _manifest() -> dict:
-    return json.loads((_files("typeseg") / "data" / "manifest.json").read_text())
+    return json.loads((_files("typemap") / "data" / "manifest.json").read_text())
 
 
 @lru_cache(maxsize=4)
 def _weights(npz_name: str) -> Weights:
-    with (_files("typeseg") / "data" / npz_name).open("rb") as fh:
+    with (_files("typemap") / "data" / npz_name).open("rb") as fh:
         data = np.load(fh)
         flat = {k.replace("__", "/"): np.asarray(data[k], dtype=np.float32) for k in data.files}
     return Weights(flat)
