@@ -33,6 +33,8 @@ dependencies = [
     "psutil==7.1.3",
     "google-genai>=1.64.0",
     "python-dotenv>=1.2.1",
+    "tree-sitter==0.26.0",
+    "tree-sitter-language-pack==1.12.5",
     "tf2onnx",
     "onnx",
     "tensorflow",

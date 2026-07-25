@@ -42,6 +42,8 @@ active_learning/benchmark_results/**
 checkpoints/**
 !checkpoints/unet_al.msgpack
 !checkpoints/mamba_al.msgpack
+!checkpoints/unet_sec.msgpack
+!checkpoints/mamba_sec.msgpack
 confusion_images/**
 start_stuff.md
 uv.lock
