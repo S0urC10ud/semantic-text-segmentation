@@ -369,4 +369,9 @@ If you use `typeseg` in your research, please cite the thesis:
 
 This work was carried out with extensive technical feedback from and many informative discussions with
 Dr. Yanick Fratantonio and Dr. Luca Invernizzi from Google Security Research (authors of
-[Magika](https://github.com/google/magika)), who also provided generous access to Google Cloud compute resources. Gemini models were used to create and refine the dense segment annotations and to act as the active-learning oracle. Thanks also go to Univ.-Prof. Stefan Rass (JKU Secure Systems Group) for his guidance, especially regarding aspects concering parsing and classical computer-science approaches.
+[Magika](https://github.com/google/magika)), who also provided generous access to Google Cloud compute
+resources. Gemini models were used to create and refine the dense segment annotations and to act as the
+active-learning oracle. Thanks also go to Univ.-Prof. Stefan Rass (JKU Secure Systems Group) for his
+guidance, especially regarding parsing and classical computer-science approaches. I am especially
+grateful for his detailed feedback on the accompanying master's thesis and for him supporting this
+academic collaboration.

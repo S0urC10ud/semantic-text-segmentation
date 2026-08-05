@@ -498,10 +498,33 @@ body{
 }
 
 .footer{
-  text-align:center;
   color:var(--subtle);
   font-size:12px;
   padding:24px 0 40px;
+}
+.footer-privacy{
+  margin:0;
+  text-align:center;
+}
+.footer-acknowledgments{
+  width:min(860px, calc(100% - 32px));
+  margin:24px auto 0;
+  padding-top:24px;
+  border-top:1px solid var(--border);
+  text-align:left;
+  font-size:13px;
+  line-height:1.65;
+}
+.footer-acknowledgments h2{
+  margin:0 0 10px;
+  color:var(--text);
+  font-size:15px;
+}
+.footer-acknowledgments p{
+  margin:0;
+}
+.footer-acknowledgments a{
+  color:inherit;
 }
 
 @media (max-width: 1120px){

