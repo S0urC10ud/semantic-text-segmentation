@@ -351,13 +351,19 @@ training data rather than just run the bundled checkpoints.
 If you use `typeseg` in your research, please cite the thesis:
 
 ```bibtex
-@mastersthesis{dallinger2026typeseg,
-  author  = {Dallinger, Martin},
-  title   = {Fine-Grained Content-Type Segmentation of Mixed Text Using Deep Learning},
-  school  = {Johannes Kepler University Linz},
-  address = {Linz, Austria},
-  type    = {Master's thesis},
-  year    = {2026}
+@inproceedings{dallinger2026typeseg,
+  author    = {Dallinger, Martin and Fratantonio, Yanick and Invernizzi, Luca},
+  title     = {{TypeSeg}: Content-Type Segmentation for Mixed Text},
+  booktitle = {Proceedings of the 19th Workshop on Artificial Intelligence and Security},
+  series    = {AISec '26},
+  year      = {2026},
+  month     = nov,
+  publisher = {Association for Computing Machinery},
+  address   = {New York, NY, USA},
+  location  = {The Hague, Netherlands},
+  isbn      = {979-8-4007-3031-3},
+  doi       = {10.1145/3847352.3848105},
+  url       = {https://doi.org/10.1145/3847352.3848105}
 }
 ```
 
