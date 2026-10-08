@@ -9,7 +9,7 @@ import TerminalExample from '../../../components/TerminalExample.astro';
 
 TypeSeg uses **deep learning sequence modeling** to predict a content type for each character. Its lightweight U-Net and Mamba models have **1.52 million and 1.36 million parameters**, respectively, and run on local hardware. U-Net processes short overlapping sections; Mamba uses context from the whole file. [About the models](../../core-concepts/models-and-content-types/).
 
-**No GPU required.** In our research-runtime benchmarks, U-Net processed **about 292,000 characters per second on CPU**. With a consumer-grade **RTX 5070 laptop GPU**, we measured **4.8 million characters per second**—about **4.8 MB/s for ASCII text**. Inference runs locally.
+**No GPU required.** In our research-runtime benchmarks, U-Net processed **about 292,000 characters per second on an AMD Ryzen AI 7 350 laptop CPU**. With a consumer-grade **RTX 5070 laptop GPU**, we measured **4.8 million characters per second**—about **4.8 MB/s for ASCII text**. Inference runs locally. [Benchmark setup](../../security/performance/#throughput).
 
 A file detector such as [Magika](https://securityresearch.google/magika/introduction/overview/) can identify textual files before TypeSeg labels their internal regions.
 

@@ -11,6 +11,8 @@ The paper benchmarks the JAX/Flax research implementation on **100,000-character
 | U-Net | **291,560** | **4,825,475** |
 | Mamba | 2,248 | 54,892 |
 
+**CPU core and thread count: not reported.** The paper does not specify how many CPU cores or threads were used for this run. Treat the CPU rate as a result for this laptop and research implementation; a per-core rate would need a benchmark with an explicit core and thread limit.
+
 These are the paper’s research implementation rates (Table 3). The installed Python package and browser demo use different implementations. The [research benchmark timer](https://github.com/S0urC10ud/semantic-text-segmentation/blob/main/evaluation/evaluation.py#L4444) measures model labeling; file decoding, character-label post-processing, and building the final segments are outside that timer. Measure a complete package call on your own files when estimating application throughput.
 
 TypeSeg reads the text it segments, so work grows with input length. Select textual inputs before running it. A tool such as Magika can identify a file’s overall type from a small sample.
