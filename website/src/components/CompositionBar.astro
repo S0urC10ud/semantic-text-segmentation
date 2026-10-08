@@ -11,7 +11,7 @@ const labelColor = (hex: string) => {
   return (luminance + .05) / .0556 > 1.05 / (luminance + .05) ? '#111111' : '#ffffff';
 };
 ---
-<figure class="composition-example" data-default-region={regions.findIndex(region => region.label === 'Shell')}>
+<figure class="composition-example" data-default-region={regions.findIndex(region => region.label === 'PowerShell')}>
   <div class="composition-heading"><strong>One file. Several content types.</strong><span>Illustrative ASCII file · {format(totalBytes)} bytes</span></div>
   <div class="composition-track" aria-label="File composition, in byte order">
     {regions.map((region, index) => <button type="button" class="composition-region"

@@ -20,7 +20,7 @@ const STATE = {
   unetLoaded: false,
   unetLoading: null,
   // Current selection
-  activeModel: 'unet',
+  activeModel: 'mamba',
 };
 
 async function fetchOrThrow(url, type='text') {
@@ -87,7 +87,7 @@ async function loadUNet() {
 }
 
 async function ensureModelLoaded(modelName) {
-  STATE.activeModel = modelName || 'unet';
+  STATE.activeModel = modelName || 'mamba';
   if (STATE.activeModel === 'unet') {
     await loadUNet();
   } else {

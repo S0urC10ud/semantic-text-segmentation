@@ -544,7 +544,7 @@ async function loadDemoText(){
 
 function getSelectedModel(){
   const select = el('#modelSelect');
-  return select ? select.value : 'unet';
+  return select ? select.value : 'mamba';
 }
 
 async function ensureWorkerLoaded(){
