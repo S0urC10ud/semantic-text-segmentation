@@ -27,6 +27,9 @@ export default defineConfig({
         { label: 'Models & Content Types', slug: 'core-concepts/models-and-content-types' },
         { label: 'Understanding the Output', slug: 'core-concepts/understanding-the-output' },
       ] },
+      { label: 'CLI & Bindings', items: [
+        { label: 'Command Line', slug: 'cli/command-line' },
+      ] },
       { label: 'Security Workflows', items: [
         { label: 'For Analysis Platforms', slug: 'security/analysis-platforms' },
         { label: 'Performance & Evaluation', slug: 'security/performance' },

@@ -1,34 +1,97 @@
 ---
-const regions = [
-  { label: 'Python', start: 0, end: 2048, color: '#3976c5', detail: 'The surrounding script.' },
-  { label: 'PowerShell', start: 2048, end: 3072, color: '#8655c9', detail: 'An embedded script region to inspect with a PowerShell analyzer.' },
-  { label: 'Base64', start: 3072, end: 4608, color: '#b84f87', detail: 'An encoded region to pass to a decoder before further inspection.' },
-  { label: 'Python', start: 4608, end: 6144, color: '#3976c5', detail: 'The surrounding script continues.' },
-];
+import { regions, sampleText, totalBytes, buildSourceLines } from '../lib/composition-example.mjs';
+const lines = buildSourceLines(sampleText, regions);
+const format = (value: number) => value.toLocaleString('en-US');
 ---
 <figure class="composition-example">
-  <div class="composition-heading"><strong>One file. Several content types.</strong><span>Illustrative ASCII file · 6,144 bytes</span></div>
+  <div class="composition-heading"><strong>One file. Several content types.</strong><span>Illustrative ASCII file · {format(totalBytes)} bytes</span></div>
   <div class="composition-track" aria-label="File composition, in byte order">
-    {regions.map(region => <button type="button" class="composition-region"
+    {regions.map((region, index) => <button type="button" class="composition-region"
       style={`--region-color:${region.color};flex-grow:${region.end - region.start}`}
-      data-detail={`${region.label} · bytes ${region.start.toLocaleString('en-US')}–${region.end.toLocaleString('en-US')} · ${(region.end-region.start).toLocaleString('en-US')} bytes. ${region.detail}`}
-      aria-label={`${region.label}, bytes ${region.start} to ${region.end}, ${region.end - region.start} bytes`}
-      title={`${region.label}: ${region.end - region.start} bytes`}>
+      data-region={index}
+      data-detail={`${region.label} · bytes ${format(region.start)}–${format(region.end)} · ${format(region.end-region.start)} bytes. ${region.detail}`}
+      aria-controls="composition-source-preview" aria-expanded="false"
+      aria-label={`${region.label}, bytes ${region.start} to ${region.end}, ${region.end - region.start} bytes`}>
       <span>{region.label}</span>
     </button>)}
   </div>
-  <div class="composition-axis"><span>0</span><span>3,072</span><span>6,144 bytes</span></div>
-  <p class="composition-detail" aria-live="polite">Select a region to see its location and size.</p>
-  <figcaption>A composition view for a sample-details page, such as VirusTotal’s. Colors mark contiguous regions; widths show their sizes. This is an illustration, not a VirusTotal integration or a model prediction.</figcaption>
+  <div class="composition-axis"><span>0</span><span>{format(Math.floor(totalBytes / 2))}</span><span>{format(totalBytes)} bytes</span></div>
+  <div class="composition-toolbar">
+    <p class="composition-detail" aria-live="polite">Hover to unfold the file. Select a region to inspect its text.</p>
+    <button class="composition-toggle" type="button" aria-expanded="false" aria-controls="composition-source-preview">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 9v12"/></svg>
+      <span>Inspect source</span>
+    </button>
+  </div>
+  <div id="composition-source-preview" class="composition-source" aria-hidden="true" inert>
+    <div class="composition-source-inner">
+      <div class="composition-source-heading"><strong>Inside the file</strong><span>Same bytes, unfolded into lines</span></div>
+      <pre class="composition-code" aria-label="Illustrative source text, marked by content type"><code>{lines.map(line => <span class="composition-code-line"><span class="composition-line-number" aria-hidden="true">{line.number}</span><span class="composition-line-text">{line.parts.length ? line.parts.map(part => <span class="composition-code-region" data-region={part.regionIndex} style={`--region-color:${part.color}`}>{part.text}</span>) : ' '}</span></span>)}</code></pre>
+      <div class="composition-legend">
+        {[...new Map(regions.map(r => [r.label, r])).values()].map(region => <span><i style={`background:${region.color}`}></i>{region.label}</span>)}
+      </div>
+    </div>
+  </div>
+  <figcaption>Hover across the bar to follow the highlighted text. Byte ranges match this source exactly; labels are illustrative.</figcaption>
 </figure>
 <script>
-  document.querySelectorAll('.composition-example').forEach(example => {
+  document.querySelectorAll<HTMLElement>('.composition-example').forEach(example => {
     const detail = example.querySelector('.composition-detail');
-    example.querySelectorAll<HTMLButtonElement>('.composition-region').forEach(button => {
-      const show = () => { if (detail) detail.textContent = button.dataset.detail || ''; };
-      button.addEventListener('click', show);
-      button.addEventListener('focus', show);
-      button.addEventListener('mouseenter', show);
+    const preview = example.querySelector<HTMLElement>('.composition-source');
+    const toggle = example.querySelector<HTMLButtonElement>('.composition-toggle');
+    const buttons = example.querySelectorAll<HTMLButtonElement>('.composition-region');
+    let pinned = false;
+    let hovered = false;
+    if (!preview || !toggle) return;
+
+    const open = (value: boolean) => {
+      example.classList.toggle('is-expanded', value);
+      preview.inert = !value;
+      preview.setAttribute('aria-hidden', String(!value));
+      toggle.setAttribute('aria-expanded', String(value));
+      const caption = toggle.querySelector('span');
+      if (caption) caption.textContent = value ? 'Close source' : 'Inspect source';
+      buttons.forEach(button => button.setAttribute('aria-expanded', String(value)));
+    };
+    const select = (button: HTMLButtonElement) => {
+      if (detail) detail.textContent = button.dataset.detail || '';
+      example.querySelectorAll<HTMLElement>('.composition-code-region, .composition-region').forEach(piece => {
+        piece.classList.toggle('is-active', piece.dataset.region === button.dataset.region);
+      });
+      example.classList.add('has-selection');
+      open(true);
+    };
+    example.addEventListener('pointerenter', event => {
+      if (event.pointerType !== 'mouse') return;
+      hovered = true;
+      if (!example.classList.contains('has-selection')) select(buttons[1] || buttons[0]);
+      open(true);
+    });
+    example.addEventListener('pointerleave', () => {
+      hovered = false;
+      if (!pinned && !example.contains(document.activeElement)) open(false);
+    });
+    example.addEventListener('focusout', event => {
+      if (!example.contains(event.relatedTarget as Node | null) && !hovered && !pinned) open(false);
+    });
+    example.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      pinned = false;
+      hovered = false;
+      open(false);
+      toggle.focus({ preventScroll: true });
+    });
+    buttons.forEach(button => {
+      button.addEventListener('mouseenter', () => select(button));
+      button.addEventListener('focus', () => select(button));
+      button.addEventListener('click', () => { pinned = true; select(button); });
+    });
+    toggle.addEventListener('click', () => {
+      const next = !example.classList.contains('is-expanded');
+      pinned = next;
+      if (!next) hovered = false;
+      if (next && !example.classList.contains('has-selection')) select(buttons[1] || buttons[0]);
+      open(next);
     });
   });
 </script>

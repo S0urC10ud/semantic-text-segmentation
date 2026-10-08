@@ -48,4 +48,4 @@ Table 6 evaluates 1,735 validator-eligible guest references. Expansion and valid
 
 Recovery counts reference guests covered by a same-class, validator-accepted route. Match rate counts produced routes that contain a same-class reference. One route may cover multiple references. Validator acceptance does not establish malicious behavior or successful downstream detection.
 
-See the [paper](../../resources/research/) for the complete protocol and [limitations](../../resources/limitations/) for interpretation.
+See [limitations](../../resources/limitations/) for interpretation and [research and citation](../../resources/research/) for publication details. The paper will be available after the conference.

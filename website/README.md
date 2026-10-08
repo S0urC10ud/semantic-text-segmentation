@@ -15,7 +15,8 @@ npm run build
 without training/export artifacts. The original viewer remains the source of truth.
 The documentation overview is the entry point; `/demo/` is the standalone demo.
 The paper is withheld until after the conference. Do not put PDFs in the public
-directory; quantitative claims in the docs cite the manuscript's table numbers.
+directory; builds reject public PDF files. Publishing the paper requires an explicit
+change to that check. Quantitative claims in the docs cite the manuscript's table numbers.
 
 For a repository-subpath deployment, build with
 `TYPESEG_BASE=/semantic-text-segmentation`. The custom-domain deployment uses `/`.

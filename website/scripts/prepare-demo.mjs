@@ -1,6 +1,7 @@
 import { cp, mkdir, copyFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { assertNoPublicPdfs } from './check-public-assets.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const source = path.resolve(root, '../viewers/content_type_segmentor_static');
@@ -16,3 +17,4 @@ for (const name of (await readdir(source)).filter(name => /^(?:favicon|apple-tou
   await copyFile(path.join(source, name), path.join(root, 'public', name));
 }
 await copyFile(path.join(source, 'CNAME'), path.join(root, 'public/CNAME'));
+await assertNoPublicPdfs(path.join(root, 'public'));
