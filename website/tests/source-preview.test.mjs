@@ -16,7 +16,11 @@ test('composition widths and byte ranges match the source exactly', () => {
 test('unfolding preserves all source lines and marks a region within a line', () => {
   const lines = buildSourceLines(sampleText, regions);
   assert.equal(lines.map(line => line.parts.map(part => part.text).join('')).join('\n'), sampleText);
-  const encodedLine = lines.find(line => line.parts.some(part => part.regionIndex === 3));
-  assert.deepEqual(encodedLine.parts.map(part => part.regionIndex), [2, 3, 4]);
-  assert.equal(Buffer.from(regions[3].text, 'base64').toString(), 'This is a harmless example for content-type segmentation.');
+  const mixed = buildSourceLines('prefix VALUE suffix\n', [
+    {start: 0, end: 7, color: 'blue'},
+    {start: 7, end: 12, color: 'purple'},
+    {start: 12, end: 20, color: 'blue'},
+  ]);
+  assert.deepEqual(mixed[0].parts.map(part => part.regionIndex), [0, 1, 2]);
+  assert.equal(mixed[0].parts[1].text, 'VALUE');
 });

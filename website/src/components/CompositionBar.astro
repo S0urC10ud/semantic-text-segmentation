@@ -2,17 +2,25 @@
 import { regions, sampleText, totalBytes, buildSourceLines } from '../lib/composition-example.mjs';
 const lines = buildSourceLines(sampleText, regions);
 const format = (value: number) => value.toLocaleString('en-US');
+const labelColor = (hex: string) => {
+  const rgb = hex.slice(1).match(/../g)!.map(channel => {
+    const value = parseInt(channel, 16) / 255;
+    return value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4;
+  });
+  const luminance = rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722;
+  return (luminance + .05) / .0556 > 1.05 / (luminance + .05) ? '#111111' : '#ffffff';
+};
 ---
-<figure class="composition-example">
+<figure class="composition-example" data-default-region={regions.findIndex(region => region.label === 'Shell')}>
   <div class="composition-heading"><strong>One file. Several content types.</strong><span>Illustrative ASCII file · {format(totalBytes)} bytes</span></div>
   <div class="composition-track" aria-label="File composition, in byte order">
     {regions.map((region, index) => <button type="button" class="composition-region"
-      style={`--region-color:${region.color};flex-grow:${region.end - region.start}`}
+      style={`--region-color:${region.color};--region-ink:${labelColor(region.color)};flex-grow:${region.end - region.start}`}
       data-region={index}
       data-detail={`${region.label} · bytes ${format(region.start)}–${format(region.end)} · ${format(region.end-region.start)} bytes. ${region.detail}`}
       aria-controls="composition-source-preview" aria-expanded="false"
       aria-label={`${region.label}, bytes ${region.start} to ${region.end}, ${region.end - region.start} bytes`}>
-      <span>{region.label}</span>
+      <span>{(region.end - region.start) / totalBytes >= .08 ? region.label : ''}</span>
     </button>)}
   </div>
   <div class="composition-axis"><span>0</span><span>{format(Math.floor(totalBytes / 2))}</span><span>{format(totalBytes)} bytes</span></div>
@@ -40,6 +48,7 @@ const format = (value: number) => value.toLocaleString('en-US');
     const preview = example.querySelector<HTMLElement>('.composition-source');
     const toggle = example.querySelector<HTMLButtonElement>('.composition-toggle');
     const buttons = example.querySelectorAll<HTMLButtonElement>('.composition-region');
+    const defaultButton = buttons[Number(example.dataset.defaultRegion)] || buttons[0];
     let pinned = false;
     let hovered = false;
     if (!preview || !toggle) return;
@@ -64,7 +73,7 @@ const format = (value: number) => value.toLocaleString('en-US');
     example.addEventListener('pointerenter', event => {
       if (event.pointerType !== 'mouse') return;
       hovered = true;
-      if (!example.classList.contains('has-selection')) select(buttons[1] || buttons[0]);
+      if (!example.classList.contains('has-selection')) select(defaultButton);
       open(true);
     });
     example.addEventListener('pointerleave', () => {
@@ -90,7 +99,7 @@ const format = (value: number) => value.toLocaleString('en-US');
       const next = !example.classList.contains('is-expanded');
       pinned = next;
       if (!next) hovered = false;
-      if (next && !example.classList.contains('has-selection')) select(buttons[1] || buttons[0]);
+      if (next && !example.classList.contains('has-selection')) select(defaultButton);
       open(next);
     });
   });

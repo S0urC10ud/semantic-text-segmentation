@@ -4,7 +4,7 @@
 .composition-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: .25rem 1rem; margin-bottom: .8rem; }
 .composition-heading span { font-size: .8rem; color: var(--sl-color-gray-2); }
 .composition-track { display: flex; width: 100%; height: 3.2rem; overflow: hidden; border-radius: .3rem; }
-.composition-track .composition-region { flex-basis: 0; min-width: 0; margin: 0; border: 0; border-right: 2px solid var(--sl-color-black); background: var(--region-color); color: white; cursor: pointer; font: inherit; font-size: .8rem; font-weight: 650; padding: 0 .25rem; }
+.composition-track .composition-region { flex-basis: 0; min-width: 0; margin: 0; border: 0; box-shadow: inset -2px 0 0 var(--sl-color-black); background: var(--region-color); color: var(--region-ink, white); cursor: pointer; font: inherit; font-size: .8rem; font-weight: 650; padding: 0; }
 .composition-region:last-child { border-right: 0; }
 .composition-region:focus-visible { outline: 3px solid var(--sl-color-white); outline-offset: -4px; }
 .composition-track .composition-region span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -36,5 +36,5 @@
 .overview-actions a { padding: .55rem .9rem; border: 1px solid var(--sl-color-gray-4); border-radius: .3rem; text-decoration: none; font-weight: 600; }
 .overview-actions a:first-child { background: var(--sl-color-accent-high); color: var(--sl-color-accent-low); border-color: var(--sl-color-accent-high); }
 .demo-frame { display: block; width: 100%; height: 900px; border: 1px solid var(--sl-color-gray-5); border-radius: .5rem; }
-@media (max-width: 480px) { .composition-track .composition-region { font-size: .58rem; padding: 0 .1rem; } .sl-markdown-content .composition-example { padding: .75rem; } .composition-toolbar { align-items: flex-start; flex-direction: column; gap: .55rem; } .composition-source-heading { padding: .65rem .5rem; } .sl-markdown-content .composition-code { padding-left: 0; } .composition-code-line { grid-template-columns: 2rem 1fr; } .demo-frame { height: 1250px; } }
+@media (max-width: 480px) { .composition-track .composition-region { font-size: .58rem; padding: 0; } .sl-markdown-content .composition-example { padding: .75rem; } .composition-toolbar { align-items: flex-start; flex-direction: column; gap: .55rem; } .composition-source-heading { padding: .65rem .5rem; } .sl-markdown-content .composition-code-line { grid-template-columns: 2rem 1fr; } .sl-markdown-content .composition-code { padding-left: 0; } .demo-frame { height: 1250px; } }
 @media (prefers-reduced-motion: reduce) { .composition-source, .composition-code-region, .composition-region { transition: none !important; } }
