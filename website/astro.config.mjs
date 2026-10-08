@@ -10,6 +10,7 @@ export default defineConfig({
   trailingSlash: 'always',
   integrations: [starlight({
     title: 'TypeSeg',
+    favicon: '/favicon.ico',
     description: 'See the content types inside a text file. Local segmentation for security analysis.',
     social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/S0urC10ud/semantic-text-segmentation' }],
     customCss: ['./src/styles/custom.css'],

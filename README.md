@@ -216,24 +216,24 @@ refinement.
 
 ## Benchmarks
 
-The Mamba model reaches a **macro F₁ of 0.951** over the 35 supervised content types on realistic
-GitHub files, and tops transition, needle-in-a-haystack, and Markdown-mixture benchmarks. The U-Net
-is strongest on near-pure host windows and is by far the faster model.
+The paper reports **95.1% dense F₁ for Mamba** and **94.9% for U-Net** on 875 human-labeled
+files spanning 35 content types. Dense F₁ scores non-whitespace character labels, weights each
+type by its character count within a file, and then averages the file scores. Mamba has the stronger
+label score near type changes; U-Net is faster. [Evaluation details](https://typeseg.martin-dallinger.me/security/performance/).
 
-**Reference model throughput** (the research JAX/Flax models — raw forward pass on 10 KB inputs,
-tokens/s; higher is better):
+**Reference model throughput** (the paper’s JAX/Flax research implementation, using 100,000-character
+inputs after model loading and initial compilation; distinct input characters/s):
 
 | Model | GPU (notebook-class) | CPU |
 |---|---:|---:|
 | U-Net (`fast`) | 4,825,475 | 291,560 |
 | Mamba (`precise`) | 54,892 | 2,248 |
-| Magika (file-level, reference) | — | 196,897 |
 
 The research U-Net comfortably clears the design criterion of 100,000 characters per second.
 
 **`typeseg` package throughput.** The pip package is a dependency-light deployment wrapper
 (numpy/ONNX/CuPy inference + sliding-window tiling + character-level post-processing), so it runs
-slower than the raw research model above. Measured end-to-end, warm (a laptop RTX 5070 for GPU):
+at different rates from the research implementation above. Measured end-to-end, warm (a laptop RTX 5070 for GPU):
 
 | Entry point | CPU (onnxruntime) | GPU (`typeseg[gpu]`) | Notes |
 |---|---:|---:|---|

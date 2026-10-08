@@ -10,7 +10,7 @@ Use the fast U-Net model to display a text file with content-type highlighting:
 typeseg --model fast file.txt
 ```
 
-For the Mamba model, use `typeseg --model precise file.txt`. The CLI defaults to Mamba if you omit `--model`.
+For Mamba, use `typeseg --model precise file.txt`. The CLI defaults to Mamba if you omit `--model`. Mamba uses context across the file and can improve labels near type changes, with a longer wait on CPU. [Choosing a model](../../core-concepts/models-and-content-types/) explains the tradeoff.
 
 The [Command Line guide](../../cli/command-line/) covers stdin, the `segcat` alias, terminal colors, and the segment table.
 

@@ -4,12 +4,16 @@ description: Choose U-Net for throughput or Mamba for context, across 35 learned
 ---
 ## Choose a model
 
-| Model | Python API | Good starting point for | Parameters |
+| Model | Python API | Good starting point for | Learned parameters |
 | --- | --- | --- | --- |
 | U-Net | `typeseg.fast(text)` | CPU deployment and bulk text inspection | 1.52M |
-| Mamba | `typeseg.precise(text)` | More context and finer boundary localization | 1.36M |
+| Mamba | `typeseg.precise(text)` | Inspecting where content types change | 1.36M |
 
-U-Net uses overlapping windows; Mamba carries context across the file. Start with U-Net when throughput matters. Compare Mamba on representative inputs if boundary quality is more important than speed. See [Performance & Evaluation](../../security/performance/) for measured results.
+Both are small deep learning models. Parameters are the learned weights that determine their predictions. U-Net uses overlapping 1,536-character sections; Mamba carries context across the file.
+
+Start with **U-Net for bulk processing or CPU speed**. **Mamba can improve labels near the starts and ends of regions**, but is much slower on CPU in the research benchmark. Overall label F1 is 94.9% for U-Net and 95.1% for Mamba; F1 near type changes is 45.3% and 57.2%, respectively. [Metric definitions and speed measurements](../../security/performance/) explain the comparison.
+
+The **CLI and browser demo default to Mamba**. Use `typeseg --model fast file.txt` or choose U-Net in the demo’s Settings for faster inspection. Python calls choose the model explicitly through `fast()` or `precise()`.
 
 Both models in the public package are **general-domain checkpoints**. The paper’s U-Net-Sec and Mamba-Sec results come from separate models trained with security-domain adaptation.
 

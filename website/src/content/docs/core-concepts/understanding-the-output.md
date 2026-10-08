@@ -10,14 +10,20 @@ Each `Segment` exposes:
 | --- | --- |
 | `start`, `end` | Character range in the input string: `text[start:end]` |
 | `label` | Predicted textual content type |
-| `confidence` | Segment confidence score |
+| `confidence` | Mean of the assigned label’s character confidence scores within the segment |
 | `text` | Matched substring |
 
 The end offset is exclusive. Keep segments in input order when drawing a composition bar: repeated regions of the same type may be separated by other content.
 
 ## Character details
 
-A `Segmentation` also includes `char_labels`, `char_confidence`, and `char_probs`. The probability array has shape `(len(text), 35)`; columns follow `result.labels`. These are raw model distributions, before post-processing. The auxiliary `other` label has no probability column.
+A `Segmentation` includes three arrays:
+
+- `char_probs`: the model’s probabilities before label post-processing, with shape `(len(text), 35)`. Columns follow `result.labels`.
+- `char_labels`: the final labels after the enabled post-processing steps. These labels also define the segments.
+- `char_confidence`: the model probability of each character’s final assigned label. If post-processing changes the label, this score can differ from the highest probability in that row.
+
+The auxiliary `other` label has no probability column. Its confidence is a derived score: `1 - max(char_probs[i])`. Segment confidence averages `char_confidence` across the segment. For example, 0.92 means an average label score of 92%; it is not a measured 92% chance that the whole segment is correct.
 
 Confidence reflects the model’s content-type prediction. Security verdicts require separate analysis.
 

@@ -7,6 +7,8 @@ import TerminalExample from '../../../components/TerminalExample.astro';
 
 **See which content types are inside a text file, and where.** TypeSeg labels regions of code, markup, data, and encodings across **35 textual content types**. It shows where each type starts and ends, including in mixed or malformed text.
 
+TypeSeg uses **deep learning sequence modeling** to predict a content type for each character. Its lightweight U-Net and Mamba models have **1.52 million and 1.36 million parameters**, respectively, and run on local hardware. U-Net processes short overlapping sections; Mamba uses context from the whole file. [About the models](../../core-concepts/models-and-content-types/).
+
 **No GPU required.** In our research-runtime benchmarks, U-Net processed **about 292,000 characters per second on CPU**. With a consumer-grade **RTX 5070 laptop GPU**, we measured **4.8 million characters per second**—about **4.8 MB/s for ASCII text**. Inference runs locally.
 
 A file detector such as [Magika](https://securityresearch.google/magika/introduction/overview/) can identify textual files before TypeSeg labels their internal regions.
@@ -38,7 +40,7 @@ The [CLI guide](../../cli/command-line/) covers models, piped input, and output 
 ## Highlights
 
 - **Mixed and malformed text.** Labels content types even when tags are missing or syntax is incomplete.
-- **Accuracy across 35 content types.** U-Net achieved **94.9% dense F1** on 875 human-labeled files covering all 35 types. [Evaluation details](../../security/performance/).
+- **35 content types.** U-Net achieved **94.9% F1 for character labels** on 875 human-labeled files covering all 35 types. [How the score is measured](../../security/performance/#general-text-quality).
 - **Small models, local inference.** U-Net has 1.52M parameters and runs on CPU or GPU.
 - **Character-level locations.** Each segment includes a content type, start and end offsets, and confidence. [Output format](../../core-concepts/understanding-the-output/).
 - **Python, CLI, and browser.** Try the [Python package](https://pypi.org/project/typeseg/), [command-line tool](../../cli/command-line/), or [browser demo](../web-demo/). Demo text stays in your browser.

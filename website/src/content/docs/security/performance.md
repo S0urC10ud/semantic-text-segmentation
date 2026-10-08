@@ -4,22 +4,27 @@ description: CPU throughput, model quality, and security results from the TypeSe
 ---
 ## Throughput
 
-The paper reports warmed inference on an **AMD Ryzen AI 7 350** notebook with an **NVIDIA RTX 5070 mobile GPU (85 W)**. Rates count distinct input characters, including the cost of processing overlapping windows. Model loading and the first compilation pass are excluded.
+The paper benchmarks the JAX/Flax research implementation on **100,000-character inputs**, using an **AMD Ryzen AI 7 350** notebook and an **NVIDIA RTX 5070 laptop GPU (85 W)**. The model is already loaded and its first compilation is complete when timing starts. Rates count each input character once, including the work of processing overlapping windows.
 
 | Model | CPU characters/s | GPU characters/s |
 | --- | ---: | ---: |
 | U-Net | **291,560** | **4,825,475** |
 | Mamba | 2,248 | 54,892 |
 
-These are the paper’s research-runtime measurements (Table 3). The PyPI ONNX package and JavaScript demo use different runtimes. Measure your runtime, thread settings, file sizes, and concurrency when estimating throughput.
+These are the paper’s research implementation rates (Table 3). The installed Python package and browser demo use different implementations. The [research benchmark timer](https://github.com/S0urC10ud/semantic-text-segmentation/blob/main/evaluation/evaluation.py#L4444) measures model labeling; file decoding, character-label post-processing, and building the final segments are outside that timer. Measure a complete package call on your own files when estimating application throughput.
 
-TypeSeg reads the text it segments, so work grows with input length. Select textual inputs before running it. Magika’s whole-file classification uses a small sample of a file; the timings cover different tasks.
+TypeSeg reads the text it segments, so work grows with input length. Select textual inputs before running it. A tool such as Magika can identify a file’s overall type from a small sample.
 
 ## General text quality
 
-Table 1 evaluates **875 human-labeled files across 35 content types**, 25 per learned class, using the same prefix of at most 10,000 characters for each system. Dense F1 scores the per-character content-type labels. Scores are computed per file and averaged.
+The general benchmark uses **875 human-labeled files across 35 content types**, 25 per type. Every system sees the same first 10,000 characters of each file, or the full file if shorter.
 
-| System | Dense F1 | Boundary-neighborhood F1 |
+**F1** combines precision (how often a predicted type is correct) and recall (how much of that type the system finds). Higher is better, with 100% representing perfect agreement with the human labels. Two scores are reported:
+
+- **Overall label F1**, called *dense F1* in the paper, scores the non-whitespace characters throughout each file. Each type is weighted by its character count within the file; the final score averages the file scores equally.
+- **F1 near type changes**, called *boundary-neighborhood F1*, applies the same score only within **four characters on each side of a human-labeled type change**. For a Python-to-PowerShell transition, it checks the nearby Python and PowerShell labels. This focuses on the difficult starts and ends of regions, so the score can be much lower than overall F1.
+
+| System | Overall label F1 | F1 near type changes |
 | --- | ---: | ---: |
 | Magika, whole-file | 72.0% | 32.0% |
 | Magika, sliding windows | 66.4% | 29.6% |
@@ -27,25 +32,43 @@ Table 1 evaluates **875 human-labeled files across 35 content types**, 25 per le
 | Mamba | 95.1% | 57.2% |
 | Gemini 3 Flash | 96.6% | 70.8% |
 
-The Magika rows score file or window predictions **on this segmentation task**. Magika’s whole-file classification quality requires its own task-specific evaluation.
+Magika normally returns one type for a whole file. For the first row, that type is assigned to every character before scoring. The sliding-window version labels overlapping 1,536-character sections and combines their predictions. Both rows therefore measure character labels inside mixed text. A Python file containing PowerShell can have the correct overall Python label while its PowerShell characters receive the wrong label.
 
 ## Security-domain evaluation
 
-The MalwareBazaar audit covers 165 files across 11 textual carrier families. Adaptation uses a separate 1,400-file training split. In Table 4, general U-Net reaches **69.85% dense F1** on the audit; U-Net-Sec reaches **88.02%**.
+The security benchmark uses **165 text files from MalwareBazaar**, a public malware repository. There are 15 files from each of 11 file formats, such as Python, PowerShell, and HTML. The containing format is called the *carrier*. A *reference segment* is a region labeled by a human.
 
-| Security-adapted model | Guest-segment recovery | Encoding recovery | Guest-class precision |
+The [security evaluation code](https://github.com/S0urC10ud/semantic-text-segmentation/blob/main/evaluation/malwarebazaar_finetune_eval.py#L29) groups labels into **15 categories**, including XML/SVG and JSON/YAML. These scores use different files and label groups from the general benchmark. General U-Net reaches **69.85% dense F1** here; U-Net-Sec, trained on a separate 1,400-file security dataset, reaches **88.02%** (Table 4).
+
+**The public package and demo include the general models.** U-Net-Sec and Mamba-Sec are the paper’s separate models with additional security training.
+
+### Finding embedded scripts and encodings
+
+A *guest* in this experiment is a script or encoding unexpected for the containing format. PowerShell inside Python counts; ordinary JavaScript inside HTML is expected and excluded. The tracked guest types are JavaScript, PowerShell, VBScript, shell, Python, SQL, PHP, Base64, and Hex.
+
+**Segment recovery** counts a human-labeled guest as found when the correct type covers at least half the region. **Encoding recovery** applies that rule to encoded regions. **Guest-class precision** measures how often predicted guest types match the human labels, counting each type once per file. For example, three shell regions in one file count as one shell prediction for this precision measure.
+
+| Model with security training | Guest-segment recovery | Encoding recovery | Guest-class precision |
 | --- | ---: | ---: | ---: |
 | U-Net-Sec | **81.8%** | **91.9%** | 52.1% |
 | Mamba-Sec | 80.0% | 89.6% | **76.6%** |
 
-Recovery requires at least 50% of a reference segment to receive the correct type; boundaries can differ. Guest-class precision counts distinct embedded classes per file.
-
-**The public package and demo ship general checkpoints.** U-Net-Sec and Mamba-Sec are the paper’s separate security-adapted models. Their results apply to those models.
-
 ## From regions to analyzer inputs
 
-Table 6 evaluates 1,735 validator-eligible guest references. Expansion and validation give U-Net-Sec **86.5% recovery** and **37.3% route match rate**, compared with **15.3% recovery from raw crops**. Mamba-Sec trades lower recovery (60.6%) for a higher route match rate (56.6%).
+A separate experiment tests whether predicted regions can become complete inputs for an analyzer. A *route* is a candidate input prepared from a prediction. A language parser or encoding validator checks whether the candidate has valid syntax or encoding.
 
-Recovery counts reference guests covered by a same-class, validator-accepted route. Match rate counts produced routes that contain a same-class reference. One route may cover multiple references. Validator acceptance does not establish malicious behavior or successful downstream detection.
+Of 1,899 human-labeled guests, **1,735 pass their validator at the annotated boundaries**. Those 1,735 are eligible for this experiment; unsupported or invalid fragments receive no credit.
+
+- **Validated-input recovery** is the share of eligible reference segments fully covered by a valid candidate of the correct type. This requires a complete input, beyond the half-segment coverage used above.
+- **Route match rate** is the share of emitted candidates that fully cover an eligible reference of the correct type. One candidate can contain several references, so these two measures count different things.
+
+The experiment compares taking the predicted substring directly (*raw crop*) with expanding it to surrounding syntax and validating the result:
+
+| Model with security training | Recovery from raw crops | Recovery after expansion | Route match rate after expansion |
+| --- | ---: | ---: | ---: |
+| U-Net-Sec | 15.3% | **86.5%** | 37.3% |
+| Mamba-Sec | 11.4% | 60.6% | **56.6%** |
+
+These are Table 6 results on the 1,735 eligible references. U-Net-Sec recovers more references; Mamba-Sec produces a larger share of matching candidates. A valid candidate may still be harmless. Effects on threat detection require a separate evaluation.
 
 See [limitations](../../resources/limitations/) for interpretation and [research and citation](../../resources/research/) for publication details. The paper will be available after the conference.
