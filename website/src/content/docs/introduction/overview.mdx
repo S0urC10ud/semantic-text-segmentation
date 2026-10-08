@@ -3,6 +3,7 @@ title: TypeSeg
 description: Find embedded scripts, languages, and encodings inside text files. Fast, local content-type segmentation for security analysis.
 ---
 import CompositionBar from '../../../components/CompositionBar.astro';
+import TerminalExample from '../../../components/TerminalExample.astro';
 
 **See what is inside a text file, and where.** TypeSeg identifies contiguous regions of code, markup, data, and encodings across **35 textual content types**. One file can mix HTML, CSS, JavaScript, and other text; TypeSeg makes those regions visible so analysts and security tools can inspect them separately.
 
@@ -16,9 +17,23 @@ For platforms such as VirusTotal, that means a readable composition view, direct
 
 <div class="overview-actions">
   <a href="../web-demo/">Try the web demo</a>
+  <a href="https://pypi.org/project/typeseg/">Install from PyPI</a>
   <a href="../../getting-started/quick-start/">Start with Python</a>
   <a href="https://github.com/S0urC10ud/semantic-text-segmentation">Get the code</a>
 </div>
+
+## In your terminal
+
+Inspect mixed text directly from the command line:
+
+```bash
+pip install typeseg
+typeseg --model fast file.txt
+```
+
+<TerminalExample />
+
+The [CLI guide](../../cli/command-line/) covers models, piped input, and output formats.
 
 ## Highlights
 

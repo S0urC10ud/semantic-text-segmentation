@@ -35,6 +35,10 @@
 .overview-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.3rem 0; }
 .overview-actions a { padding: .55rem .9rem; border: 1px solid var(--sl-color-gray-4); border-radius: .3rem; text-decoration: none; font-weight: 600; }
 .overview-actions a:first-child { background: var(--sl-color-accent-high); color: var(--sl-color-accent-low); border-color: var(--sl-color-accent-high); }
+.sl-markdown-content .terminal-example { margin: 1.1rem 0; }
+.terminal-example > a { display: block; }
+.terminal-example img { display: block; width: 100%; height: auto; border: 1px solid var(--sl-color-gray-5); border-radius: .35rem; }
+.sl-markdown-content .terminal-example figcaption { margin: .55rem 0 0; font-size: .78rem; color: var(--sl-color-gray-2); line-height: 1.55; }
 .demo-frame { display: block; width: 100%; height: 900px; border: 1px solid var(--sl-color-gray-5); border-radius: .5rem; }
 @media (max-width: 480px) { .composition-track .composition-region { font-size: .58rem; padding: 0; } .sl-markdown-content .composition-example { padding: .75rem; } .composition-toolbar { align-items: flex-start; flex-direction: column; gap: .55rem; } .composition-source-heading { padding: .65rem .5rem; } .sl-markdown-content .composition-code-line { grid-template-columns: 2rem 1fr; } .sl-markdown-content .composition-code { padding-left: 0; } .demo-frame { height: 1250px; } }
 @media (prefers-reduced-motion: reduce) { .composition-source, .composition-code-region, .composition-region { transition: none !important; } }

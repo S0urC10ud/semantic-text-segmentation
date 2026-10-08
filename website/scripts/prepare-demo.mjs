@@ -17,4 +17,15 @@ for (const name of (await readdir(source)).filter(name => /^(?:favicon|apple-tou
   await copyFile(path.join(source, name), path.join(root, 'public', name));
 }
 await copyFile(path.join(source, 'CNAME'), path.join(root, 'public/CNAME'));
+// Preserve the existing image URLs embedded in the published PyPI description.
+await mkdir(path.join(root, 'public/images'), { recursive: true });
+for (const [asset, name] of [
+  ['src/assets/typeseg-terminal.png', 'typeseg-example.png'],
+  ['src/assets/typeseg-annotated.png', 'llm_segmentation.png'],
+  ['../images/use_cases.png', 'use_cases.png'],
+]) {
+  const file = path.join(root, asset);
+  await copyFile(file, path.join(root, 'public/images', name));
+  await copyFile(file, path.join(target, 'images', name));
+}
 await assertNoPublicPdfs(path.join(root, 'public'));

@@ -2,7 +2,7 @@
 title: Installation
 description: Install the TypeSeg Python package for local CPU inference, with optional CUDA support.
 ---
-Install the inference package with Python 3.9 or later:
+Install [TypeSeg from PyPI](https://pypi.org/project/typeseg/) with Python 3.9 or later:
 
 ```bash
 pip install typeseg
