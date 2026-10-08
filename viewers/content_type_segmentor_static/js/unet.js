@@ -131,24 +131,29 @@ class UNetSegmentor {
    */
   _group_norm(inp, seq, ch, num_groups, scale, bias, out) {
     const group_size = ch / num_groups;
-    for (let i = 0; i < seq; i++) {
-      const base = i * ch;
-      for (let g = 0; g < num_groups; g++) {
-        const gStart = g * group_size;
-        // Compute mean
-        let sum = 0;
+    // Flax GroupNorm reduces over spatial positions AND channels in each
+    // group. Normalizing each position independently changes the model.
+    for (let g = 0; g < num_groups; g++) {
+      const gStart = g * group_size;
+      let sum = 0;
+      for (let i = 0; i < seq; i++) {
+        const base = i * ch;
         for (let j = 0; j < group_size; j++) {
           sum += inp[base + gStart + j];
         }
-        const mean = sum / group_size;
-        // Compute variance
-        let varSum = 0;
+      }
+      const mean = sum / (seq * group_size);
+      let varSum = 0;
+      for (let i = 0; i < seq; i++) {
+        const base = i * ch;
         for (let j = 0; j < group_size; j++) {
           const d = inp[base + gStart + j] - mean;
           varSum += d * d;
         }
-        const invStd = 1.0 / Math.sqrt(varSum / group_size + this.gn_eps);
-        // Normalize, scale, bias
+      }
+      const invStd = 1.0 / Math.sqrt(varSum / (seq * group_size) + this.gn_eps);
+      for (let i = 0; i < seq; i++) {
+        const base = i * ch;
         for (let j = 0; j < group_size; j++) {
           const idx = base + gStart + j;
           const chIdx = gStart + j;
@@ -281,6 +286,36 @@ class UNetSegmentor {
    * @returns {Float32Array} probabilities, flat (seq × num_classes)
    */
   predict_window_probs(inputArr) {
+    const length = inputArr.length;
+    if (!length) return new Float32Array(0);
+    const window = 1536;
+    const stride = 768;
+    const C = this.num_classes;
+    const accum = new Float32Array(length * C);
+    const weightSum = new Float32Array(length);
+    for (let start = 0; start < length; start += stride) {
+      const size = Math.min(window, length - start);
+      // Match the Python runtime: fixed model width, PAD=256, including
+      // short inputs. GroupNorm statistics depend on the window geometry.
+      const tokens = new Int32Array(window);
+      tokens.fill(256);
+      tokens.set(inputArr.subarray(start, start + size));
+      const probs = this._predict_single_window(tokens);
+      for (let i = 0; i < size; i++) {
+        const position = size <= 1 ? 0 : -1 + 2 * i / (size - 1);
+        const weight = Math.exp(-0.5 * (position / 0.5) ** 2);
+        weightSum[start + i] += weight;
+        for (let c = 0; c < C; c++) accum[(start + i) * C + c] += probs[i * C + c] * weight;
+      }
+      if (start + size >= length) break;
+    }
+    for (let i = 0; i < length; i++) {
+      for (let c = 0; c < C; c++) accum[i * C + c] /= weightSum[i];
+    }
+    return accum;
+  }
+
+  _predict_single_window(inputArr) {
     const seq = inputArr.length;
     if (seq === 0) return new Float32Array(0);
 

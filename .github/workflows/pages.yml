@@ -1,4 +1,4 @@
-name: Deploy Segmentor to Pages
+name: Deploy TypeSeg Documentation to Pages
 
 on:
   push:
@@ -23,13 +23,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install website dependencies
+        working-directory: website
+        run: npm ci
+      - name: Check documentation and composition ranges
+        working-directory: website
+        run: |
+          npm run check
+          npm test
+      - name: Build documentation and browser demo
+        working-directory: website
+        run: npm run build
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # Upload only the static viewer directory
-          path: './viewers/content_type_segmentor_static'
+          path: './website/dist'
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

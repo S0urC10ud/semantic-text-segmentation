@@ -1,0 +1,12 @@
+---
+title: Web Demo
+description: Try TypeSeg locally in your browser. View the composition and character-level content types of mixed text.
+tableOfContents: false
+---
+Paste text or select an example. **U-Net is selected for a fast first try**; choose Mamba in Settings for longer context. Hover or select a region in the composition bar to see its location, then inspect the highlighted text.
+
+Inference runs locally. The page downloads model assets, but does not upload your input. This demo uses the **general checkpoints**, not the security-adapted models evaluated in the paper. Browser speed depends on your device and differs from the paper’s native-runtime benchmarks.
+
+<a href={`${import.meta.env.BASE_URL}demo/`}>Open the demo in a full window ↗</a>
+
+<iframe class="demo-frame" src={`${import.meta.env.BASE_URL}demo/`} title="TypeSeg local text segmentation demo" loading="lazy" allow="clipboard-write" />

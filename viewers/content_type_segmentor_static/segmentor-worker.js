@@ -20,7 +20,7 @@ const STATE = {
   unetLoaded: false,
   unetLoading: null,
   // Current selection
-  activeModel: 'mamba',
+  activeModel: 'unet',
 };
 
 async function fetchOrThrow(url, type='text') {
@@ -87,7 +87,7 @@ async function loadUNet() {
 }
 
 async function ensureModelLoaded(modelName) {
-  STATE.activeModel = modelName || 'mamba';
+  STATE.activeModel = modelName || 'unet';
   if (STATE.activeModel === 'unet') {
     await loadUNet();
   } else {
@@ -232,7 +232,7 @@ async function runSegment(payloadObj) {
     char_pp_trace,
     stats,
     input_bytes: seq,
-    window_count: 1,
+    window_count: STATE.activeModel === 'unet' ? Math.max(1, Math.ceil((seq - 1536) / 768) + 1) : 1,
     other_threshold: nextThreshold,
     elapsed_ms: Number((performance.now() - started).toFixed(1)),
     runtime: STATE.activeModel === 'unet' ? 'unet-js' : 'hybrid-webgpu',

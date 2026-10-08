@@ -1,0 +1,30 @@
+---
+title: TypeSeg
+description: Find embedded scripts, languages, and encodings inside text files. Fast, local content-type segmentation for security analysis.
+---
+import CompositionBar from '../../../components/CompositionBar.astro';
+
+**See what is inside a text file, and where.** TypeSeg identifies contiguous regions of code, markup, data, and encodings across **35 textual content types**. A Python file can contain PowerShell and Base64; TypeSeg makes those regions visible so analysts and security tools can inspect them separately.
+
+The fast U-Net model processes **about 292,000 characters per second on CPU**, with no GPU required. It runs locally, and returns content types, boundaries, and confidence scores. TypeSeg complements whole-file detectors such as [Magika](https://securityresearch.google/magika/introduction/overview/): first identify the file, then inspect the structure inside its text.
+
+<CompositionBar />
+
+For platforms such as VirusTotal, that means a readable composition view, direct navigation to embedded scripts, and locations to guide specialized analyzers or decoders. [See the integration workflow](../../security/analysis-platforms/).
+
+<div class="overview-actions">
+  <a href="../web-demo/">Try the web demo</a>
+  <a href="../../getting-started/quick-start/">Start with Python</a>
+  <a href="https://github.com/S0urC10ud/semantic-text-segmentation">Get the code</a>
+</div>
+
+## Highlights
+
+- **Text files, including mixed or malformed text.** Finds internal content types without requiring tags, file extensions, or valid syntax.
+- **CPU-first deployment.** U-Net has 1.52M parameters; the paper reports 291,560 characters/s on CPU and 4.8M on a consumer GPU after warm-up.
+- **Useful output.** Contiguous segments, character offsets, and confidence values support composition bars, source highlighting, and downstream inspection.
+- **Measured quality.** U-Net achieved **94.9% dense F1** on 875 human-labeled files. [Benchmark details and security results](../../security/performance/) explain the datasets and model variants.
+- **Easy to try.** A Python package, command-line tool, and browser demo. Demo text stays in your browser.
+- **Open source.** Code and general checkpoints are available under Apache 2.0. [Research and citation](../../resources/research/).
+
+TypeSeg identifies content types; downstream tools determine whether the content is malicious. Performance is the paper’s warmed research-runtime measurement on an AMD Ryzen AI 7 350, not a browser or package latency guarantee.

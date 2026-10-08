@@ -163,3 +163,13 @@ packages/typeseg/typeseg/data/*.npz
 packages/typeseg/typeseg/data/*.onnx
 packages/typeseg/dist/
 packages/typeseg/build/
+
+# Astro documentation site (copied viewer and build output are generated).
+website/node_modules/
+website/dist/
+website/.astro/
+website/public/demo/
+website/public/favicon*
+website/public/apple-touch-icon.png
+website/public/CNAME
+website/public/papers/

@@ -1,3 +1,19 @@
+.composition-panel{padding:1rem 1.5rem;border-bottom:1px solid var(--border);background:var(--panel-2)}
+.composition-header{display:flex;flex-wrap:wrap;align-items:baseline;gap:.4rem 1rem;margin-bottom:.6rem}
+.composition-header h3{margin:0;font-size:1rem}
+.composition-header span{color:var(--subtle);font-size:.75rem}
+.composition-track{display:flex;overflow:hidden;height:36px;border-radius:5px;width:100%}
+.composition-region{flex-basis:0;min-width:0;padding:0;border:0;border-right:1px solid white;overflow:hidden;white-space:nowrap;color:#fff;font:600 11px var(--sans);cursor:pointer}
+.composition-region:last-child{border-right:0}
+.composition-region:focus-visible{outline:3px solid #111;outline-offset:-3px}
+.composition-detail{font-size:.8rem;color:var(--subtle);min-height:1.5rem;margin:.5rem 0}
+.composition-panel details{font-size:.8rem}
+.composition-list{max-height:180px;overflow:auto;padding-left:1.5rem}
+.composition-list button{border:0;background:none;text-align:left;color:var(--text);font:inherit;cursor:pointer;padding:.25rem 0}
+.composition-list button:hover{text-decoration:underline}
+.char.is-selected-region{outline:1px solid var(--accent);filter:brightness(.85)}
+.demo-status{margin:0;padding:.3rem 1.5rem;font-size:.8rem;color:var(--subtle)}
+.demo-status[data-mode="error"]{color:#b42318}
 :root{
   --bg: #f7f9fc;
   --panel: #ffffff;
