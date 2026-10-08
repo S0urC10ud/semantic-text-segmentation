@@ -14,6 +14,6 @@ The Python API exposes segments and the per-character distributions. Post-proces
 
 ## Where it fits
 
-A file-level detector answers “What kind of file is this?” TypeSeg adds “Which types appear inside this text, and where?” Run it after selecting textual inputs, then use its regions for visualization or downstream analysis.
+Run TypeSeg on decoded text to locate its content types. The regions can be displayed in a source viewer or passed to further analysis tools. A file detector such as Magika can help select textual inputs.
 
-TypeSeg does not parse, execute, or recursively decode the input. A detected script region can be a fragment rather than a complete program. An analyzer may need expansion to surrounding syntax and validation before it can consume a region.
+TypeSeg predicts labels from the input text. Parsing, execution, and recursive decoding are separate tasks. A detected script region can be incomplete; an analyzer may need surrounding syntax and validation before it can process the region.

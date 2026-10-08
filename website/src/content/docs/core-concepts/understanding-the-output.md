@@ -19,7 +19,7 @@ The end offset is exclusive. Keep segments in input order when drawing a composi
 
 A `Segmentation` also includes `char_labels`, `char_confidence`, and `char_probs`. The probability array has shape `(len(text), 35)`; columns follow `result.labels`. These are raw model distributions, before post-processing. The auxiliary `other` label has no probability column.
 
-Confidence reflects the model’s content-type prediction. It is not a maliciousness score, and should not be presented as one.
+Confidence reflects the model’s content-type prediction. Security verdicts require separate analysis.
 
 ## Convert UTF-8 character ranges to bytes
 
@@ -36,6 +36,6 @@ for segment in result.segments:
     print(segment.label, start_byte, end_byte)
 ```
 
-This maps a string decoded from UTF-8 **without normalization** back to its bytes. For UTF-16, a BOM, replacement decoding, or normalized line endings, retain the decoding map from the original byte stream instead.
+This maps a string decoded from UTF-8 **without normalization** back to its bytes. For UTF-16, a BOM, replacement decoding, or normalized line endings, retain the decoding map from the original byte stream.
 
-The browser demo normalizes line endings and maps unsupported characters to placeholders. Its composition bar reports offsets in that normalized text, not the original uploaded file.
+The browser demo normalizes line endings and maps unsupported characters to placeholders. Its composition bar reports offsets in that normalized text. Mapping these offsets to an uploaded file requires tracking the normalization steps.

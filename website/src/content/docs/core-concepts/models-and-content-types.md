@@ -11,7 +11,7 @@ description: Choose U-Net for throughput or Mamba for context, across 35 learned
 
 U-Net uses overlapping windows; Mamba carries context across the file. Start with U-Net when throughput matters. Compare Mamba on representative inputs if boundary quality is more important than speed. See [Performance & Evaluation](../../security/performance/) for measured results.
 
-Both models in the public package are **general-domain checkpoints**. The paper separately evaluates U-Net-Sec and Mamba-Sec after security-domain adaptation; those results are not measurements of the bundled package models.
+Both models in the public package are **general-domain checkpoints**. The paper’s U-Net-Sec and Mamba-Sec results come from separate models trained with security-domain adaptation.
 
 ## Supported content types
 
@@ -26,6 +26,6 @@ The model learns 35 textual labels:
 
 `c_family` groups C, C++, and Objective-C. `javascript_typescript` groups JavaScript and TypeScript. The browser uses the shorter display name `js_ts`.
 
-Confidence gating adds an auxiliary `other` output for uncertain positions. It is not a learned 36th class or a guarantee that all unsupported languages will be recognized as unknown.
+Confidence gating adds an auxiliary `other` output for uncertain positions. The model learns 35 classes; `other` is assigned during post-processing. Unsupported languages can still receive a known label.
 
 TypeSeg handles textual content. Binary executables, archives, images, and overlapping interpretations of the same bytes are outside its current scope.

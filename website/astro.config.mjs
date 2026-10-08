@@ -30,8 +30,8 @@ export default defineConfig({
       { label: 'CLI & Bindings', items: [
         { label: 'Command Line', slug: 'cli/command-line' },
       ] },
-      { label: 'Security Workflows', items: [
-        { label: 'For Analysis Platforms', slug: 'security/analysis-platforms' },
+      { label: 'Use Cases & Evaluation', items: [
+        { label: 'Use Cases', slug: 'security/analysis-platforms' },
         { label: 'Performance & Evaluation', slug: 'security/performance' },
       ] },
       { label: 'Resources', items: [

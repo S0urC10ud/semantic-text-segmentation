@@ -1,31 +1,29 @@
 ---
-title: For Analysis Platforms
-description: A practical TypeSeg workflow for VirusTotal-style file details, triage, and analyzer routing.
+title: Use Cases
+description: Inspect mixed text, locate embedded languages and encodings, and review text datasets with TypeSeg.
 ---
-TypeSeg can add an internal content map to a file-details page. An analyst sees embedded scripts and encodings at a glance, then jumps directly to the relevant source range.
+TypeSeg labels the content types within a text file. The resulting regions can support source viewers, analysis scripts, and dataset review.
 
-## Three useful additions
+## Inspect mixed text
 
-- **Composition view.** Show one bar in file order, colored by content type. Hover reveals type, location, length, and confidence; selection highlights the source. Keep text labels and a segment list so color is not the only cue.
-- **Embedded-content navigation.** Expose PowerShell inside another script, JavaScript inside markup, or an encoded region as a separate item to inspect. Use the carrier type and expected structure to distinguish ordinary mixtures from combinations worth reviewing.
-- **Analyzer routing.** Use candidate locations to guide language-specific analyzers or decoders. Expand fragmented regions to an appropriate boundary, then validate them before analysis.
+Display regions in file order, with colors and labels for each type. Selecting a region can highlight its source. This makes it easier to inspect PowerShell inside a Python script, JavaScript inside markup, or Base64 embedded in another language. The [browser demo](../../introduction/web-demo/) shows a composition bar and highlighted text.
 
-These are proposed integration uses. TypeSeg is not currently integrated with VirusTotal, and the paper does not measure improvements to VirusTotal detections or analyst workload.
+The model also handles incomplete or malformed text, including web content with missing script or style tags. Short fragments and boundaries can still be ambiguous; inspect predictions alongside the source.
 
-## Start with the text branch
+## Analyze regions by content type
 
-1. Identify the whole file with your existing detector, such as Magika.
-2. Select textual inputs, decode them, and retain the mapping to original bytes.
-3. Run `typeseg.fast(text)` with the model loaded once per worker.
-4. Store ordered ranges, labels, and confidence alongside the file’s existing metadata.
-5. Render the composition view; send selected candidates to downstream validators and analyzers.
+Content-type labels can help locate input for language-specific tools or decoders:
 
-Ordinary HTML with CSS and JavaScript is mixed too. Mixedness alone is not evidence of malware. Use TypeSeg’s structural information together with your existing analysis signals.
+1. Decode the text and retain a mapping to the original bytes if needed.
+2. Run `typeseg.fast(text)` or `typeseg.precise(text)`.
+3. Select regions by label, such as `powershell` or `encoding_base64`.
+4. Expand code fragments to a suitable boundary and validate them before analysis.
+5. Pass suitable regions to an analyzer or decoder.
 
-## Evidence for a pilot
+The [Python quick start](../../getting-started/quick-start/) shows how to read segment labels and ranges. The paper evaluates region expansion and validation in [Performance & Evaluation](../performance/).
 
-In a stratified audit of **165 MalwareBazaar text files**, 131 contained mixed content and 96 had an unexpected embedded type. The paper’s security-adapted U-Net recovered **81.8% of guest segments** and **91.9% of encoded regions**. This is evidence from that audited set, not a malware-wide prevalence estimate or a result for the general demo model.
+## Review text datasets
 
-The routing experiment also shows why validation matters: raw crops recovered 15.3% of eligible regions; expansion and validation raised recovery to 86.5%, with a 37.3% route match rate. [Performance & Evaluation](../performance/) gives the definitions and trade-offs.
+Summarize the types present in a corpus, find mixed-language samples, and select examples for annotation or closer review. Keep the regions and confidence values so predictions can be checked against the original text.
 
-For a pilot, measure local latency by file size, false embedded-type suggestions, validator acceptance, and extra analyzer findings on your own representative text corpus.
+For security use, combine these labels with other analysis signals. Ordinary documents and scripts often contain several languages. [Known limitations](../../resources/limitations/) covers scope, offsets, and model uncertainty.

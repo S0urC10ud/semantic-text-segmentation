@@ -5,7 +5,9 @@ tableOfContents: false
 ---
 Paste text or select an example. **Mamba is selected for its full-file context**; choose U-Net in Settings for faster inference. Hover or select a region in the composition bar to see its location, then inspect the highlighted text.
 
-Inference runs locally. The page downloads model assets, but does not upload your input. This demo uses the **general checkpoints**, not the security-adapted models evaluated in the paper. Browser speed depends on your device and differs from the paper’s native-runtime benchmarks.
+Inference runs locally. The page downloads model assets; your input stays in the browser. The demo uses the **general checkpoints**. [Evaluation details](../../security/performance/) cover the paper’s general and security-adapted models. Browser speed depends on your device and runtime.
+
+The mixed-content example includes an instruction inside an HTML comment. Its original reverse-shell command is redacted; the displayed shell line prints a placeholder.
 
 <a href={`${import.meta.env.BASE_URL}demo/`}>Open the demo in a full window ↗</a>
 
