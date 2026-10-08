@@ -8,8 +8,7 @@
 .composition-region:last-child { border-right: 0; }
 .composition-region:focus-visible { outline: 3px solid var(--sl-color-white); outline-offset: -4px; }
 .composition-track .composition-region span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.has-selection .composition-track .composition-region { opacity: .6; transition: opacity .15s; }
-.has-selection .composition-track .composition-region.is-active { opacity: 1; box-shadow: inset 0 -4px 0 rgba(255,255,255,.65); }
+.has-selection .composition-track .composition-region.is-active { box-shadow: inset 0 -4px 0 rgba(255,255,255,.65); }
 .composition-axis { display: flex; justify-content: space-between; font: .75rem var(--sl-font-mono, var(--sl-font-system-mono)); margin-top: .35rem; color: var(--sl-color-gray-2); }
 .composition-toolbar { display: flex; align-items: center; gap: 1rem; margin: .85rem 0; }
 .sl-markdown-content .composition-detail { flex: 1; margin: 0; font-size: .8rem; line-height: 1.5; }
@@ -27,7 +26,6 @@
 .composition-line-number { padding-right: .75rem; color: var(--sl-color-gray-3); text-align: right; user-select: none; }
 .composition-line-text { white-space: pre; }
 .composition-code-region { border-radius: 2px; background: color-mix(in srgb, var(--region-color) 15%, transparent); transition: background .15s, opacity .15s; }
-.has-selection .composition-code-region { opacity: .6; }
 .has-selection .composition-code-region.is-active { opacity: 1; background: color-mix(in srgb, var(--region-color) 35%, transparent); box-shadow: 0 1px 0 var(--region-color); }
 .composition-legend { display: flex; flex-wrap: wrap; gap: .8rem; margin: 0; padding: .6rem 1rem .8rem; font-size: .7rem; }
 .composition-legend span { display: inline-flex; align-items: center; gap: .35rem; }
